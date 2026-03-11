@@ -13,18 +13,28 @@ from fastapi.responses import Response
 from .cache import (
     CompileCacheEntry,
     MeshCacheEntry,
+    UploadedHostFieldCacheEntry,
     field_preview_cache,
     hash_preview_request,
     hash_source,
+    hash_uploaded_mesh_host_request,
     hash_uploaded_mesh_request,
     mesh_preview_cache,
     scene_compile_cache,
+    uploaded_host_field_cache,
     uploaded_mesh_preview_cache,
     UploadedMeshCacheEntry,
 )
 from .dsl import DslError, compile_source_with_diagnostics
 from .evaluator import EvaluationError, ensure_scene_valid, evaluate_scene_field, merge_parameter_values
-from .mesh_upload import MeshUploadError, build_hollow_lattice_field, parse_mesh_bytes, validate_triangle_mesh
+from .mesh_upload import (
+    MeshUploadError,
+    ParsedMesh,
+    build_host_field,
+    compose_hollow_lattice_field,
+    parse_mesh_bytes,
+    validate_triangle_mesh,
+)
 from .meshing import MeshData, MeshingError, build_mesh, mesh_to_obj, mesh_to_stl
 from .models import (
     CompileSceneRequest,
@@ -294,6 +304,43 @@ async def _read_uploaded_mesh(file: UploadFile) -> tuple[bytes, str]:
     return payload, extension
 
 
+def _resolve_uploaded_host_field(
+    *,
+    file_bytes: bytes,
+    extension: str,
+    quality_profile: QualityProfile,
+) -> tuple[ParsedMesh, list[list[float]], np.ndarray]:
+    host_key = hash_uploaded_mesh_host_request(
+        file_bytes=file_bytes,
+        extension=extension,
+        quality_profile=quality_profile,
+    )
+    cached = uploaded_host_field_cache.get(host_key)
+    if cached is not None:
+        parsed = ParsedMesh(
+            vertices=np.array(cached.vertices, dtype=np.float64, copy=True),
+            faces=np.array(cached.faces, dtype=np.int32, copy=True),
+        )
+        bounds = [[float(axis[0]), float(axis[1])] for axis in cached.bounds]
+        return parsed, bounds, cached.host_sdf
+
+    parsed = parse_mesh_bytes(file_bytes, extension)
+    validate_triangle_mesh(parsed)
+    resolution = MESH_QUALITY_TO_RESOLUTION[quality_profile]
+    host = build_host_field(parsed, resolution=resolution)
+
+    uploaded_host_field_cache.set(
+        host_key,
+        UploadedHostFieldCacheEntry(
+            vertices=np.array(parsed.vertices, dtype=np.float64, copy=True),
+            faces=np.array(parsed.faces, dtype=np.int32, copy=True),
+            bounds=[[float(axis[0]), float(axis[1])] for axis in host.bounds],
+            host_sdf=host.host_sdf,
+        ),
+    )
+    return parsed, host.bounds, host.host_sdf
+
+
 def _run_uploaded_mesh_preview(
     *,
     file_bytes: bytes,
@@ -329,17 +376,19 @@ def _run_uploaded_mesh_preview(
         )
 
     eval_start = time.perf_counter()
-    parsed = parse_mesh_bytes(file_bytes, extension)
-    validate_triangle_mesh(parsed)
-    resolution = MESH_QUALITY_TO_RESOLUTION[quality_profile]
-    field, bounds, host_sdf = build_hollow_lattice_field(
-        parsed,
+    parsed, bounds, host_sdf = _resolve_uploaded_host_field(
+        file_bytes=file_bytes,
+        extension=extension,
+        quality_profile=quality_profile,
+    )
+    field = compose_hollow_lattice_field(
+        host_sdf,
+        bounds,
         shell_thickness=shell_thickness,
         lattice_type=lattice_type,
         lattice_pitch=lattice_pitch,
         lattice_thickness=lattice_thickness,
         lattice_phase=lattice_phase,
-        resolution=resolution,
     )
     eval_ms = (time.perf_counter() - eval_start) * 1000.0
 

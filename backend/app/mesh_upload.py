@@ -18,6 +18,13 @@ class ParsedMesh:
     faces: np.ndarray
 
 
+@dataclass
+class HostFieldData:
+    mesh: ParsedMesh
+    bounds: list[list[float]]
+    host_sdf: np.ndarray
+
+
 def parse_mesh_bytes(data: bytes, extension: str) -> ParsedMesh:
     ext = extension.lower()
     if ext == ".obj":
@@ -73,6 +80,72 @@ def validate_triangle_mesh(mesh: ParsedMesh) -> None:
         )
 
 
+def build_host_field(
+    mesh: ParsedMesh,
+    resolution: int,
+) -> HostFieldData:
+    if resolution < 24:
+        raise MeshUploadError("resolution is too low for mesh workflow")
+
+    bounds = _build_bounds(mesh)
+    occupancy = _voxelize_and_fill(mesh, bounds, resolution)
+
+    spacing = _bounds_spacing(bounds, resolution)
+    outside = np.logical_not(occupancy)
+    dist_out = ndimage.distance_transform_edt(outside, sampling=spacing)
+    dist_in = ndimage.distance_transform_edt(occupancy, sampling=spacing)
+    host_sdf = dist_out - dist_in
+    return HostFieldData(mesh=mesh, bounds=bounds, host_sdf=host_sdf)
+
+
+def compose_hollow_lattice_field(
+    host_sdf: np.ndarray,
+    bounds: list[list[float]],
+    shell_thickness: float,
+    lattice_type: str,
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+) -> np.ndarray:
+    if shell_thickness <= 0.0:
+        raise MeshUploadError("shell_thickness must be > 0")
+    if lattice_pitch <= 0.0:
+        raise MeshUploadError("lattice_pitch must be > 0")
+    if lattice_thickness <= 0.0:
+        raise MeshUploadError("lattice_thickness must be > 0")
+    if host_sdf.ndim != 3:
+        raise MeshUploadError("host_sdf must be a 3D grid")
+
+    shell_field = np.maximum(host_sdf, -host_sdf - abs(shell_thickness))
+    cavity = host_sdf + abs(shell_thickness)
+    lattice_clipped = cavity.copy()
+
+    # Expensive TPMS trig is needed only inside cavity voxels.
+    mask = cavity < 0.0
+    if np.any(mask):
+        resolution = host_sdf.shape[0]
+        x_axis = np.linspace(bounds[0][0], bounds[0][1], resolution, dtype=np.float64)
+        y_axis = np.linspace(bounds[1][0], bounds[1][1], resolution, dtype=np.float64)
+        z_axis = np.linspace(bounds[2][0], bounds[2][1], resolution, dtype=np.float64)
+        ix, iy, iz = np.nonzero(mask)
+
+        qx = x_axis[ix]
+        qy = y_axis[iy]
+        qz = z_axis[iz]
+        lattice_values = _tpms_field(
+            qx,
+            qy,
+            qz,
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+        )
+        lattice_clipped[mask] = np.maximum(lattice_values, cavity[mask])
+
+    return np.minimum(shell_field, lattice_clipped)
+
+
 def build_hollow_lattice_field(
     mesh: ParsedMesh,
     shell_thickness: float,
@@ -82,33 +155,17 @@ def build_hollow_lattice_field(
     lattice_phase: float,
     resolution: int,
 ) -> tuple[np.ndarray, list[list[float]], np.ndarray]:
-    if shell_thickness <= 0.0:
-        raise MeshUploadError("shell_thickness must be > 0")
-    if lattice_pitch <= 0.0:
-        raise MeshUploadError("lattice_pitch must be > 0")
-    if lattice_thickness <= 0.0:
-        raise MeshUploadError("lattice_thickness must be > 0")
-    if resolution < 24:
-        raise MeshUploadError("resolution is too low for mesh workflow")
-
-    bounds = _build_bounds(mesh, shell_thickness, lattice_pitch, lattice_thickness)
-    occupancy = _voxelize_and_fill(mesh, bounds, resolution)
-
-    spacing = _bounds_spacing(bounds, resolution)
-    outside = np.logical_not(occupancy)
-    dist_out = ndimage.distance_transform_edt(outside, sampling=spacing)
-    dist_in = ndimage.distance_transform_edt(occupancy, sampling=spacing)
-    host_sdf = dist_out - dist_in
-
-    px, py, pz = _grid_points(bounds, resolution)
-    lattice_sdf = _tpms_field(px, py, pz, lattice_type, lattice_pitch, lattice_thickness, lattice_phase)
-
-    shell_field = np.maximum(host_sdf, -host_sdf - abs(shell_thickness))
-    cavity = host_sdf + abs(shell_thickness)
-    lattice_clipped = np.maximum(lattice_sdf, cavity)
-    final_field = np.minimum(shell_field, lattice_clipped)
-
-    return final_field, bounds, host_sdf
+    host = build_host_field(mesh, resolution=resolution)
+    field = compose_hollow_lattice_field(
+        host.host_sdf,
+        host.bounds,
+        shell_thickness=shell_thickness,
+        lattice_type=lattice_type,
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+    )
+    return field, host.bounds, host.host_sdf
 
 
 def _parse_obj(data: bytes) -> ParsedMesh:
@@ -280,12 +337,7 @@ def _triangles_to_indexed_mesh(triangles: np.ndarray) -> ParsedMesh:
     )
 
 
-def _build_bounds(
-    mesh: ParsedMesh,
-    shell_thickness: float,
-    lattice_pitch: float,
-    lattice_thickness: float,
-) -> list[list[float]]:
+def _build_bounds(mesh: ParsedMesh) -> list[list[float]]:
     mins = np.min(mesh.vertices, axis=0)
     maxs = np.max(mesh.vertices, axis=0)
     extents = maxs - mins
@@ -295,10 +347,7 @@ def _build_bounds(
     span = float(np.max(extents))
     padding = max(
         1e-3,
-        span * 0.08,
-        abs(shell_thickness) * 1.5,
-        abs(lattice_pitch) * 0.75,
-        abs(lattice_thickness) * 2.0,
+        span * 0.12,
     )
     return [
         [float(mins[0] - padding), float(maxs[0] + padding)],
@@ -313,16 +362,6 @@ def _bounds_spacing(bounds: list[list[float]], resolution: int) -> tuple[float, 
         (bounds[1][1] - bounds[1][0]) / float(resolution - 1),
         (bounds[2][1] - bounds[2][0]) / float(resolution - 1),
     )
-
-
-def _grid_points(
-    bounds: list[list[float]],
-    resolution: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    x = np.linspace(bounds[0][0], bounds[0][1], resolution, dtype=np.float64)
-    y = np.linspace(bounds[1][0], bounds[1][1], resolution, dtype=np.float64)
-    z = np.linspace(bounds[2][0], bounds[2][1], resolution, dtype=np.float64)
-    return np.meshgrid(x, y, z, indexing="ij")
 
 
 def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: int) -> np.ndarray:

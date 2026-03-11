@@ -67,6 +67,17 @@ class UploadedMeshCacheEntry:
 uploaded_mesh_preview_cache: LruCache[UploadedMeshCacheEntry] = LruCache(maxsize=12)
 
 
+@dataclass
+class UploadedHostFieldCacheEntry:
+    vertices: np.ndarray
+    faces: np.ndarray
+    bounds: list[list[float]]
+    host_sdf: np.ndarray
+
+
+uploaded_host_field_cache: LruCache[UploadedHostFieldCacheEntry] = LruCache(maxsize=8)
+
+
 def hash_source(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
@@ -100,6 +111,21 @@ def hash_uploaded_mesh_request(
         "lattice_pitch": float(lattice_pitch),
         "lattice_thickness": float(lattice_thickness),
         "lattice_phase": float(lattice_phase),
+        "quality_profile": quality_profile,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def hash_uploaded_mesh_host_request(
+    *,
+    file_bytes: bytes,
+    extension: str,
+    quality_profile: str,
+) -> str:
+    payload: dict[str, Any] = {
+        "file_hash": hashlib.sha256(file_bytes).hexdigest(),
+        "extension": extension.lower(),
         "quality_profile": quality_profile,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
