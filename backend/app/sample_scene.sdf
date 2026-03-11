@@ -1,0 +1,10 @@
+# TPMS conformal fill example
+param wall default=0.08 min=0.03 max=0.2 step=0.01
+param pitch default=0.45 min=0.2 max=0.9 step=0.01
+
+host = union(
+  impeller_centrifugal(r_in=0.22, r_out=0.95, blade_count=9, blade_twist=0.9),
+  volute_casing(throat_radius=0.34, outlet_radius=1.25, width=0.48)
+)
+lat = gyroid(pitch=$pitch, thickness=0.1)
+root = conformal_fill(host, lat, wall=$wall, mode="hybrid")
