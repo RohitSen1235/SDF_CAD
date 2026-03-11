@@ -17,19 +17,47 @@ export interface ViewerProps {
   sectionLevel: number;
 }
 
+function packVec3(values: [number, number, number][]): Float32Array {
+  const out = new Float32Array(values.length * 3);
+  for (let i = 0; i < values.length; i += 1) {
+    const offset = i * 3;
+    const value = values[i];
+    out[offset] = value[0];
+    out[offset + 1] = value[1];
+    out[offset + 2] = value[2];
+  }
+  return out;
+}
+
+function packIndices(
+  faces: [number, number, number][],
+  vertexCount: number
+): Uint16Array | Uint32Array {
+  const out =
+    vertexCount > 65535 ? new Uint32Array(faces.length * 3) : new Uint16Array(faces.length * 3);
+  for (let i = 0; i < faces.length; i += 1) {
+    const offset = i * 3;
+    const tri = faces[i];
+    out[offset] = tri[0];
+    out[offset + 1] = tri[1];
+    out[offset + 2] = tri[2];
+  }
+  return out;
+}
+
 function toGeometry(mesh: MeshPayload | null): THREE.BufferGeometry | null {
   if (!mesh) {
     return null;
   }
 
   const geometry = new THREE.BufferGeometry();
-  const vertices = new Float32Array(mesh.vertices.flat());
-  const indices = mesh.indices.flat();
+  const vertices = packVec3(mesh.vertices);
+  const indices = packIndices(mesh.indices, mesh.vertices.length);
   geometry.setAttribute("position", new THREE.BufferAttribute(vertices, 3));
-  geometry.setIndex(indices);
+  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
 
   if (mesh.normals.length === mesh.vertices.length) {
-    const normals = new Float32Array(mesh.normals.flat());
+    const normals = packVec3(mesh.normals);
     geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
   } else {
     geometry.computeVertexNormals();
@@ -105,12 +133,19 @@ export function Viewer({
   const meshRef = useRef<THREE.Mesh>(null);
 
   const geometry = useMemo(() => toGeometry(mesh), [mesh]);
-  const clippingPlanes = useMemo(() => {
+  const sectionPlane = useMemo(() => {
     if (!sectionEnabled) {
-      return [];
+      return null;
     }
-    return [new THREE.Plane(new THREE.Vector3(0, -1, 0), sectionLevel)];
+    return new THREE.Plane(new THREE.Vector3(0, -1, 0), sectionLevel);
   }, [sectionEnabled, sectionLevel]);
+  const clippingPlanes = useMemo(() => (sectionPlane ? [sectionPlane] : []), [sectionPlane]);
+  const capSize = useMemo(() => {
+    if (!geometry?.boundingSphere) {
+      return 120;
+    }
+    return Math.max(120, geometry.boundingSphere.radius * 8);
+  }, [geometry]);
 
   useEffect(() => {
     return () => {
@@ -124,6 +159,7 @@ export function Viewer({
     <Canvas
       camera={{ position: [3.5, 2.5, 3.5], fov: 45 }}
       dpr={[1, 1.75]}
+      gl={{ stencil: true }}
       onCreated={({ gl }) => {
         gl.localClippingEnabled = true;
       }}
@@ -144,17 +180,69 @@ export function Viewer({
           onMouseUp={() => setOrbitEnabled(true)}
           size={0.75}
         >
-          <mesh ref={meshRef} geometry={geometry} castShadow receiveShadow>
-            <meshStandardMaterial
-              color="#8be9fd"
-              roughness={0.2}
-              metalness={0.05}
-              wireframe={wireframe}
-              clippingPlanes={clippingPlanes}
-              clipShadows
-            />
-          </mesh>
+          <group>
+            {sectionEnabled ? (
+              <>
+                <mesh geometry={geometry} renderOrder={1}>
+                  <meshBasicMaterial
+                    colorWrite={false}
+                    depthWrite={false}
+                    depthTest={false}
+                    clippingPlanes={clippingPlanes}
+                    side={THREE.BackSide}
+                    stencilWrite
+                    stencilFunc={THREE.AlwaysStencilFunc}
+                    stencilFail={THREE.IncrementWrapStencilOp}
+                    stencilZFail={THREE.IncrementWrapStencilOp}
+                    stencilZPass={THREE.IncrementWrapStencilOp}
+                  />
+                </mesh>
+                <mesh geometry={geometry} renderOrder={1}>
+                  <meshBasicMaterial
+                    colorWrite={false}
+                    depthWrite={false}
+                    depthTest={false}
+                    clippingPlanes={clippingPlanes}
+                    side={THREE.FrontSide}
+                    stencilWrite
+                    stencilFunc={THREE.AlwaysStencilFunc}
+                    stencilFail={THREE.DecrementWrapStencilOp}
+                    stencilZFail={THREE.DecrementWrapStencilOp}
+                    stencilZPass={THREE.DecrementWrapStencilOp}
+                  />
+                </mesh>
+              </>
+            ) : null}
+            <mesh ref={meshRef} geometry={geometry} castShadow receiveShadow renderOrder={3}>
+              <meshStandardMaterial
+                color="#8be9fd"
+                roughness={0.2}
+                metalness={0.05}
+                wireframe={wireframe}
+                clippingPlanes={clippingPlanes}
+                clipShadows
+              />
+            </mesh>
+          </group>
         </TransformControls>
+      ) : null}
+
+      {geometry && sectionEnabled && sectionPlane ? (
+        <mesh position={[0, sectionLevel, 0]} rotation={[-Math.PI * 0.5, 0, 0]} renderOrder={2}>
+          <planeGeometry args={[capSize, capSize]} />
+          <meshStandardMaterial
+            color="#ff3b30"
+            roughness={0.5}
+            metalness={0.05}
+            side={THREE.DoubleSide}
+            stencilWrite
+            stencilRef={0}
+            stencilFunc={THREE.NotEqualStencilFunc}
+            stencilFail={THREE.ReplaceStencilOp}
+            stencilZFail={THREE.ReplaceStencilOp}
+            stencilZPass={THREE.ReplaceStencilOp}
+          />
+        </mesh>
       ) : null}
 
       <OrbitControls ref={orbitRef} makeDefault enabled={orbitEnabled} />

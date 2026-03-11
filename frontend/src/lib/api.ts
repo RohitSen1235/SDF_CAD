@@ -1,6 +1,7 @@
 import {
   CompileDiagnostics,
   GridConfig,
+  MeshWorkflowParams,
   PreviewMeshResponse,
   QualityProfile,
   SceneIR
@@ -101,6 +102,75 @@ export async function exportMesh(
         format,
         quality_profile: qualityProfile
       })
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({ detail: "Export failed" }));
+      throw new Error(payload.detail ?? "Export failed");
+    }
+    return response.blob();
+  } catch (error) {
+    if ((error as Error)?.name === "AbortError") {
+      throw error;
+    }
+    if (error instanceof TypeError) {
+      throw asNetworkError(error);
+    }
+    throw error;
+  }
+}
+
+function appendMeshWorkflowFormData(
+  body: FormData,
+  file: File,
+  params: MeshWorkflowParams,
+  qualityProfile: QualityProfile
+): void {
+  body.append("file", file, file.name);
+  body.append("shell_thickness", String(params.shellThickness));
+  body.append("lattice_type", params.latticeType);
+  body.append("lattice_pitch", String(params.latticePitch));
+  body.append("lattice_thickness", String(params.latticeThickness));
+  body.append("lattice_phase", String(params.latticePhase));
+  body.append("quality_profile", qualityProfile);
+}
+
+export async function previewUploadedMesh(
+  file: File,
+  params: MeshWorkflowParams,
+  qualityProfile: QualityProfile
+): Promise<PreviewMeshResponse> {
+  try {
+    const body = new FormData();
+    appendMeshWorkflowFormData(body, file, params, qualityProfile);
+    const response = await fetch(`${API_BASE}/api/v1/mesh/preview`, {
+      method: "POST",
+      body
+    });
+    return parseJsonOrThrow(response);
+  } catch (error) {
+    if ((error as Error)?.name === "AbortError") {
+      throw error;
+    }
+    if (error instanceof TypeError) {
+      throw asNetworkError(error);
+    }
+    throw error;
+  }
+}
+
+export async function exportUploadedMesh(
+  file: File,
+  params: MeshWorkflowParams,
+  format: "stl" | "obj",
+  qualityProfile: QualityProfile
+): Promise<Blob> {
+  try {
+    const body = new FormData();
+    appendMeshWorkflowFormData(body, file, params, qualityProfile);
+    body.append("format", format);
+    const response = await fetch(`${API_BASE}/api/v1/mesh/export`, {
+      method: "POST",
+      body
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({ detail: "Export failed" }));

@@ -124,9 +124,10 @@ def build_mesh(field: np.ndarray, bounds: list[list[float]], chunk_size: int | N
             "No zero level-set detected in current grid bounds. Expand bounds or change parameters."
         )
 
-    if field.shape[0] >= 192:
+    try:
+        return _mesh_single(field, bounds)
+    except MemoryError:
         return _mesh_chunked(field, bounds, chunk_size=chunk_size or 80)
-    return _mesh_single(field, bounds)
 
 
 

@@ -103,7 +103,7 @@ def _smooth_union(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:
     if k <= 0:
         return np.minimum(a, b)
     if NUMBA_AVAILABLE and _smin_numba is not None:
-        return _smin_numba(a, b, np.array(k, dtype=a.dtype))
+        return _smin_numba(a, b, a.dtype.type(k))
     h = np.clip(0.5 + 0.5 * (b - a) / k, 0.0, 1.0)
     return (b * (1.0 - h) + a * h) - k * h * (1.0 - h)
 
@@ -165,6 +165,113 @@ def _repeat_local(coord: np.ndarray, pitch: float) -> np.ndarray:
     return ((coord + pitch * 0.5) % pitch) - pitch * 0.5
 
 
+def _parse_float_tokens(raw: str) -> list[float] | None:
+    text = raw.replace(";", " ").replace(",", " ")
+    tokens = [token for token in text.split() if token]
+    if not tokens:
+        return None
+    out: list[float] = []
+    for token in tokens:
+        try:
+            out.append(float(token))
+        except ValueError:
+            return None
+    return out
+
+
+def _parse_points_string(raw: str) -> list[tuple[float, float, float]] | None:
+    values = _parse_float_tokens(raw)
+    if values is None or len(values) < 6 or len(values) % 3 != 0:
+        return None
+    return [
+        (values[idx], values[idx + 1], values[idx + 2])
+        for idx in range(0, len(values), 3)
+    ]
+
+
+def _parse_heights_grid(raw: str) -> np.ndarray | None:
+    values = _parse_float_tokens(raw)
+    if values is None or len(values) != 16:
+        return None
+    return np.asarray(values, dtype=np.float64).reshape(4, 4)
+
+
+def _catmull_rom_sample(
+    p0: tuple[float, float, float],
+    p1: tuple[float, float, float],
+    p2: tuple[float, float, float],
+    p3: tuple[float, float, float],
+    t: float,
+) -> tuple[float, float, float]:
+    t2 = t * t
+    t3 = t2 * t
+    x = 0.5 * (
+        2.0 * p1[0]
+        + (-p0[0] + p2[0]) * t
+        + (2.0 * p0[0] - 5.0 * p1[0] + 4.0 * p2[0] - p3[0]) * t2
+        + (-p0[0] + 3.0 * p1[0] - 3.0 * p2[0] + p3[0]) * t3
+    )
+    y = 0.5 * (
+        2.0 * p1[1]
+        + (-p0[1] + p2[1]) * t
+        + (2.0 * p0[1] - 5.0 * p1[1] + 4.0 * p2[1] - p3[1]) * t2
+        + (-p0[1] + 3.0 * p1[1] - 3.0 * p2[1] + p3[1]) * t3
+    )
+    z = 0.5 * (
+        2.0 * p1[2]
+        + (-p0[2] + p2[2]) * t
+        + (2.0 * p0[2] - 5.0 * p1[2] + 4.0 * p2[2] - p3[2]) * t2
+        + (-p0[2] + 3.0 * p1[2] - 3.0 * p2[2] + p3[2]) * t3
+    )
+    return (x, y, z)
+
+
+def _sample_catmull_rom_polyline(
+    points: list[tuple[float, float, float]],
+    samples_per_span: int,
+    closed: bool,
+) -> list[tuple[float, float, float]]:
+    if len(points) < 2:
+        return points
+
+    samples = max(4, samples_per_span)
+    polyline: list[tuple[float, float, float]] = []
+
+    if closed:
+        count = len(points)
+        for idx in range(count):
+            p0 = points[(idx - 1) % count]
+            p1 = points[idx]
+            p2 = points[(idx + 1) % count]
+            p3 = points[(idx + 2) % count]
+            for step in range(samples):
+                t = float(step) / float(samples)
+                polyline.append(_catmull_rom_sample(p0, p1, p2, p3, t))
+        polyline.append(polyline[0])
+        return polyline
+
+    span_count = len(points) - 1
+    for idx in range(span_count):
+        p0 = points[idx - 1] if idx > 0 else points[idx]
+        p1 = points[idx]
+        p2 = points[idx + 1]
+        p3 = points[idx + 2] if idx + 2 < len(points) else points[idx + 1]
+        for step in range(samples):
+            t = float(step) / float(samples)
+            polyline.append(_catmull_rom_sample(p0, p1, p2, p3, t))
+    polyline.append(points[-1])
+    return polyline
+
+
+def _cubic_bezier_basis(t: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    one_minus = 1.0 - t
+    b0 = one_minus * one_minus * one_minus
+    b1 = 3.0 * t * one_minus * one_minus
+    b2 = 3.0 * t * t * one_minus
+    b3 = t * t * t
+    return b0, b1, b2, b3
+
+
 def _strut_segments(kind: str) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
     c = (0.0, 0.0, 0.0)
     corners = [
@@ -222,6 +329,107 @@ class _FieldRuntime:
         self.scene_ir = scene_ir
         self.parameter_values = parameter_values
         self.node_lookup: dict[str, SceneNode] = {node.id: node for node in scene_ir.nodes}
+        self._bounds_hint_cache: dict[str, tuple[float, float, float, float, float, float] | None] = {
+            node.id: self._resolve_bounds_hint(node) for node in scene_ir.nodes
+        }
+        self._scalar_param_cache: dict[tuple[str, str], float] = {}
+        self._string_param_cache: dict[tuple[str, str], str] = {}
+        self._transform_cache: dict[str, tuple[float, float, float, float, float, float, np.ndarray | None]] = {}
+        self._spline_polyline_cache: dict[
+            tuple[str, str, bool, int],
+            list[tuple[float, float, float]],
+        ] = {}
+        self._freeform_grid_cache: dict[tuple[str, str], np.ndarray] = {}
+
+    def _node_scalar_param(self, node: SceneNode, key: str, default: Any) -> float:
+        cache_key = (node.id, key)
+        if cache_key in self._scalar_param_cache:
+            return self._scalar_param_cache[cache_key]
+        value = _resolve_scalar(node.params.get(key, default), self.parameter_values)
+        self._scalar_param_cache[cache_key] = value
+        return value
+
+    def _node_string_param(self, node: SceneNode, key: str, default: str) -> str:
+        cache_key = (node.id, key)
+        if cache_key in self._string_param_cache:
+            return self._string_param_cache[cache_key]
+        value = _resolve_string(node.params.get(key, default), default)
+        self._string_param_cache[cache_key] = value
+        return value
+
+    def _node_transform(
+        self, node: SceneNode
+    ) -> tuple[float, float, float, float, float, float, np.ndarray | None]:
+        cached = self._transform_cache.get(node.id)
+        if cached is not None:
+            return cached
+
+        transform_payload = node.transform or {}
+        translate = _resolve_vec3(
+            transform_payload.get("translate", [0.0, 0.0, 0.0]),
+            self.parameter_values,
+            (0.0, 0.0, 0.0),
+        )
+        rotate = _resolve_vec3(
+            transform_payload.get("rotate", [0.0, 0.0, 0.0]),
+            self.parameter_values,
+            (0.0, 0.0, 0.0),
+        )
+        scale = _resolve_vec3(
+            transform_payload.get("scale", [1.0, 1.0, 1.0]),
+            self.parameter_values,
+            (1.0, 1.0, 1.0),
+        )
+        sx, sy, sz = scale
+        if abs(sx) < 1e-6 or abs(sy) < 1e-6 or abs(sz) < 1e-6:
+            raise EvaluationError(f"Node '{node.id}' has singular scale")
+
+        inv_rotation = _rotation_matrix_xyz(rotate).T if any(abs(v) > 1e-9 for v in rotate) else None
+        tx, ty, tz = translate
+        out = (tx, ty, tz, sx, sy, sz, inv_rotation)
+        self._transform_cache[node.id] = out
+        return out
+
+    def _node_spline_polyline(self, node: SceneNode) -> list[tuple[float, float, float]]:
+        points_raw = self._node_string_param(
+            node,
+            "points",
+            "0 0 0; 0.4 0.2 0; 0.8 -0.2 0.1; 1.2 0 0",
+        )
+        closed = self._node_scalar_param(node, "closed", 0.0) >= 0.5
+        samples = int(max(4, round(self._node_scalar_param(node, "samples", 20.0))))
+        cache_key = (node.id, points_raw, closed, samples)
+        if cache_key in self._spline_polyline_cache:
+            return self._spline_polyline_cache[cache_key]
+
+        points = _parse_points_string(points_raw)
+        if points is None or len(points) < 2:
+            raise EvaluationError(
+                f"spline primitive '{node.id}' must define at least two 3D control points in 'points'"
+            )
+        polyline = _sample_catmull_rom_polyline(points, samples, closed)
+        if len(polyline) < 2:
+            raise EvaluationError(f"spline primitive '{node.id}' could not build a valid curve")
+        self._spline_polyline_cache[cache_key] = polyline
+        return polyline
+
+    def _node_freeform_grid(self, node: SceneNode) -> np.ndarray:
+        heights_raw = self._node_string_param(
+            node,
+            "heights",
+            "0 0 0 0; 0 0.2 0.2 0; 0 0.2 0.2 0; 0 0 0 0",
+        )
+        cache_key = (node.id, heights_raw)
+        if cache_key in self._freeform_grid_cache:
+            return self._freeform_grid_cache[cache_key]
+
+        grid = _parse_heights_grid(heights_raw)
+        if grid is None:
+            raise EvaluationError(
+                f"freeform_surface primitive '{node.id}' expects exactly 16 numeric values in 'heights'"
+            )
+        self._freeform_grid_cache[cache_key] = grid
+        return grid
 
     def evaluate(self, px: np.ndarray, py: np.ndarray, pz: np.ndarray) -> np.ndarray:
         memo: dict[tuple[str, int, int, int], np.ndarray] = {}
@@ -235,7 +443,7 @@ class _FieldRuntime:
             if node is None:
                 raise EvaluationError(f"Node '{node_id}' is not defined")
 
-            bounds_hint = self._resolve_bounds_hint(node)
+            bounds_hint = self._bounds_hint_cache.get(node.id)
             if bounds_hint is not None and node.type in LEAF_TYPES_WITH_AABB_SKIP:
                 xmin, xmax, ymin, ymax, zmin, zmax = bounds_hint
                 mask = (
@@ -398,15 +606,14 @@ class _FieldRuntime:
 
         def eval_primitive(node: SceneNode, qx: np.ndarray, qy: np.ndarray, qz: np.ndarray) -> np.ndarray:
             primitive = node.primitive
-            params = node.params
             if primitive == "sphere":
-                r = _resolve_scalar(params.get("r", 1.0), self.parameter_values)
+                r = self._node_scalar_param(node, "r", 1.0)
                 return np.sqrt(qx * qx + qy * qy + qz * qz) - r
 
             if primitive == "box":
-                bx = _resolve_scalar(params.get("x", 0.5), self.parameter_values)
-                by = _resolve_scalar(params.get("y", 0.5), self.parameter_values)
-                bz = _resolve_scalar(params.get("z", 0.5), self.parameter_values)
+                bx = self._node_scalar_param(node, "x", 0.5)
+                by = self._node_scalar_param(node, "y", 0.5)
+                bz = self._node_scalar_param(node, "z", 0.5)
                 qmx = np.abs(qx) - bx
                 qmy = np.abs(qy) - by
                 qmz = np.abs(qz) - bz
@@ -418,8 +625,8 @@ class _FieldRuntime:
                 return outside + inside
 
             if primitive == "cylinder":
-                r = _resolve_scalar(params.get("r", 0.4), self.parameter_values)
-                h = _resolve_scalar(params.get("h", 1.0), self.parameter_values)
+                r = self._node_scalar_param(node, "r", 0.4)
+                h = self._node_scalar_param(node, "h", 1.0)
                 d1 = np.sqrt(qx * qx + qz * qz) - r
                 d2 = np.abs(qy) - h * 0.5
                 outside = np.sqrt(np.maximum(d1, 0.0) ** 2 + np.maximum(d2, 0.0) ** 2)
@@ -427,16 +634,53 @@ class _FieldRuntime:
                 return outside + inside
 
             if primitive == "torus":
-                major_r = _resolve_scalar(params.get("R", 0.8), self.parameter_values)
-                minor_r = _resolve_scalar(params.get("r", 0.2), self.parameter_values)
+                major_r = self._node_scalar_param(node, "R", 0.8)
+                minor_r = self._node_scalar_param(node, "r", 0.2)
                 q = np.sqrt(qx * qx + qz * qz) - major_r
                 return np.sqrt(q * q + qy * qy) - minor_r
 
+            if primitive == "spline":
+                radius = self._node_scalar_param(node, "radius", 0.08)
+                curve = self._node_spline_polyline(node)
+                dist = np.full_like(qx, fill_value=np.inf, dtype=np.float64)
+                for idx in range(len(curve) - 1):
+                    dseg = _dist_to_segment(qx, qy, qz, curve[idx], curve[idx + 1])
+                    dist = np.minimum(dist, dseg)
+                return dist - abs(radius)
+
+            if primitive == "freeform_surface":
+                grid = self._node_freeform_grid(node)
+                x_extent = abs(self._node_scalar_param(node, "x", 1.0))
+                z_extent = abs(self._node_scalar_param(node, "z", 1.0))
+                thickness = abs(self._node_scalar_param(node, "thickness", 0.06))
+                if x_extent < 1e-6 or z_extent < 1e-6:
+                    raise EvaluationError("freeform_surface x/z extents must be non-zero")
+
+                u = np.clip(qx / (2.0 * x_extent) + 0.5, 0.0, 1.0)
+                v = np.clip(qz / (2.0 * z_extent) + 0.5, 0.0, 1.0)
+                bu0, bu1, bu2, bu3 = _cubic_bezier_basis(u)
+                bv0, bv1, bv2, bv3 = _cubic_bezier_basis(v)
+
+                row0 = bv0 * grid[0, 0] + bv1 * grid[0, 1] + bv2 * grid[0, 2] + bv3 * grid[0, 3]
+                row1 = bv0 * grid[1, 0] + bv1 * grid[1, 1] + bv2 * grid[1, 2] + bv3 * grid[1, 3]
+                row2 = bv0 * grid[2, 0] + bv1 * grid[2, 1] + bv2 * grid[2, 2] + bv3 * grid[2, 3]
+                row3 = bv0 * grid[3, 0] + bv1 * grid[3, 1] + bv2 * grid[3, 2] + bv3 * grid[3, 3]
+                surface_y = bu0 * row0 + bu1 * row1 + bu2 * row2 + bu3 * row3
+
+                sheet = np.abs(qy - surface_y) - thickness
+
+                rx = np.abs(qx) - x_extent
+                rz = np.abs(qz) - z_extent
+                outside = np.sqrt(np.maximum(rx, 0.0) ** 2 + np.maximum(rz, 0.0) ** 2)
+                inside = np.minimum(np.maximum(rx, rz), 0.0)
+                footprint = outside + inside
+                return np.maximum(sheet, footprint)
+
             if primitive == "plane":
-                nx = _resolve_scalar(params.get("nx", 0.0), self.parameter_values)
-                ny = _resolve_scalar(params.get("ny", 1.0), self.parameter_values)
-                nz = _resolve_scalar(params.get("nz", 0.0), self.parameter_values)
-                d = _resolve_scalar(params.get("d", 0.0), self.parameter_values)
+                nx = self._node_scalar_param(node, "nx", 0.0)
+                ny = self._node_scalar_param(node, "ny", 1.0)
+                nz = self._node_scalar_param(node, "nz", 0.0)
+                d = self._node_scalar_param(node, "d", 0.0)
                 norm = np.sqrt(nx * nx + ny * ny + nz * nz)
                 if norm < 1e-9:
                     raise EvaluationError("plane normal cannot be a zero vector")
@@ -463,7 +707,7 @@ class _FieldRuntime:
                     result = np.maximum(result, -field)
                 return result
             if op == "smooth_union":
-                k = _resolve_scalar(node.params.get("k", 0.2), self.parameter_values)
+                k = self._node_scalar_param(node, "k", 0.2)
                 result = fields[0]
                 for field in fields[1:]:
                     result = _smooth_union(result, field, k)
@@ -475,36 +719,12 @@ class _FieldRuntime:
             if len(node.inputs) != 1:
                 raise EvaluationError(f"Transform node '{node.id}' must have exactly one input")
 
-            transform_payload = node.transform or {}
-
-            translate = _resolve_vec3(
-                transform_payload.get("translate", [0.0, 0.0, 0.0]),
-                self.parameter_values,
-                (0.0, 0.0, 0.0),
-            )
-            rotate = _resolve_vec3(
-                transform_payload.get("rotate", [0.0, 0.0, 0.0]),
-                self.parameter_values,
-                (0.0, 0.0, 0.0),
-            )
-            scale = _resolve_vec3(
-                transform_payload.get("scale", [1.0, 1.0, 1.0]),
-                self.parameter_values,
-                (1.0, 1.0, 1.0),
-            )
-
-            sx, sy, sz = scale
-            if abs(sx) < 1e-6 or abs(sy) < 1e-6 or abs(sz) < 1e-6:
-                raise EvaluationError(f"Node '{node.id}' has singular scale")
-
-            tx, ty, tz = translate
+            tx, ty, tz, sx, sy, sz, inv_rotation = self._node_transform(node)
             local_x = qx - tx
             local_y = qy - ty
             local_z = qz - tz
 
-            if any(abs(v) > 1e-9 for v in rotate):
-                rotation = _rotation_matrix_xyz(rotate)
-                inv_rotation = rotation.T
+            if inv_rotation is not None:
                 rx = inv_rotation[0, 0] * local_x + inv_rotation[0, 1] * local_y + inv_rotation[0, 2] * local_z
                 ry = inv_rotation[1, 0] * local_x + inv_rotation[1, 1] * local_y + inv_rotation[1, 2] * local_z
                 rz = inv_rotation[2, 0] * local_x + inv_rotation[2, 1] * local_y + inv_rotation[2, 2] * local_z
@@ -522,20 +742,19 @@ class _FieldRuntime:
                 raise EvaluationError(f"Domain op node '{node.id}' must have exactly one child")
 
             op = node.op
-            params = node.params
 
             if op == "repeat":
-                pxp = _resolve_scalar(params.get("x", 1.0), self.parameter_values)
-                pyp = _resolve_scalar(params.get("y", 1.0), self.parameter_values)
-                pzp = _resolve_scalar(params.get("z", 1.0), self.parameter_values)
+                pxp = self._node_scalar_param(node, "x", 1.0)
+                pyp = self._node_scalar_param(node, "y", 1.0)
+                pzp = self._node_scalar_param(node, "z", 1.0)
                 rx = _repeat_local(qx, pxp)
                 ry = _repeat_local(qy, pyp)
                 rz = _repeat_local(qz, pzp)
                 return eval_node(node.inputs[0], rx, ry, rz)
 
             if op == "twist":
-                k = _resolve_scalar(params.get("k", 1.0), self.parameter_values)
-                axis = _resolve_string(params.get("axis", "y"), "y").lower()
+                k = self._node_scalar_param(node, "k", 1.0)
+                axis = self._node_string_param(node, "axis", "y").lower()
                 if axis == "y":
                     angle = k * qy
                     ca = np.cos(angle)
@@ -558,8 +777,8 @@ class _FieldRuntime:
                 return eval_node(node.inputs[0], rx, ry, qz)
 
             if op == "bend":
-                k = _resolve_scalar(params.get("k", 0.5), self.parameter_values)
-                axis = _resolve_string(params.get("axis", "x"), "x").lower()
+                k = self._node_scalar_param(node, "k", 0.5)
+                axis = self._node_string_param(node, "axis", "x").lower()
                 if axis == "x":
                     angle = k * qx
                     ca = np.cos(angle)
@@ -582,20 +801,20 @@ class _FieldRuntime:
                 return eval_node(node.inputs[0], rx, ry, qz)
 
             if op == "shell":
-                thickness = _resolve_scalar(params.get("t", 0.1), self.parameter_values)
+                thickness = self._node_scalar_param(node, "t", 0.1)
                 inner = eval_node(node.inputs[0], qx, qy, qz)
                 return np.abs(inner) - abs(thickness)
 
             if op == "offset":
-                d = _resolve_scalar(params.get("d", 0.0), self.parameter_values)
+                d = self._node_scalar_param(node, "d", 0.0)
                 child = eval_node(node.inputs[0], qx, qy, qz)
                 return child - d
 
             if op == "circular_array":
-                raw_count = _resolve_scalar(params.get("count", 12.0), self.parameter_values)
+                raw_count = self._node_scalar_param(node, "count", 12.0)
                 count = int(max(1, round(raw_count)))
-                phase = _resolve_scalar(params.get("phase", 0.0), self.parameter_values)
-                axis = _resolve_string(params.get("axis", "y"), "y").lower()
+                phase = self._node_scalar_param(node, "phase", 0.0)
+                axis = self._node_string_param(node, "axis", "y").lower()
 
                 if count == 1:
                     return eval_node(node.inputs[0], qx, qy, qz)
@@ -628,12 +847,11 @@ class _FieldRuntime:
 
         def eval_lattice(node: SceneNode, qx: np.ndarray, qy: np.ndarray, qz: np.ndarray) -> np.ndarray:
             op = node.op
-            params = node.params
 
             if op in {"gyroid", "schwarz_p", "diamond"}:
-                pitch = _resolve_scalar(params.get("pitch", 1.0), self.parameter_values)
-                phase = _resolve_scalar(params.get("phase", 0.0), self.parameter_values)
-                thickness = _resolve_scalar(params.get("thickness", 0.08), self.parameter_values)
+                pitch = self._node_scalar_param(node, "pitch", 1.0)
+                phase = self._node_scalar_param(node, "phase", 0.0)
+                thickness = self._node_scalar_param(node, "thickness", 0.08)
                 scale = 2.0 * np.pi / max(abs(pitch), 1e-6)
                 u = qx * scale + phase
                 v = qy * scale + phase
@@ -654,9 +872,9 @@ class _FieldRuntime:
                 return np.abs(base) - abs(thickness)
 
             if op == "strut_lattice":
-                kind = _resolve_string(params.get("type", "bcc"), "bcc").lower()
-                pitch = _resolve_scalar(params.get("pitch", 1.0), self.parameter_values)
-                radius = _resolve_scalar(params.get("radius", 0.08), self.parameter_values)
+                kind = self._node_string_param(node, "type", "bcc").lower()
+                pitch = self._node_scalar_param(node, "pitch", 1.0)
+                radius = self._node_scalar_param(node, "radius", 0.08)
 
                 rx = _repeat_local(qx, pitch) / max(abs(pitch), 1e-6)
                 ry = _repeat_local(qy, pitch) / max(abs(pitch), 1e-6)
@@ -675,9 +893,9 @@ class _FieldRuntime:
                     raise EvaluationError("conformal_fill requires two child nodes: host and lattice")
                 host = eval_node(node.inputs[0], qx, qy, qz)
                 lattice = eval_node(node.inputs[1], qx, qy, qz)
-                wall = _resolve_scalar(params.get("wall", 0.1), self.parameter_values)
-                offset = _resolve_scalar(params.get("offset", 0.0), self.parameter_values)
-                mode = _resolve_string(params.get("mode", "shell"), "shell").lower()
+                wall = self._node_scalar_param(node, "wall", 0.1)
+                offset = self._node_scalar_param(node, "offset", 0.0)
+                mode = self._node_string_param(node, "mode", "shell").lower()
 
                 host_shifted = host + offset
                 clipped = np.maximum(lattice, host_shifted)
@@ -693,23 +911,22 @@ class _FieldRuntime:
 
         def eval_turbomachine(node: SceneNode, qx: np.ndarray, qy: np.ndarray, qz: np.ndarray) -> np.ndarray:
             op = node.op
-            params = node.params
             r = np.sqrt(qx * qx + qz * qz)
             theta = np.arctan2(qz, qx)
 
             if op in {"impeller_centrifugal", "radial_turbine"}:
-                r_in = _resolve_scalar(params.get("r_in", 0.25), self.parameter_values)
-                r_out = _resolve_scalar(params.get("r_out", 1.0), self.parameter_values)
-                hub_h = _resolve_scalar(params.get("hub_h", 0.45), self.parameter_values)
-                blade_count = int(max(1, round(_resolve_scalar(params.get("blade_count", 8.0), self.parameter_values))))
-                blade_thickness = _resolve_scalar(params.get("blade_thickness", 0.08), self.parameter_values)
-                blade_twist = _resolve_scalar(params.get("blade_twist", 0.8), self.parameter_values)
+                r_in = self._node_scalar_param(node, "r_in", 0.25)
+                r_out = self._node_scalar_param(node, "r_out", 1.0)
+                hub_h = self._node_scalar_param(node, "hub_h", 0.45)
+                blade_count = int(max(1, round(self._node_scalar_param(node, "blade_count", 8.0))))
+                blade_thickness = self._node_scalar_param(node, "blade_thickness", 0.08)
+                blade_twist = self._node_scalar_param(node, "blade_twist", 0.8)
 
                 if op == "impeller_centrifugal":
-                    shroud_gap = _resolve_scalar(params.get("shroud_gap", 0.05), self.parameter_values)
+                    shroud_gap = self._node_scalar_param(node, "shroud_gap", 0.05)
                     blade_twist_dir = blade_twist
                 else:
-                    shroud_gap = _resolve_scalar(params.get("shroud_gap", 0.03), self.parameter_values)
+                    shroud_gap = self._node_scalar_param(node, "shroud_gap", 0.03)
                     blade_twist_dir = blade_twist
 
                 radial_span = max(r_out - r_in, 1e-6)
@@ -732,12 +949,12 @@ class _FieldRuntime:
                 return np.maximum(solid, bore)
 
             if op == "volute_casing":
-                throat_radius = _resolve_scalar(params.get("throat_radius", 0.35), self.parameter_values)
-                outlet_radius = _resolve_scalar(params.get("outlet_radius", 1.4), self.parameter_values)
-                area_growth = _resolve_scalar(params.get("area_growth", 0.9), self.parameter_values)
-                width = _resolve_scalar(params.get("width", 0.6), self.parameter_values)
-                wall = _resolve_scalar(params.get("wall", 0.08), self.parameter_values)
-                tongue_clearance = _resolve_scalar(params.get("tongue_clearance", 0.06), self.parameter_values)
+                throat_radius = self._node_scalar_param(node, "throat_radius", 0.35)
+                outlet_radius = self._node_scalar_param(node, "outlet_radius", 1.4)
+                area_growth = self._node_scalar_param(node, "area_growth", 0.9)
+                width = self._node_scalar_param(node, "width", 0.6)
+                wall = self._node_scalar_param(node, "wall", 0.08)
+                tongue_clearance = self._node_scalar_param(node, "tongue_clearance", 0.06)
 
                 theta01 = (theta + np.pi) / (2.0 * np.pi)
                 centerline = throat_radius + (outlet_radius - throat_radius) * theta01

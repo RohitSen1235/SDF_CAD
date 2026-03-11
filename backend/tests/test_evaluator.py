@@ -130,3 +130,42 @@ def test_circular_array_domain_op_produces_periodic_blades() -> None:
     iz = np.clip(((ring_z + 1.2) / 2.4 * 63).astype(int), 0, 63)
     samples = field[ix, iy, iz]
     assert float(np.std(samples)) > 1e-3
+
+
+def test_spline_primitive_builds_tubular_mesh() -> None:
+    source = """
+    root = spline(
+      points="0 0 0; 0.3 0.25 0.0; 0.75 -0.2 0.18; 1.2 0.0 0.0",
+      radius=0.09,
+      samples=24
+    )
+    """
+    scene = compile_source(source)
+    params = merge_parameter_values(scene, {})
+    grid = GridConfig(bounds=[[-0.3, 1.4], [-0.6, 0.6], [-0.6, 0.6]], resolution=64)
+    field = evaluate_scene_field(scene, params, grid)
+    mesh = build_mesh(field, grid.bounds)
+
+    assert np.all(np.isfinite(field))
+    assert mesh.vertices.shape[0] > 0
+    assert mesh.faces.shape[0] > 0
+
+
+def test_freeform_surface_primitive_builds_mesh() -> None:
+    source = """
+    root = freeform_surface(
+      heights="0 0 0 0; 0 0.26 0.32 0; 0 0.24 0.28 0; 0 0 0 0",
+      x=0.9,
+      z=0.8,
+      thickness=0.05
+    )
+    """
+    scene = compile_source(source)
+    params = merge_parameter_values(scene, {})
+    grid = GridConfig(bounds=[[-1.0, 1.0], [-0.3, 0.6], [-1.0, 1.0]], resolution=64)
+    field = evaluate_scene_field(scene, params, grid)
+    mesh = build_mesh(field, grid.bounds)
+
+    assert np.all(np.isfinite(field))
+    assert mesh.vertices.shape[0] > 0
+    assert mesh.faces.shape[0] > 0

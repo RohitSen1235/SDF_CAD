@@ -10,6 +10,7 @@ export type SceneNodeType =
   | "turbomachine";
 
 export type QualityProfile = "interactive" | "medium" | "high" | "ultra";
+export type MeshLatticeType = "gyroid" | "schwarz_p" | "diamond";
 
 export interface ParameterSpec {
   name: string;
@@ -65,4 +66,12 @@ export interface PreviewStats {
 export interface PreviewMeshResponse {
   mesh: MeshPayload;
   stats: PreviewStats;
+}
+
+export interface MeshWorkflowParams {
+  shellThickness: number;
+  latticeType: MeshLatticeType;
+  latticePitch: number;
+  latticeThickness: number;
+  latticePhase: number;
 }

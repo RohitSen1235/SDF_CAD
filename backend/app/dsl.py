@@ -206,7 +206,7 @@ class _AstBuilder(Transformer):
         return BinaryExpr(op="^", left=left, right=right)
 
 
-PRIMITIVES = {"sphere", "box", "cylinder", "torus", "plane"}
+PRIMITIVES = {"sphere", "box", "cylinder", "torus", "plane", "spline", "freeform_surface", "freeform"}
 BOOLEAN_OPS = {"union", "intersection", "difference", "smooth_union"}
 TRANSFORMS = {"translate", "rotate", "scale"}
 DOMAIN_OPS = {"repeat", "twist", "bend", "shell", "offset", "circular_array"}
@@ -225,6 +225,37 @@ MATH_FUNCTIONS = {
     "clamp",
 }
 COORDINATE_NAMES = {"x", "y", "z"}
+
+
+def _parse_float_tokens(raw: str) -> list[float] | None:
+    text = raw.replace(";", " ").replace(",", " ")
+    tokens = [token for token in text.split() if token]
+    if not tokens:
+        return None
+    out: list[float] = []
+    for token in tokens:
+        try:
+            out.append(float(token))
+        except ValueError:
+            return None
+    return out
+
+
+def _parse_points_string(raw: str) -> list[tuple[float, float, float]] | None:
+    values = _parse_float_tokens(raw)
+    if values is None or len(values) < 6 or len(values) % 3 != 0:
+        return None
+    return [
+        (values[idx], values[idx + 1], values[idx + 2])
+        for idx in range(0, len(values), 3)
+    ]
+
+
+def _parse_heights_grid(raw: str) -> list[list[float]] | None:
+    values = _parse_float_tokens(raw)
+    if values is None or len(values) != 16:
+        return None
+    return [values[idx * 4 : (idx + 1) * 4] for idx in range(4)]
 
 
 class DslError(ValueError):
@@ -397,53 +428,115 @@ class SceneCompiler:
                     return [[-reach, reach], [-float(minor_r), float(minor_r)], [-reach, reach]]
                 return None
 
+            if name == "spline":
+                points = params.get("points")
+                radius = params.get("radius", 0.08)
+                if isinstance(points, str) and isinstance(radius, (float, int)):
+                    parsed = _parse_points_string(points)
+                    if parsed is None:
+                        return None
+                    xs = [point[0] for point in parsed]
+                    ys = [point[1] for point in parsed]
+                    zs = [point[2] for point in parsed]
+                    pad = abs(float(radius))
+                    return [
+                        [min(xs) - pad, max(xs) + pad],
+                        [min(ys) - pad, max(ys) + pad],
+                        [min(zs) - pad, max(zs) + pad],
+                    ]
+                return None
+
+            if name == "freeform_surface":
+                heights = params.get("heights")
+                x_extent = params.get("x", 1.0)
+                z_extent = params.get("z", 1.0)
+                thickness = params.get("thickness", 0.05)
+                if (
+                    isinstance(heights, str)
+                    and isinstance(x_extent, (float, int))
+                    and isinstance(z_extent, (float, int))
+                    and isinstance(thickness, (float, int))
+                ):
+                    grid = _parse_heights_grid(heights)
+                    if grid is None:
+                        return None
+                    y_values = [item for row in grid for item in row]
+                    pad = abs(float(thickness))
+                    return [
+                        [-abs(float(x_extent)), abs(float(x_extent))],
+                        [min(y_values) - pad, max(y_values) + pad],
+                        [-abs(float(z_extent)), abs(float(z_extent))],
+                    ]
+                return None
+
             return None
 
         def compile_primitive(fn: str, call: CallExpr) -> SceneNode:
+            primitive_name = "freeform_surface" if fn == "freeform" else fn
             defaults: dict[str, ScalarValue] = {}
             key_order: list[str]
-            if fn == "sphere":
+            string_keys: set[str] = set()
+            if primitive_name == "sphere":
                 defaults = {"r": 1.0}
                 key_order = ["r"]
-            elif fn == "box":
+            elif primitive_name == "box":
                 defaults = {"x": 0.5, "y": 0.5, "z": 0.5}
                 key_order = ["x", "y", "z"]
-            elif fn == "cylinder":
+            elif primitive_name == "cylinder":
                 defaults = {"r": 0.4, "h": 1.0}
                 key_order = ["r", "h"]
-            elif fn == "torus":
+            elif primitive_name == "torus":
                 defaults = {"R": 0.8, "r": 0.2}
                 key_order = ["R", "r"]
-            elif fn == "plane":
+            elif primitive_name == "plane":
                 defaults = {"nx": 0.0, "ny": 1.0, "nz": 0.0, "d": 0.0}
                 key_order = ["nx", "ny", "nz", "d"]
+            elif primitive_name == "spline":
+                defaults = {
+                    "points": "0 0 0; 0.4 0.2 0; 0.8 -0.2 0.1; 1.2 0 0",
+                    "radius": 0.08,
+                    "samples": 20.0,
+                    "closed": 0.0,
+                }
+                key_order = ["points", "radius", "samples", "closed"]
+                string_keys = {"points"}
+            elif primitive_name == "freeform_surface":
+                defaults = {
+                    "heights": "0 0 0 0; 0 0.2 0.2 0; 0 0.2 0.2 0; 0 0 0 0",
+                    "x": 1.0,
+                    "z": 1.0,
+                    "thickness": 0.06,
+                }
+                key_order = ["heights", "x", "z", "thickness"]
+                string_keys = {"heights"}
             else:
-                raise DslError(f"Unsupported primitive {fn}")
+                raise DslError(f"Unsupported primitive {primitive_name}")
 
             params: dict[str, ScalarValue] = defaults.copy()
             if call.pos_args:
-                if fn == "box" and len(call.pos_args) == 1:
+                if primitive_name == "box" and len(call.pos_args) == 1:
                     size = ensure_scalar(call.pos_args[0])
                     params["x"] = size
                     params["y"] = size
                     params["z"] = size
                 else:
                     if len(call.pos_args) > len(key_order):
-                        raise DslError(f"{fn} received too many positional arguments")
+                        raise DslError(f"{primitive_name} received too many positional arguments")
                     for idx, pos_value in enumerate(call.pos_args):
-                        params[key_order[idx]] = ensure_scalar(pos_value)
+                        key = key_order[idx]
+                        params[key] = ensure_scalar(pos_value, allow_string=key in string_keys)
 
             for key, value in call.kw_args.items():
                 if key not in defaults:
-                    raise DslError(f"{fn} does not support argument '{key}'")
-                params[key] = ensure_scalar(value)
+                    raise DslError(f"{primitive_name} does not support argument '{key}'")
+                params[key] = ensure_scalar(value, allow_string=key in string_keys)
 
             return SceneNode(
                 id="",
                 type="primitive",
-                primitive=fn,
+                primitive=primitive_name,
                 params=params,
-                bounds_hint=primitive_bounds(fn, params),
+                bounds_hint=primitive_bounds(primitive_name, params),
             )
 
         def compile_boolean(fn: str, call: CallExpr) -> SceneNode:

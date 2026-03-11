@@ -58,6 +58,25 @@ def test_compile_circular_array_domain_op() -> None:
     assert scene.root_node_id == domain_nodes[0].id
 
 
+def test_compile_spline_and_freeform_surface_primitives() -> None:
+    source = """
+    path = spline(points="0 0 0; 0.2 0.3 0.0; 0.7 -0.2 0.2; 1.1 0.0 0.0", radius=0.06, samples=18)
+    patch = freeform_surface(
+      heights="0 0 0 0; 0 0.25 0.25 0; 0 0.3 0.3 0; 0 0 0 0",
+      x=0.9,
+      z=0.7,
+      thickness=0.04
+    )
+    root = union(path, patch)
+    """
+    scene = compile_source(source)
+    primitive_nodes = [node for node in scene.nodes if node.type == "primitive"]
+    primitives = {node.primitive for node in primitive_nodes}
+    assert "spline" in primitives
+    assert "freeform_surface" in primitives
+    assert scene.root_node_id == scene.nodes[-1].id
+
+
 def test_compile_raises_for_unknown_symbol() -> None:
     source = "root = union(a, sphere(r=1.0))"
     try:

@@ -1,10 +1,18 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { Viewer } from "./components/Viewer";
-import { compileScene, exportMesh, previewMesh } from "./lib/api";
+import {
+  compileScene,
+  exportMesh,
+  exportUploadedMesh,
+  previewMesh,
+  previewUploadedMesh
+} from "./lib/api";
 import {
   CompileDiagnostics,
+  MeshLatticeType,
   MeshPayload,
+  MeshWorkflowParams,
   PreviewStats,
   QualityProfile,
   SceneIR
@@ -30,6 +38,9 @@ root = abs(a) - 0.45
 };
 
 const FUNCTION_SIGNATURES = [
+  'spline(points="x y z; ...", radius=0.08, samples=20, closed=0|1)',
+  'freeform_surface(heights="16 numbers", x=1.0, z=1.0, thickness=0.06)',
+  'freeform(heights="16 numbers", x=1.0, z=1.0, thickness=0.06)',
   "gyroid(pitch=1.0, phase=0.0, thickness=0.08)",
   "schwarz_p(pitch=1.0, phase=0.0, thickness=0.08)",
   "diamond(pitch=1.0, phase=0.0, thickness=0.08)",
@@ -48,6 +59,8 @@ const FUNCTION_SIGNATURES = [
 
 const QUALITY_ORDER: QualityProfile[] = ["interactive", "medium", "high", "ultra"];
 const SAVED_EXPRESSIONS_KEY = "sdfcad.savedFieldExpressions.v1";
+
+type WorkflowMode = "dsl" | "mesh";
 
 interface SavedFieldExpression {
   name: string;
@@ -97,10 +110,22 @@ function inferPreviewBounds(
 }
 
 export default function App() {
+  const [workflow, setWorkflow] = useState<WorkflowMode>("dsl");
+
   const [source, setSource] = useState(EXAMPLES["Gyroid Fill"]);
   const [sceneIr, setSceneIr] = useState<SceneIR | null>(null);
   const [diagnostics, setDiagnostics] = useState<CompileDiagnostics | null>(null);
   const [params, setParams] = useState<Record<string, number>>({});
+
+  const [meshFile, setMeshFile] = useState<File | null>(null);
+  const [meshShellThickness, setMeshShellThickness] = useState(0.08);
+  const [meshLatticeType, setMeshLatticeType] = useState<MeshLatticeType>("gyroid");
+  const [meshLatticePitch, setMeshLatticePitch] = useState(0.45);
+  const [meshLatticeThickness, setMeshLatticeThickness] = useState(0.09);
+  const [meshLatticePhase, setMeshLatticePhase] = useState(0.0);
+  const [meshPreviewQuality, setMeshPreviewQuality] = useState<QualityProfile>("medium");
+  const [meshExportQuality, setMeshExportQuality] = useState<QualityProfile>("high");
+
   const [mesh, setMesh] = useState<MeshPayload | null>(null);
   const [stats, setStats] = useState<PreviewStats | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -122,6 +147,17 @@ export default function App() {
 
   const paramsSignature = useMemo(() => JSON.stringify(params), [params]);
   const previewBounds = useMemo(() => inferPreviewBounds(diagnostics), [diagnostics]);
+
+  const meshWorkflowParams = useMemo<MeshWorkflowParams>(
+    () => ({
+      shellThickness: meshShellThickness,
+      latticeType: meshLatticeType,
+      latticePitch: meshLatticePitch,
+      latticeThickness: meshLatticeThickness,
+      latticePhase: meshLatticePhase
+    }),
+    [meshShellThickness, meshLatticeType, meshLatticePitch, meshLatticeThickness, meshLatticePhase]
+  );
 
   const compileAndSync = useCallback(
     async (nextSource: string) => {
@@ -148,14 +184,17 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (workflow !== "dsl") {
+      return;
+    }
     const timer = window.setTimeout(() => {
       void compileAndSync(source);
     }, 420);
     return () => window.clearTimeout(timer);
-  }, [source, compileAndSync]);
+  }, [source, compileAndSync, workflow]);
 
   useEffect(() => {
-    if (!sceneIr) {
+    if (workflow !== "dsl" || !sceneIr) {
       return;
     }
 
@@ -234,7 +273,7 @@ export default function App() {
         controller.abort();
       }
     };
-  }, [sceneIr, paramsSignature, quality, previewBounds]);
+  }, [workflow, sceneIr, paramsSignature, quality, previewBounds, params]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -267,7 +306,7 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  const onExport = async (format: "stl" | "obj") => {
+  const onExportDsl = async (format: "stl" | "obj") => {
     if (!sceneIr) {
       return;
     }
@@ -276,6 +315,43 @@ export default function App() {
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
       link.download = `sdf-model.${format}`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+    } catch (exportError) {
+      setError((exportError as Error).message);
+    }
+  };
+
+  const onGenerateMesh = async () => {
+    if (!meshFile) {
+      setError("Upload an STL or OBJ file first.");
+      return;
+    }
+
+    setIsPreviewing(true);
+    setError(null);
+    try {
+      const response = await previewUploadedMesh(meshFile, meshWorkflowParams, meshPreviewQuality);
+      setMesh(response.mesh);
+      setStats(response.stats);
+    } catch (previewError) {
+      setError((previewError as Error).message);
+    } finally {
+      setIsPreviewing(false);
+    }
+  };
+
+  const onExportUploaded = async (format: "stl" | "obj") => {
+    if (!meshFile) {
+      setError("Upload an STL or OBJ file before exporting.");
+      return;
+    }
+
+    try {
+      const blob = await exportUploadedMesh(meshFile, meshWorkflowParams, format, meshExportQuality);
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `mesh-lattice.${format}`;
       link.click();
       URL.revokeObjectURL(link.href);
     } catch (exportError) {
@@ -321,114 +397,256 @@ export default function App() {
     setError(null);
   };
 
+  const statusQuality = workflow === "dsl" ? quality : meshPreviewQuality;
+
   return (
     <div className="shell">
       <header className="topbar">
         <h1>SDF CAD Studio</h1>
         <div className="status-pills">
-          <span className={isCompiling ? "pill active" : "pill"}>{isCompiling ? "Compiling" : "Compiled"}</span>
+          <span className={workflow === "dsl" && isCompiling ? "pill active" : "pill"}>
+            {workflow === "dsl" ? (isCompiling ? "Compiling" : "Compiled") : "Mesh Workflow"}
+          </span>
           <span className={isPreviewing ? "pill active" : "pill"}>{isPreviewing ? "Previewing" : "Preview Ready"}</span>
-          <span className="pill">Q: {quality}</span>
+          <span className="pill">Q: {statusQuality}</span>
         </div>
       </header>
 
       <main className="layout">
         <section className="panel editor-panel">
-          <div className="panel-title-row">
-            <h2>DSL Editor</h2>
-            <div className="inline-actions">
-              <select onChange={(event) => setSource(EXAMPLES[event.target.value])} defaultValue="Gyroid Fill">
-                {Object.keys(EXAMPLES).map((name) => (
-                  <option key={name} value={name}>
-                    {name}
-                  </option>
-                ))}
-              </select>
-              <button type="button" onClick={() => setIsSignatureHelpOpen(true)}>
-                Signature Help
-              </button>
-              <button onClick={() => void compileAndSync(source)}>Compile now</button>
-            </div>
-          </div>
-
-          <textarea
-            value={source}
-            onChange={(event) => setSource(event.target.value)}
-            spellCheck={false}
-            className="editor"
-            aria-label="DSL source editor"
-          />
-
-          <h3>Field Expressions</h3>
-          <div className="saved-expr-row">
-            <input
-              type="text"
-              value={expressionName}
-              onChange={(event) => setExpressionName(event.target.value)}
-              placeholder="Expression name"
-              aria-label="Field expression name"
-            />
-            <button type="button" onClick={onSaveExpression}>
-              Save
-            </button>
-            <select
-              value={selectedExpressionName}
-              onChange={(event) => setSelectedExpressionName(event.target.value)}
-              aria-label="Saved field expressions"
+          <div className="workflow-toggle" role="tablist" aria-label="Workflow mode">
+            <button
+              type="button"
+              className={workflow === "dsl" ? "active" : ""}
+              onClick={() => setWorkflow("dsl")}
+              role="tab"
+              aria-selected={workflow === "dsl"}
             >
-              <option value="">Load saved...</option>
-              {savedExpressions.map((item) => (
-                <option key={item.name} value={item.name}>
-                  {item.name}
-                </option>
-              ))}
-            </select>
-            <button type="button" onClick={onLoadExpression}>
-              Load
+              DSL
+            </button>
+            <button
+              type="button"
+              className={workflow === "mesh" ? "active" : ""}
+              onClick={() => setWorkflow("mesh")}
+              role="tab"
+              aria-selected={workflow === "mesh"}
+            >
+              Mesh
             </button>
           </div>
-          <p className="muted">{expressionStatus ?? "Save and reuse field expressions from this browser."}</p>
 
-          <h3>Parameters ({sceneIr?.parameter_schema.length ?? 0})</h3>
-          <div className="params-list">
-            {sceneIr?.parameter_schema.length ? (
-              sceneIr.parameter_schema.map((spec) => (
-                <label key={spec.name} className="slider-row">
-                  <span>
-                    {spec.name}: {params[spec.name]?.toFixed(3)}
-                  </span>
+          {workflow === "dsl" ? (
+            <>
+              <div className="panel-title-row">
+                <h2>DSL Editor</h2>
+                <div className="inline-actions">
+                  <select onChange={(event) => setSource(EXAMPLES[event.target.value])} defaultValue="Gyroid Fill">
+                    {Object.keys(EXAMPLES).map((name) => (
+                      <option key={name} value={name}>
+                        {name}
+                      </option>
+                    ))}
+                  </select>
+                  <button type="button" onClick={() => setIsSignatureHelpOpen(true)}>
+                    Signature Help
+                  </button>
+                  <button onClick={() => void compileAndSync(source)}>Compile now</button>
+                </div>
+              </div>
+
+              <textarea
+                value={source}
+                onChange={(event) => setSource(event.target.value)}
+                spellCheck={false}
+                className="editor"
+                aria-label="DSL source editor"
+              />
+
+              <h3>Field Expressions</h3>
+              <div className="saved-expr-row">
+                <input
+                  type="text"
+                  value={expressionName}
+                  onChange={(event) => setExpressionName(event.target.value)}
+                  placeholder="Expression name"
+                  aria-label="Field expression name"
+                />
+                <button type="button" onClick={onSaveExpression}>
+                  Save
+                </button>
+                <select
+                  value={selectedExpressionName}
+                  onChange={(event) => setSelectedExpressionName(event.target.value)}
+                  aria-label="Saved field expressions"
+                >
+                  <option value="">Load saved...</option>
+                  {savedExpressions.map((item) => (
+                    <option key={item.name} value={item.name}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+                <button type="button" onClick={onLoadExpression}>
+                  Load
+                </button>
+              </div>
+              <p className="muted">{expressionStatus ?? "Save and reuse field expressions from this browser."}</p>
+
+              <h3>Parameters ({sceneIr?.parameter_schema.length ?? 0})</h3>
+              <div className="params-list">
+                {sceneIr?.parameter_schema.length ? (
+                  sceneIr.parameter_schema.map((spec) => (
+                    <label key={spec.name} className="slider-row">
+                      <span>
+                        {spec.name}: {params[spec.name]?.toFixed(3)}
+                      </span>
+                      <input
+                        type="range"
+                        min={spec.min}
+                        max={spec.max}
+                        step={spec.step}
+                        value={params[spec.name] ?? spec.default}
+                        onChange={(event) =>
+                          setParams((previous) => ({
+                            ...previous,
+                            [spec.name]: Number(event.target.value)
+                          }))
+                        }
+                      />
+                      <input
+                        type="number"
+                        min={spec.min}
+                        max={spec.max}
+                        step={spec.step}
+                        value={params[spec.name] ?? spec.default}
+                        onChange={(event) =>
+                          setParams((previous) => ({
+                            ...previous,
+                            [spec.name]: Number(event.target.value)
+                          }))
+                        }
+                      />
+                    </label>
+                  ))
+                ) : (
+                  <p className="muted">Declare parameters using: param name default=.. min=.. max=.. step=..</p>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="panel-title-row">
+                <h2>Mesh Workflow</h2>
+              </div>
+
+              <div className="mesh-controls">
+                <label className="slider-row">
+                  <span>Input mesh (.stl/.obj)</span>
                   <input
-                    type="range"
-                    min={spec.min}
-                    max={spec.max}
-                    step={spec.step}
-                    value={params[spec.name] ?? spec.default}
-                    onChange={(event) =>
-                      setParams((previous) => ({
-                        ...previous,
-                        [spec.name]: Number(event.target.value)
-                      }))
-                    }
-                  />
-                  <input
-                    type="number"
-                    min={spec.min}
-                    max={spec.max}
-                    step={spec.step}
-                    value={params[spec.name] ?? spec.default}
-                    onChange={(event) =>
-                      setParams((previous) => ({
-                        ...previous,
-                        [spec.name]: Number(event.target.value)
-                      }))
-                    }
+                    type="file"
+                    accept=".stl,.obj"
+                    aria-label="Mesh file upload"
+                    onChange={(event) => setMeshFile(event.target.files?.[0] ?? null)}
                   />
                 </label>
-              ))
-            ) : (
-              <p className="muted">Declare parameters using: param name default=.. min=.. max=.. step=..</p>
-            )}
-          </div>
+                <p className="muted">{meshFile ? `Selected: ${meshFile.name}` : "No file selected."}</p>
+
+                <label className="slider-row">
+                  <span>Shell thickness</span>
+                  <input
+                    type="number"
+                    step={0.01}
+                    min={0.001}
+                    value={meshShellThickness}
+                    aria-label="Shell thickness"
+                    onChange={(event) => setMeshShellThickness(Number(event.target.value))}
+                  />
+                </label>
+
+                <label className="slider-row">
+                  <span>Lattice type</span>
+                  <select
+                    aria-label="Lattice type"
+                    value={meshLatticeType}
+                    onChange={(event) => setMeshLatticeType(event.target.value as MeshLatticeType)}
+                  >
+                    <option value="gyroid">gyroid</option>
+                    <option value="schwarz_p">schwarz_p</option>
+                    <option value="diamond">diamond</option>
+                  </select>
+                </label>
+
+                <label className="slider-row">
+                  <span>Lattice pitch</span>
+                  <input
+                    type="number"
+                    step={0.01}
+                    min={0.001}
+                    value={meshLatticePitch}
+                    aria-label="Lattice pitch"
+                    onChange={(event) => setMeshLatticePitch(Number(event.target.value))}
+                  />
+                </label>
+
+                <label className="slider-row">
+                  <span>Lattice thickness</span>
+                  <input
+                    type="number"
+                    step={0.01}
+                    min={0.001}
+                    value={meshLatticeThickness}
+                    aria-label="Lattice thickness"
+                    onChange={(event) => setMeshLatticeThickness(Number(event.target.value))}
+                  />
+                </label>
+
+                <label className="slider-row">
+                  <span>Lattice phase</span>
+                  <input
+                    type="number"
+                    step={0.05}
+                    value={meshLatticePhase}
+                    aria-label="Lattice phase"
+                    onChange={(event) => setMeshLatticePhase(Number(event.target.value))}
+                  />
+                </label>
+
+                <label className="slider-row">
+                  <span>Preview quality</span>
+                  <select
+                    aria-label="Mesh preview quality"
+                    value={meshPreviewQuality}
+                    onChange={(event) => setMeshPreviewQuality(event.target.value as QualityProfile)}
+                  >
+                    {QUALITY_ORDER.map((item) => (
+                      <option key={item} value={item}>
+                        {item}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="slider-row">
+                  <span>Export quality</span>
+                  <select
+                    aria-label="Mesh export quality"
+                    value={meshExportQuality}
+                    onChange={(event) => setMeshExportQuality(event.target.value as QualityProfile)}
+                  >
+                    {QUALITY_ORDER.map((item) => (
+                      <option key={item} value={item}>
+                        {item}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <button type="button" onClick={() => void onGenerateMesh()}>
+                  Generate Mesh Preview
+                </button>
+              </div>
+            </>
+          )}
         </section>
 
         <section className="panel viewer-panel">
@@ -443,18 +661,24 @@ export default function App() {
             <button onClick={() => setSectionEnabled((value) => !value)}>
               {sectionEnabled ? "Section Off" : "Section On"}
             </button>
-            <label className="inline-label">
-              Quality
-              <select value={quality} onChange={(event) => setQuality(event.target.value as QualityProfile)}>
-                {QUALITY_ORDER.map((item) => (
-                  <option key={item} value={item}>
-                    {item}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button onClick={() => void onExport("stl")}>Export STL</button>
-            <button onClick={() => void onExport("obj")}>Export OBJ</button>
+            {workflow === "dsl" ? (
+              <label className="inline-label">
+                Quality
+                <select value={quality} onChange={(event) => setQuality(event.target.value as QualityProfile)}>
+                  {QUALITY_ORDER.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
+            <button onClick={() => void (workflow === "dsl" ? onExportDsl("stl") : onExportUploaded("stl"))}>
+              Export STL
+            </button>
+            <button onClick={() => void (workflow === "dsl" ? onExportDsl("obj") : onExportUploaded("obj"))}>
+              Export OBJ
+            </button>
           </div>
 
           {sectionEnabled ? (
@@ -494,7 +718,7 @@ export default function App() {
         </section>
       </main>
 
-      {isSignatureHelpOpen ? (
+      {isSignatureHelpOpen && workflow === "dsl" ? (
         <div className="modal-backdrop" onClick={() => setIsSignatureHelpOpen(false)}>
           <section
             className="modal-card"
