@@ -70,6 +70,9 @@ class UploadedMeshCacheEntry:
     indices: list[list[int]]
     normals: list[list[float]]
     stats: dict[str, float | int | bool | str]
+    field_resolution: int | None = None
+    field_bounds: list[list[float]] | None = None
+    field_data: str | None = None
 
 
 uploaded_mesh_preview_cache: LruCache[UploadedMeshCacheEntry] = LruCache(maxsize=12)

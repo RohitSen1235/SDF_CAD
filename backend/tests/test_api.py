@@ -191,6 +191,9 @@ def test_mesh_preview_endpoint_obj_upload() -> None:
     payload = response.json()
     assert payload["stats"]["tri_count"] > 0
     assert len(payload["mesh"]["vertices"]) > 0
+    assert payload["field"]["encoding"] == "f32-base64"
+    assert payload["field"]["resolution"] == 48
+    assert payload["field"]["data"]
 
 
 def test_mesh_preview_preserves_original_outer_vertices() -> None:

@@ -3,6 +3,7 @@ import struct
 import numpy as np
 import pytest
 
+from app import mesh_upload
 from app.mesh_upload import MeshUploadError, parse_mesh_bytes, validate_triangle_mesh
 
 
@@ -105,3 +106,53 @@ def test_validate_accepts_closed_obj_mesh() -> None:
     mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
     validate_triangle_mesh(mesh)
     assert np.all(np.isfinite(mesh.vertices))
+
+
+def test_numba_rasterization_topology_equivalent_to_python() -> None:
+    if not mesh_upload.NUMBA_AVAILABLE:
+        pytest.skip("Numba is not available in this environment")
+
+    mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
+    bounds = mesh_upload._build_bounds(mesh)
+    resolution = 48
+    mins = np.asarray([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
+    scales = np.asarray(
+        [
+            (resolution - 1) / (bounds[0][1] - bounds[0][0]),
+            (resolution - 1) / (bounds[1][1] - bounds[1][0]),
+            (resolution - 1) / (bounds[2][1] - bounds[2][0]),
+        ],
+        dtype=np.float64,
+    )
+    verts_grid = np.ascontiguousarray((mesh.vertices - mins) * scales, dtype=np.float64)
+    faces = np.ascontiguousarray(mesh.faces, dtype=np.int32)
+
+    py_surface = mesh_upload._rasterize_surface_python(verts_grid, faces, resolution).astype(bool)
+    nb_surface = mesh_upload._rasterize_surface_numba(verts_grid, faces, resolution).astype(bool)
+    union = np.logical_or(py_surface, nb_surface)
+    if not np.any(union):
+        raise AssertionError("Expected non-empty rasterized surface for comparison")
+    overlap = float(np.count_nonzero(np.logical_and(py_surface, nb_surface))) / float(np.count_nonzero(union))
+    assert overlap >= 0.995
+
+
+def test_voxelize_falls_back_when_numba_kernel_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
+    bounds = mesh_upload._build_bounds(mesh)
+    called = {"python": False}
+    python_impl = mesh_upload._rasterize_surface_python
+
+    def fail_numba(_verts_grid: np.ndarray, _faces: np.ndarray, _resolution: int) -> np.ndarray:
+        raise RuntimeError("numba failure")
+
+    def track_python(verts_grid: np.ndarray, faces: np.ndarray, resolution: int) -> np.ndarray:
+        called["python"] = True
+        return python_impl(verts_grid, faces, resolution)
+
+    monkeypatch.setattr(mesh_upload, "_rasterize_surface_numba", fail_numba)
+    monkeypatch.setattr(mesh_upload, "_rasterize_surface_python", track_python)
+    monkeypatch.setattr(mesh_upload, "NUMBA_AVAILABLE", True)
+
+    filled = mesh_upload._voxelize_and_fill(mesh, bounds, resolution=40)
+    assert called["python"] is True
+    assert np.any(filled)

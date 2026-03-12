@@ -7,6 +7,14 @@ from typing import Any, Literal
 
 import numpy as np
 from scipy import ndimage
+try:
+    from numba import njit, prange
+
+    NUMBA_AVAILABLE = True
+except Exception:
+    njit = None  # type: ignore[assignment]
+    prange = range  # type: ignore[assignment]
+    NUMBA_AVAILABLE = False
 
 try:
     import cupy as cp
@@ -495,21 +503,18 @@ def _bounds_spacing(bounds: list[list[float]], resolution: int) -> tuple[float, 
     )
 
 
-def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: int) -> np.ndarray:
-    surface = np.zeros((resolution, resolution, resolution), dtype=bool)
+def _clip_round_index(value: float, resolution: int) -> int:
+    idx = int(round(value))
+    if idx < 0:
+        return 0
+    if idx >= resolution:
+        return resolution - 1
+    return idx
 
-    mins = np.asarray([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
-    scales = np.asarray(
-        [
-            (resolution - 1) / (bounds[0][1] - bounds[0][0]),
-            (resolution - 1) / (bounds[1][1] - bounds[1][0]),
-            (resolution - 1) / (bounds[2][1] - bounds[2][0]),
-        ],
-        dtype=np.float64,
-    )
-    verts_grid = (mesh.vertices - mins) * scales
 
-    for f0, f1, f2 in mesh.faces:
+def _rasterize_surface_python(verts_grid: np.ndarray, faces: np.ndarray, resolution: int) -> np.ndarray:
+    surface = np.zeros((resolution, resolution, resolution), dtype=np.uint8)
+    for f0, f1, f2 in faces:
         p0 = verts_grid[int(f0)]
         p1 = verts_grid[int(f1)]
         p2 = verts_grid[int(f2)]
@@ -526,10 +531,115 @@ def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: 
             for j in range(max_j + 1):
                 v = float(j) / float(steps)
                 sample = p0 + u * (p1 - p0) + v * (p2 - p0)
-                ix = int(np.clip(round(sample[0]), 0, resolution - 1))
-                iy = int(np.clip(round(sample[1]), 0, resolution - 1))
-                iz = int(np.clip(round(sample[2]), 0, resolution - 1))
-                surface[ix, iy, iz] = True
+                ix = _clip_round_index(float(sample[0]), resolution)
+                iy = _clip_round_index(float(sample[1]), resolution)
+                iz = _clip_round_index(float(sample[2]), resolution)
+                surface[ix, iy, iz] = 1
+    return surface
+
+
+if NUMBA_AVAILABLE:
+
+    @njit(cache=True)
+    def _clip_round_index_numba(value: float, resolution: int) -> int:
+        idx = int(round(value))
+        if idx < 0:
+            return 0
+        if idx >= resolution:
+            return resolution - 1
+        return idx
+
+
+    @njit(parallel=True, cache=True)
+    def _rasterize_surface_numba(verts_grid: np.ndarray, faces: np.ndarray, resolution: int) -> np.ndarray:
+        surface = np.zeros((resolution, resolution, resolution), dtype=np.uint8)
+        for face_idx in prange(faces.shape[0]):
+            f0 = int(faces[face_idx, 0])
+            f1 = int(faces[face_idx, 1])
+            f2 = int(faces[face_idx, 2])
+
+            p0x = verts_grid[f0, 0]
+            p0y = verts_grid[f0, 1]
+            p0z = verts_grid[f0, 2]
+            p1x = verts_grid[f1, 0]
+            p1y = verts_grid[f1, 1]
+            p1z = verts_grid[f1, 2]
+            p2x = verts_grid[f2, 0]
+            p2y = verts_grid[f2, 1]
+            p2z = verts_grid[f2, 2]
+
+            e01x = p1x - p0x
+            e01y = p1y - p0y
+            e01z = p1z - p0z
+            e12x = p2x - p1x
+            e12y = p2y - p1y
+            e12z = p2z - p1z
+            e20x = p0x - p2x
+            e20y = p0y - p2y
+            e20z = p0z - p2z
+
+            edge01 = math.sqrt(e01x * e01x + e01y * e01y + e01z * e01z)
+            edge12 = math.sqrt(e12x * e12x + e12y * e12y + e12z * e12z)
+            edge20 = math.sqrt(e20x * e20x + e20y * e20y + e20z * e20z)
+            max_edge = edge01
+            if edge12 > max_edge:
+                max_edge = edge12
+            if edge20 > max_edge:
+                max_edge = edge20
+            steps = max(2, int(math.ceil(max_edge * 2.0)))
+
+            d10x = p1x - p0x
+            d10y = p1y - p0y
+            d10z = p1z - p0z
+            d20x = p2x - p0x
+            d20y = p2y - p0y
+            d20z = p2z - p0z
+            inv_steps = 1.0 / float(steps)
+
+            for i in range(steps + 1):
+                u = float(i) * inv_steps
+                max_j = steps - i
+                for j in range(max_j + 1):
+                    v = float(j) * inv_steps
+                    sx = p0x + u * d10x + v * d20x
+                    sy = p0y + u * d10y + v * d20y
+                    sz = p0z + u * d10z + v * d20z
+
+                    ix = _clip_round_index_numba(sx, resolution)
+                    iy = _clip_round_index_numba(sy, resolution)
+                    iz = _clip_round_index_numba(sz, resolution)
+                    surface[ix, iy, iz] = 1
+        return surface
+
+else:
+
+    def _rasterize_surface_numba(verts_grid: np.ndarray, faces: np.ndarray, resolution: int) -> np.ndarray:
+        raise RuntimeError("Numba is unavailable")
+
+
+def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: int) -> np.ndarray:
+    mins = np.asarray([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
+    scales = np.asarray(
+        [
+            (resolution - 1) / (bounds[0][1] - bounds[0][0]),
+            (resolution - 1) / (bounds[1][1] - bounds[1][0]),
+            (resolution - 1) / (bounds[2][1] - bounds[2][0]),
+        ],
+        dtype=np.float64,
+    )
+    verts_grid = (mesh.vertices - mins) * scales
+    verts_grid = np.ascontiguousarray(verts_grid, dtype=np.float64)
+    faces = np.ascontiguousarray(mesh.faces, dtype=np.int32)
+
+    surface_u8: np.ndarray
+    try:
+        if NUMBA_AVAILABLE:
+            surface_u8 = _rasterize_surface_numba(verts_grid, faces, resolution)
+        else:
+            surface_u8 = _rasterize_surface_python(verts_grid, faces, resolution)
+    except Exception:
+        surface_u8 = _rasterize_surface_python(verts_grid, faces, resolution)
+    surface = surface_u8.astype(bool, copy=False)
 
     surface = ndimage.binary_dilation(surface, iterations=1)
     surface = ndimage.binary_closing(surface, structure=np.ones((3, 3, 3), dtype=bool), iterations=1)

@@ -3,8 +3,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 
+const viewerMock = vi.fn();
+
 vi.mock("./components/Viewer", () => ({
-  Viewer: () => <div data-testid="viewer" />
+  Viewer: (props: unknown) => {
+    viewerMock(props);
+    return <div data-testid="viewer" />;
+  }
 }));
 
 const compileScene = vi.fn();
@@ -78,6 +83,7 @@ const meshPreviewPayload = {
 describe("App", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    viewerMock.mockClear();
     window.localStorage.clear();
     compileScene.mockResolvedValue({
       sceneIr: compiledScene,
@@ -229,6 +235,10 @@ describe("App", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
 
+    previewUploadedMesh.mockResolvedValueOnce({
+      ...meshPreviewPayload,
+      field: fieldPreviewPayload.field
+    });
     previewUploadedMesh.mockClear();
 
     const file = new File(["v 0 0 0\n"], "test.obj", { type: "text/plain" });
@@ -240,6 +250,10 @@ describe("App", () => {
     await waitFor(() => {
       expect(previewUploadedMesh).toHaveBeenCalled();
     });
+
+    const latestViewerProps = viewerMock.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(latestViewerProps.mesh).toEqual(meshPreviewPayload.mesh);
+    expect(latestViewerProps.field).toEqual(fieldPreviewPayload.field);
   });
 
   it("sends selected mesh workflow backends", async () => {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import logging
 import time
 from pathlib import Path
 from typing import Literal
@@ -69,6 +70,8 @@ from .models import (
     QualityProfile,
     MeshBackend,
 )
+
+logger = logging.getLogger(__name__)
 
 EVAL_TIMEOUT_SECONDS = 20.0
 QUALITY_TO_RESOLUTION: dict[QualityProfile, int] = {
@@ -519,6 +522,18 @@ def _run_uploaded_mesh_preview(
     if cached_mesh is not None:
         cached_stats = copy.deepcopy(cached_mesh.stats)
         cached_stats["cache_hit"] = True
+        cached_field = None
+        if (
+            cached_mesh.field_resolution is not None
+            and cached_mesh.field_bounds is not None
+            and cached_mesh.field_data is not None
+        ):
+            cached_field = FieldPayload(
+                encoding="f32-base64",
+                resolution=int(cached_mesh.field_resolution),
+                bounds=[[float(axis[0]), float(axis[1])] for axis in cached_mesh.field_bounds],
+                data=cached_mesh.field_data,
+            )
         return PreviewMeshResponse(
             mesh={
                 "vertices": cached_mesh.vertices,
@@ -526,14 +541,18 @@ def _run_uploaded_mesh_preview(
                 "normals": cached_mesh.normals,
             },
             stats=cached_stats,
+            field=cached_field,
         )
 
     eval_start = time.perf_counter()
+    host_start = time.perf_counter()
     parsed, bounds, host_sdf = _resolve_uploaded_host_field(
         file_bytes=file_bytes,
         extension=extension,
         quality_profile=quality_profile,
     )
+    host_ms = (time.perf_counter() - host_start) * 1000.0
+    compose_start = time.perf_counter()
     field, eval_backend_used = compose_hollow_lattice_field_with_backend(
         host_sdf,
         bounds,
@@ -544,23 +563,43 @@ def _run_uploaded_mesh_preview(
         lattice_phase=lattice_phase,
         compute_backend=compute_backend,
     )
+    compose_ms = (time.perf_counter() - compose_start) * 1000.0
     eval_ms = (time.perf_counter() - eval_start) * 1000.0
 
     mesh_start = time.perf_counter()
+    mesher_start = time.perf_counter()
     generated, mesh_backend_used = build_mesh_with_backend(
         field,
         bounds,
         backend=mesh_backend,
         meshing_mode=meshing_mode,
     )
+    mesher_ms = (time.perf_counter() - mesher_start) * 1000.0
+    post_mesh_start = time.perf_counter()
     interior = _strip_outer_surface(generated, host_sdf, bounds)
     outer = _meshdata_from_parsed(parsed)
     mesh = _merge_meshes(outer, interior)
+    post_mesh_ms = (time.perf_counter() - post_mesh_start) * 1000.0
     mesh_ms = (time.perf_counter() - mesh_start) * 1000.0
+    logger.debug(
+        "mesh_upload_timing host_ms=%.2f compose_ms=%.2f eval_ms=%.2f mesher_ms=%.2f post_mesh_ms=%.2f mesh_ms=%.2f",
+        host_ms,
+        compose_ms,
+        eval_ms,
+        mesher_ms,
+        post_mesh_ms,
+        mesh_ms,
+    )
 
     vertices = mesh.vertices.tolist()
     indices = mesh.faces.tolist()
     normals = mesh.normals.tolist()
+    field_payload = FieldPayload(
+        encoding="f32-base64",
+        resolution=int(field.shape[0]),
+        bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
+        data=_encode_field(field),
+    )
     stats = PreviewStats(
         eval_ms=eval_ms,
         mesh_ms=mesh_ms,
@@ -578,11 +617,15 @@ def _run_uploaded_mesh_preview(
             indices=indices,
             normals=normals,
             stats=stats.model_dump(),
+            field_resolution=int(field_payload.resolution),
+            field_bounds=[[float(axis[0]), float(axis[1])] for axis in field_payload.bounds],
+            field_data=field_payload.data,
         ),
     )
     return PreviewMeshResponse(
         mesh={"vertices": vertices, "indices": indices, "normals": normals},
         stats=stats,
+        field=field_payload,
     )
 
 

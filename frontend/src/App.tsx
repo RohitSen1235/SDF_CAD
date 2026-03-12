@@ -454,7 +454,7 @@ export default function App() {
         meshBackend,
         meshingMode
       );
-      setField(null);
+      setField(response.field ?? null);
       setMesh(response.mesh);
       setStats(response.stats);
     } catch (previewError) {
@@ -821,6 +821,7 @@ export default function App() {
                     <option value="adaptive">adaptive</option>
                   </select>
                 </label>
+                <p className="muted">Tip: `adaptive` is currently slower on CPU; use `uniform` for fastest previews.</p>
 
                 <button type="button" onClick={() => void onGenerateMesh()}>
                   Generate Mesh Preview

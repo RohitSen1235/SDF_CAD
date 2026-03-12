@@ -82,6 +82,7 @@ export interface PreviewStats {
 export interface PreviewMeshResponse {
   mesh: MeshPayload;
   stats: PreviewStats;
+  field?: FieldPayload | null;
 }
 
 export interface PreviewFieldResponse {

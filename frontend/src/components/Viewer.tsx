@@ -141,6 +141,45 @@ const FIELD_FRAGMENT_SHADER = `
   }
 `;
 
+const SECTION_CAP_VERTEX_SHADER = `
+  out vec3 vWorldPos;
+  void main() {
+    vec4 worldPos = modelMatrix * vec4(position, 1.0);
+    vWorldPos = worldPos.xyz;
+    gl_Position = projectionMatrix * viewMatrix * worldPos;
+  }
+`;
+
+const SECTION_CAP_FRAGMENT_SHADER = `
+  precision highp float;
+  precision highp sampler3D;
+
+  uniform sampler3D uField;
+  uniform vec3 uBoundsMin;
+  uniform vec3 uBoundsMax;
+  uniform vec3 uColor;
+
+  in vec3 vWorldPos;
+  out vec4 outColor;
+
+  void main() {
+    vec3 uvw = (vWorldPos - uBoundsMin) / (uBoundsMax - uBoundsMin);
+    if (
+      any(lessThan(uvw, vec3(0.0))) ||
+      any(greaterThan(uvw, vec3(1.0)))
+    ) {
+      discard;
+    }
+
+    float sdf = texture(uField, clamp(uvw, 0.0, 1.0)).r;
+    if (sdf > 0.0) {
+      discard;
+    }
+
+    outColor = vec4(uColor, 1.0);
+  }
+`;
+
 function packVec3(values: [number, number, number][]): Float32Array {
   const out = new Float32Array(values.length * 3);
   for (let i = 0; i < values.length; i += 1) {
@@ -366,7 +405,7 @@ export function Viewer({
       {showGrid ? <gridHelper args={[12, 24, "#2f536d", "#1d2f3d"]} /> : null}
       {showAxes ? <axesHelper args={[2.5]} /> : null}
 
-      {hasField && fieldBounds ? (
+      {hasField && fieldBounds && !geometry ? (
         <mesh ref={meshRef} position={fieldBounds.center.toArray() as [number, number, number]} renderOrder={3}>
           <boxGeometry args={fieldBounds.size.toArray() as [number, number, number]} />
           <shaderMaterial
@@ -390,7 +429,7 @@ export function Viewer({
         </mesh>
       ) : null}
 
-      {!hasField && geometry ? (
+      {geometry ? (
         <TransformControls
           mode={transformMode}
           onMouseDown={() => setOrbitEnabled(false)}
@@ -444,20 +483,7 @@ export function Viewer({
         </TransformControls>
       ) : null}
 
-      {hasField && geometry ? (
-        <mesh geometry={geometry} renderOrder={4}>
-          <meshStandardMaterial
-            color="#8be9fd"
-            roughness={0.25}
-            metalness={0.05}
-            wireframe={wireframe}
-            clippingPlanes={clippingPlanes}
-            clipShadows
-          />
-        </mesh>
-      ) : null}
-
-      {!hasField && geometry && sectionEnabled && sectionPlane ? (
+      {geometry && sectionEnabled && sectionPlane ? (
         <mesh position={[0, sectionLevel, 0]} rotation={[-Math.PI * 0.5, 0, 0]} renderOrder={2}>
           <planeGeometry args={[capSize, capSize]} />
           <meshStandardMaterial
@@ -471,6 +497,27 @@ export function Viewer({
             stencilFail={THREE.ReplaceStencilOp}
             stencilZFail={THREE.ReplaceStencilOp}
             stencilZPass={THREE.ReplaceStencilOp}
+          />
+        </mesh>
+      ) : null}
+
+      {hasField && !geometry && sectionEnabled && fieldBounds ? (
+        <mesh position={[0, sectionLevel, 0]} rotation={[-Math.PI * 0.5, 0, 0]} renderOrder={2}>
+          <planeGeometry args={[capSize, capSize]} />
+          <shaderMaterial
+            glslVersion={THREE.GLSL3}
+            vertexShader={SECTION_CAP_VERTEX_SHADER}
+            fragmentShader={SECTION_CAP_FRAGMENT_SHADER}
+            uniforms={{
+              uField: { value: fieldTexture },
+              uBoundsMin: { value: fieldBounds.min },
+              uBoundsMax: { value: fieldBounds.max },
+              uColor: { value: new THREE.Color("#ff3b30") }
+            }}
+            side={THREE.DoubleSide}
+            transparent
+            depthWrite={false}
+            toneMapped={false}
           />
         </mesh>
       ) : null}

@@ -147,6 +147,7 @@ class PreviewStats(BaseModel):
 class PreviewMeshResponse(BaseModel):
     mesh: MeshPayload
     stats: PreviewStats
+    field: FieldPayload | None = None
 
 
 class PreviewFieldRequest(BaseModel):
