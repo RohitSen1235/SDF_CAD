@@ -1,5 +1,6 @@
 import numpy as np
 
+import app.evaluator as evaluator_module
 from app.dsl import compile_source
 from app.evaluator import CUPY_AVAILABLE, evaluate_scene_field, evaluate_scene_field_with_backend, merge_parameter_values
 from app.meshing import build_mesh
@@ -201,3 +202,35 @@ def test_cuda_backend_selection_reports_fallback_or_cuda() -> None:
         assert backend in {"cpu", "cuda"}
     else:
         assert backend == "cpu"
+
+
+def test_spline_simd_path_matches_python_fallback(monkeypatch) -> None:
+    source = """
+    root = spline(
+      points="0 0 0; 0.2 0.25 0.1; 0.7 -0.2 0.18; 1.0 0.0 0.0",
+      radius=0.08,
+      samples=16
+    )
+    """
+    scene = compile_source(source)
+    params = merge_parameter_values(scene, {})
+    grid = GridConfig(bounds=[[-0.3, 1.2], [-0.6, 0.6], [-0.6, 0.6]], resolution=40)
+    baseline = evaluate_scene_field(scene, params, grid)
+
+    monkeypatch.setattr(evaluator_module, "NUMBA_AVAILABLE", False)
+    monkeypatch.setattr(evaluator_module, "_spline_min_dist_numba", None)
+    fallback = evaluate_scene_field(scene, params, grid)
+    assert np.allclose(baseline, fallback, atol=1e-4, rtol=1e-4)
+
+
+def test_turbomachine_simd_path_matches_python_fallback(monkeypatch) -> None:
+    source = "root = impeller_centrifugal(r_in=0.22, r_out=0.95, hub_h=0.45, blade_count=9, blade_twist=0.9)"
+    scene = compile_source(source)
+    params = merge_parameter_values(scene, {})
+    grid = GridConfig(bounds=[[-1.2, 1.2], [-0.6, 0.6], [-1.2, 1.2]], resolution=36)
+    baseline = evaluate_scene_field(scene, params, grid)
+
+    monkeypatch.setattr(evaluator_module, "NUMBA_AVAILABLE", False)
+    monkeypatch.setattr(evaluator_module, "_blade_field_numba", None)
+    fallback = evaluate_scene_field(scene, params, grid)
+    assert np.allclose(baseline, fallback, atol=1e-4, rtol=1e-4)

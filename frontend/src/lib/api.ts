@@ -4,7 +4,9 @@ import {
   ComputePrecision,
   GridConfig,
   MeshBackend,
+  MeshingMode,
   MeshWorkflowParams,
+  PreviewFieldResponse,
   PreviewMeshResponse,
   QualityProfile,
   SceneIR
@@ -65,6 +67,7 @@ export async function previewMesh(
   computePrecision: ComputePrecision = "float32",
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
+  meshingMode: MeshingMode = "uniform",
   signal?: AbortSignal,
   grid?: GridConfig
 ): Promise<PreviewMeshResponse> {
@@ -80,6 +83,42 @@ export async function previewMesh(
         compute_precision: computePrecision,
         compute_backend: computeBackend,
         mesh_backend: meshBackend,
+        meshing_mode: meshingMode,
+        grid
+      })
+    });
+    return parseJsonOrThrow(response);
+  } catch (error) {
+    if ((error as Error)?.name === "AbortError") {
+      throw error;
+    }
+    if (error instanceof TypeError) {
+      throw asNetworkError(error);
+    }
+    throw error;
+  }
+}
+
+export async function previewField(
+  sceneIr: SceneIR,
+  parameterValues: Record<string, number>,
+  qualityProfile: QualityProfile,
+  computePrecision: ComputePrecision = "float32",
+  computeBackend: ComputeBackend = "auto",
+  signal?: AbortSignal,
+  grid?: GridConfig
+): Promise<PreviewFieldResponse> {
+  try {
+    const response = await fetch(`${API_BASE}/api/v1/preview/field`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal,
+      body: JSON.stringify({
+        scene_ir: sceneIr,
+        parameter_values: parameterValues,
+        quality_profile: qualityProfile,
+        compute_precision: computePrecision,
+        compute_backend: computeBackend,
         grid
       })
     });
@@ -102,7 +141,8 @@ export async function exportMesh(
   qualityProfile: QualityProfile,
   computePrecision: ComputePrecision = "float32",
   computeBackend: ComputeBackend = "auto",
-  meshBackend: MeshBackend = "auto"
+  meshBackend: MeshBackend = "auto",
+  meshingMode: MeshingMode = "uniform"
 ): Promise<Blob> {
   try {
     const response = await fetch(`${API_BASE}/api/v1/export`, {
@@ -115,7 +155,8 @@ export async function exportMesh(
         quality_profile: qualityProfile,
         compute_precision: computePrecision,
         compute_backend: computeBackend,
-        mesh_backend: meshBackend
+        mesh_backend: meshBackend,
+        meshing_mode: meshingMode
       })
     });
     if (!response.ok) {
@@ -140,7 +181,8 @@ function appendMeshWorkflowFormData(
   params: MeshWorkflowParams,
   qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
-  meshBackend: MeshBackend = "auto"
+  meshBackend: MeshBackend = "auto",
+  meshingMode: MeshingMode = "uniform"
 ): void {
   body.append("file", file, file.name);
   body.append("shell_thickness", String(params.shellThickness));
@@ -151,6 +193,7 @@ function appendMeshWorkflowFormData(
   body.append("quality_profile", qualityProfile);
   body.append("compute_backend", computeBackend);
   body.append("mesh_backend", meshBackend);
+  body.append("meshing_mode", meshingMode);
 }
 
 export async function previewUploadedMesh(
@@ -158,11 +201,12 @@ export async function previewUploadedMesh(
   params: MeshWorkflowParams,
   qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
-  meshBackend: MeshBackend = "auto"
+  meshBackend: MeshBackend = "auto",
+  meshingMode: MeshingMode = "uniform"
 ): Promise<PreviewMeshResponse> {
   try {
     const body = new FormData();
-    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend);
+    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode);
     const response = await fetch(`${API_BASE}/api/v1/mesh/preview`, {
       method: "POST",
       body
@@ -185,11 +229,12 @@ export async function exportUploadedMesh(
   format: "stl" | "obj",
   qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
-  meshBackend: MeshBackend = "auto"
+  meshBackend: MeshBackend = "auto",
+  meshingMode: MeshingMode = "uniform"
 ): Promise<Blob> {
   try {
     const body = new FormData();
-    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend);
+    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode);
     body.append("format", format);
     const response = await fetch(`${API_BASE}/api/v1/mesh/export`, {
       method: "POST",

@@ -18,7 +18,7 @@ except Exception:
     CUPY_AVAILABLE = False
 
 try:
-    from numba import vectorize
+    from numba import njit, prange, vectorize
 
     @vectorize(["float32(float32,float32,float32)", "float64(float64,float64,float64)"], nopython=True, cache=True)
     def _smin_numba(a: float, b: float, k: float) -> float:
@@ -29,9 +29,97 @@ try:
             h = 1.0
         return (b * (1.0 - h) + a * h) - k * h * (1.0 - h)
 
+    @njit(parallel=True, cache=True)
+    def _spline_min_dist_numba(
+        qx_flat: np.ndarray,
+        qy_flat: np.ndarray,
+        qz_flat: np.ndarray,
+        segments: np.ndarray,
+    ) -> np.ndarray:
+        out = np.empty(qx_flat.shape[0], dtype=qx_flat.dtype)
+        for i in prange(qx_flat.shape[0]):
+            px = qx_flat[i]
+            py = qy_flat[i]
+            pz = qz_flat[i]
+            best = np.float32(1e30)
+            for s in range(segments.shape[0]):
+                ax = segments[s, 0]
+                ay = segments[s, 1]
+                az = segments[s, 2]
+                bx = segments[s, 3]
+                by = segments[s, 4]
+                bz = segments[s, 5]
+
+                abx = bx - ax
+                aby = by - ay
+                abz = bz - az
+                denom = abx * abx + aby * aby + abz * abz
+                if denom < 1e-12:
+                    dx = px - ax
+                    dy = py - ay
+                    dz = pz - az
+                else:
+                    apx = px - ax
+                    apy = py - ay
+                    apz = pz - az
+                    t = (apx * abx + apy * aby + apz * abz) / denom
+                    if t < 0.0:
+                        t = 0.0
+                    elif t > 1.0:
+                        t = 1.0
+                    cx = ax + t * abx
+                    cy = ay + t * aby
+                    cz = az + t * abz
+                    dx = px - cx
+                    dy = py - cy
+                    dz = pz - cz
+
+                d = np.sqrt(dx * dx + dy * dy + dz * dz)
+                if d < best:
+                    best = d
+            out[i] = best
+        return out
+
+    @njit(parallel=True, cache=True)
+    def _blade_field_numba(
+        r_flat: np.ndarray,
+        theta_flat: np.ndarray,
+        qy_flat: np.ndarray,
+        r_in: float,
+        radial_span: float,
+        blade_count: int,
+        blade_thickness: float,
+        hub_h: float,
+        blade_twist_dir: float,
+    ) -> np.ndarray:
+        out = np.empty(r_flat.shape[0], dtype=r_flat.dtype)
+        for i in prange(r_flat.shape[0]):
+            rv = r_flat[i]
+            tv = (rv - r_in) / radial_span
+            if tv < 0.0:
+                tv = 0.0
+            elif tv > 1.0:
+                tv = 1.0
+            th = theta_flat[i]
+            qy = qy_flat[i]
+            best = np.float32(1e30)
+            rr = rv if rv > 1e-6 else np.float32(1e-6)
+            for idx in range(blade_count):
+                base_angle = 2.0 * np.pi * idx / float(blade_count)
+                target = base_angle + blade_twist_dir * tv
+                ang = (th - target + np.pi) % (2.0 * np.pi) - np.pi
+                arc_dist = abs(ang) * rr
+                blade_field = max(arc_dist - abs(blade_thickness) * 0.5, abs(qy) - hub_h * 0.5)
+                if blade_field < best:
+                    best = blade_field
+            out[i] = best
+        return out
+
     NUMBA_AVAILABLE = True
 except Exception:
     _smin_numba = None
+    _spline_min_dist_numba = None
+    _blade_field_numba = None
     NUMBA_AVAILABLE = False
 
 
@@ -709,6 +797,20 @@ class _FieldRuntime:
             if primitive == "spline":
                 radius = self._node_scalar_param(node, "radius", 0.08)
                 curve = self._node_spline_polyline(node)
+                if xp is np and NUMBA_AVAILABLE and _spline_min_dist_numba is not None:
+                    segments = np.asarray(
+                        [
+                            [a[0], a[1], a[2], b[0], b[1], b[2]]
+                            for a, b in zip(curve[:-1], curve[1:])
+                        ],
+                        dtype=np.float32,
+                    )
+                    qx_flat = np.asarray(qx, dtype=np.float32).reshape(-1)
+                    qy_flat = np.asarray(qy, dtype=np.float32).reshape(-1)
+                    qz_flat = np.asarray(qz, dtype=np.float32).reshape(-1)
+                    dist_flat = _spline_min_dist_numba(qx_flat, qy_flat, qz_flat, segments)
+                    return dist_flat.reshape(qx.shape).astype(self.eval_dtype, copy=False) - abs(radius)
+
                 dist = xp.full_like(qx, fill_value=xp.inf, dtype=self.eval_dtype)
                 for idx in range(len(curve) - 1):
                     dseg = _dist_to_segment(qx, qy, qz, curve[idx], curve[idx + 1], xp=xp)
@@ -1008,14 +1110,27 @@ class _FieldRuntime:
                 hub = xp.maximum(r - r_out, xp.abs(qy) - hub_h * 0.25)
                 shroud = xp.maximum(xp.abs(r - r_out) - abs(shroud_gap), xp.abs(qy) - hub_h * 0.5)
 
-                blades = xp.full_like(r, xp.inf, dtype=self.eval_dtype)
-                for idx in range(blade_count):
-                    base_angle = 2.0 * np.pi * idx / float(blade_count)
-                    target = base_angle + blade_twist_dir * t
-                    ang = _angle_wrap(theta - target)
-                    arc_dist = xp.abs(ang) * xp.maximum(r, 1e-6)
-                    blade_field = xp.maximum(arc_dist - abs(blade_thickness) * 0.5, xp.abs(qy) - hub_h * 0.5)
-                    blades = xp.minimum(blades, blade_field)
+                if xp is np and NUMBA_AVAILABLE and _blade_field_numba is not None:
+                    blades = _blade_field_numba(
+                        np.asarray(r, dtype=np.float32).reshape(-1),
+                        np.asarray(theta, dtype=np.float32).reshape(-1),
+                        np.asarray(qy, dtype=np.float32).reshape(-1),
+                        float(r_in),
+                        float(radial_span),
+                        int(blade_count),
+                        float(blade_thickness),
+                        float(hub_h),
+                        float(blade_twist_dir),
+                    ).reshape(r.shape).astype(self.eval_dtype, copy=False)
+                else:
+                    blades = xp.full_like(r, xp.inf, dtype=self.eval_dtype)
+                    for idx in range(blade_count):
+                        base_angle = 2.0 * np.pi * idx / float(blade_count)
+                        target = base_angle + blade_twist_dir * t
+                        ang = _angle_wrap(theta - target)
+                        arc_dist = xp.abs(ang) * xp.maximum(r, 1e-6)
+                        blade_field = xp.maximum(arc_dist - abs(blade_thickness) * 0.5, xp.abs(qy) - hub_h * 0.5)
+                        blades = xp.minimum(blades, blade_field)
 
                 solid = xp.minimum(xp.minimum(hub, shroud), blades)
                 bore = r_in - r

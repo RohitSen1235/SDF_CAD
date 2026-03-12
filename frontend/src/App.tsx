@@ -5,6 +5,7 @@ import {
   compileScene,
   exportMesh,
   exportUploadedMesh,
+  previewField,
   previewMesh,
   previewUploadedMesh
 } from "./lib/api";
@@ -12,8 +13,10 @@ import {
   CompileDiagnostics,
   ComputeBackend,
   ComputePrecision,
+  FieldPayload,
   MeshBackend,
   MeshLatticeType,
+  MeshingMode,
   MeshPayload,
   MeshWorkflowParams,
   PreviewStats,
@@ -131,6 +134,7 @@ export default function App() {
   const [meshPreviewQuality, setMeshPreviewQuality] = useState<QualityProfile>("medium");
   const [meshExportQuality, setMeshExportQuality] = useState<QualityProfile>("high");
 
+  const [field, setField] = useState<FieldPayload | null>(null);
   const [mesh, setMesh] = useState<MeshPayload | null>(null);
   const [stats, setStats] = useState<PreviewStats | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -145,6 +149,7 @@ export default function App() {
   const [computePrecision, setComputePrecision] = useState<ComputePrecision>("float32");
   const [computeBackend, setComputeBackend] = useState<ComputeBackend>("auto");
   const [meshBackend, setMeshBackend] = useState<MeshBackend>("auto");
+  const [meshingMode, setMeshingMode] = useState<MeshingMode>("uniform");
   const [sectionEnabled, setSectionEnabled] = useState(false);
   const [sectionLevel, setSectionLevel] = useState(0);
   const [isSignatureHelpOpen, setIsSignatureHelpOpen] = useState(false);
@@ -220,16 +225,57 @@ export default function App() {
         controllers.push(controller);
         const resolution =
           profile === "interactive" ? 64 : profile === "medium" ? 128 : profile === "high" ? 192 : 256;
-        return previewMesh(
-          sceneIr,
-          previewParams,
-          profile,
-          computePrecision,
-          computeBackend,
-          meshBackend,
-          controller.signal,
-          previewBounds ? { bounds: previewBounds, resolution } : undefined
-        );
+        const grid = previewBounds ? { bounds: previewBounds, resolution } : undefined;
+        try {
+          const fieldResponse = await previewField(
+            sceneIr,
+            previewParams,
+            profile,
+            computePrecision,
+            computeBackend,
+            controller.signal,
+            grid
+          );
+          const meshController = new AbortController();
+          controllers.push(meshController);
+          void previewMesh(
+            sceneIr,
+            previewParams,
+            profile,
+            computePrecision,
+            computeBackend,
+            meshBackend,
+            meshingMode,
+            meshController.signal,
+            grid
+          )
+            .then((meshResponse) => {
+              if (!active) {
+                return;
+              }
+              setMesh(meshResponse.mesh);
+            })
+            .catch(() => {
+              // Keep field preview active even if backup mesh fetch fails.
+            });
+          return { kind: "field" as const, response: fieldResponse };
+        } catch (error) {
+          if ((error as Error).name === "AbortError") {
+            throw error;
+          }
+          const meshResponse = await previewMesh(
+            sceneIr,
+            previewParams,
+            profile,
+            computePrecision,
+            computeBackend,
+            meshBackend,
+            meshingMode,
+            controller.signal,
+            grid
+          );
+          return { kind: "mesh" as const, response: meshResponse };
+        }
       };
 
       try {
@@ -237,8 +283,14 @@ export default function App() {
         if (!active) {
           return;
         }
-        setMesh(coarse.mesh);
-        setStats(coarse.stats);
+        if (coarse.kind === "field") {
+          setField(coarse.response.field);
+          setStats(coarse.response.stats);
+        } else {
+          setField(null);
+          setMesh(coarse.response.mesh);
+          setStats(coarse.response.stats);
+        }
 
         if (quality !== "interactive") {
           fineTimer = window.setTimeout(async () => {
@@ -247,8 +299,14 @@ export default function App() {
               if (!active) {
                 return;
               }
-              setMesh(fine.mesh);
-              setStats(fine.stats);
+              if (fine.kind === "field") {
+                setField(fine.response.field);
+                setStats(fine.response.stats);
+              } else {
+                setField(null);
+                setMesh(fine.response.mesh);
+                setStats(fine.response.stats);
+              }
               setIsPreviewing(false);
             } catch (err) {
               if (!active) {
@@ -285,7 +343,18 @@ export default function App() {
         controller.abort();
       }
     };
-  }, [workflow, sceneIr, previewRevision, quality, computePrecision, computeBackend, meshBackend, previewBounds, previewParams]);
+  }, [
+    workflow,
+    sceneIr,
+    previewRevision,
+    quality,
+    computePrecision,
+    computeBackend,
+    meshBackend,
+    meshingMode,
+    previewBounds,
+    previewParams
+  ]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -330,7 +399,8 @@ export default function App() {
         quality === "interactive" ? "high" : quality,
         computePrecision,
         computeBackend,
-        meshBackend
+        meshBackend,
+        meshingMode
       );
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
@@ -364,8 +434,10 @@ export default function App() {
         meshWorkflowParams,
         meshPreviewQuality,
         computeBackend,
-        meshBackend
+        meshBackend,
+        meshingMode
       );
+      setField(null);
       setMesh(response.mesh);
       setStats(response.stats);
     } catch (previewError) {
@@ -388,7 +460,8 @@ export default function App() {
         format,
         meshExportQuality,
         computeBackend,
-        meshBackend
+        meshBackend,
+        meshingMode
       );
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
@@ -710,6 +783,17 @@ export default function App() {
                     <option value="cuda">cuda</option>
                   </select>
                 </label>
+                <label className="slider-row">
+                  <span>Meshing mode</span>
+                  <select
+                    aria-label="Mesh meshing mode"
+                    value={meshingMode}
+                    onChange={(event) => setMeshingMode(event.target.value as MeshingMode)}
+                  >
+                    <option value="uniform">uniform</option>
+                    <option value="adaptive">adaptive</option>
+                  </select>
+                </label>
 
                 <button type="button" onClick={() => void onGenerateMesh()}>
                   Generate Mesh Preview
@@ -775,6 +859,15 @@ export default function App() {
                 </select>
               </label>
             ) : null}
+            {workflow === "dsl" ? (
+              <label className="inline-label">
+                Meshing Mode
+                <select value={meshingMode} onChange={(event) => setMeshingMode(event.target.value as MeshingMode)}>
+                  <option value="uniform">Uniform</option>
+                  <option value="adaptive">Adaptive</option>
+                </select>
+              </label>
+            ) : null}
             <button onClick={() => void (workflow === "dsl" ? onExportDsl("stl") : onExportUploaded("stl"))}>
               Export STL
             </button>
@@ -800,6 +893,7 @@ export default function App() {
           <div className="viewer-wrap">
             <Viewer
               mesh={mesh}
+              field={field}
               wireframe={wireframe}
               transformMode={transformMode}
               fitSignal={fitSignal}
@@ -811,9 +905,11 @@ export default function App() {
           </div>
 
           <div className="stats-row">
+            <span>Mode: {stats?.preview_mode ?? "mesh"}</span>
             <span>Triangles: {stats?.tri_count ?? 0}</span>
+            <span>Voxels: {stats?.voxel_count ?? 0}</span>
             <span>Eval: {stats ? stats.eval_ms.toFixed(1) : "0.0"} ms</span>
-            <span>Mesh: {stats ? stats.mesh_ms.toFixed(1) : "0.0"} ms</span>
+            <span>Mesh: {stats?.mesh_ms != null ? stats.mesh_ms.toFixed(1) : "n/a"} ms</span>
             <span>Eval backend: {stats?.compute_backend ?? "cpu"}</span>
             <span>Mesh backend: {stats?.mesh_backend ?? "cpu"}</span>
             <span>Cache: {stats?.cache_hit ? "hit" : "miss"}</span>

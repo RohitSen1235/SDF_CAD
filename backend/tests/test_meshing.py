@@ -53,3 +53,21 @@ def test_auto_backend_can_fallback_to_cpu_when_cuda_fails(monkeypatch) -> None:
     mesh, backend = meshing.build_mesh_with_backend(field, bounds, backend="auto")
     assert mesh is fake_mesh
     assert backend == "cpu"
+
+
+def test_adaptive_meshing_mode_routes_to_cpu_adaptive(monkeypatch) -> None:
+    field = np.array(
+        [[[-1.0, 1.0], [1.0, 1.0]], [[1.0, 1.0], [1.0, 1.0]]],
+        dtype=np.float32,
+    )
+    bounds = [[-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0]]
+    fake_mesh = meshing.MeshData(
+        vertices=np.zeros((0, 3), dtype=np.float64),
+        faces=np.zeros((1, 3), dtype=np.int32),
+        normals=np.zeros((0, 3), dtype=np.float64),
+    )
+
+    monkeypatch.setattr(meshing, "_mesh_adaptive_cpu", lambda _f, _b: fake_mesh)
+    mesh, backend = meshing.build_mesh_with_backend(field, bounds, backend="cuda", meshing_mode="adaptive")
+    assert mesh is fake_mesh
+    assert backend == "cpu"

@@ -22,6 +22,7 @@ QualityProfile = Literal["interactive", "medium", "high", "ultra"]
 ComputePrecision = Literal["float32", "float16"]
 ComputeBackend = Literal["auto", "cpu", "cuda"]
 MeshBackend = Literal["auto", "cpu", "cuda"]
+MeshingMode = Literal["uniform", "adaptive"]
 
 
 class ParameterSpec(BaseModel):
@@ -115,6 +116,7 @@ class PreviewMeshRequest(BaseModel):
     compute_precision: ComputePrecision = "float32"
     compute_backend: ComputeBackend = "auto"
     mesh_backend: MeshBackend = "auto"
+    meshing_mode: MeshingMode = "uniform"
 
 
 class MeshPayload(BaseModel):
@@ -123,18 +125,41 @@ class MeshPayload(BaseModel):
     normals: list[list[float]]
 
 
+class FieldPayload(BaseModel):
+    encoding: Literal["f32-base64"] = "f32-base64"
+    resolution: int
+    bounds: list[list[float]]
+    data: str
+
+
 class PreviewStats(BaseModel):
     eval_ms: float
-    mesh_ms: float
+    mesh_ms: float | None = None
     tri_count: int
+    voxel_count: int | None = None
     cache_hit: bool = False
     compute_precision: ComputePrecision = "float32"
     compute_backend: Literal["cpu", "cuda"] = "cpu"
     mesh_backend: Literal["cpu", "cuda"] = "cpu"
+    preview_mode: Literal["mesh", "field"] = "mesh"
 
 
 class PreviewMeshResponse(BaseModel):
     mesh: MeshPayload
+    stats: PreviewStats
+
+
+class PreviewFieldRequest(BaseModel):
+    scene_ir: SceneIR
+    parameter_values: dict[str, float] = Field(default_factory=dict)
+    grid: GridConfig | None = None
+    quality_profile: QualityProfile = "interactive"
+    compute_precision: ComputePrecision = "float32"
+    compute_backend: ComputeBackend = "auto"
+
+
+class PreviewFieldResponse(BaseModel):
+    field: FieldPayload
     stats: PreviewStats
 
 
@@ -147,6 +172,7 @@ class ExportMeshRequest(BaseModel):
     compute_precision: ComputePrecision = "float32"
     compute_backend: ComputeBackend = "auto"
     mesh_backend: MeshBackend = "auto"
+    meshing_mode: MeshingMode = "uniform"
 
 
 class PreviewWsRequest(BaseModel):
@@ -157,6 +183,7 @@ class PreviewWsRequest(BaseModel):
     compute_precision: ComputePrecision = "float32"
     compute_backend: ComputeBackend = "auto"
     mesh_backend: MeshBackend = "auto"
+    meshing_mode: MeshingMode = "uniform"
 
 
 class PreviewWsResponse(BaseModel):

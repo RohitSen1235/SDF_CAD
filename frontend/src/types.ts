@@ -13,6 +13,7 @@ export type QualityProfile = "interactive" | "medium" | "high" | "ultra";
 export type ComputePrecision = "float32" | "float16";
 export type ComputeBackend = "auto" | "cpu" | "cuda";
 export type MeshBackend = "auto" | "cpu" | "cuda";
+export type MeshingMode = "uniform" | "adaptive";
 export type MeshLatticeType = "gyroid" | "schwarz_p" | "diamond";
 
 export interface ParameterSpec {
@@ -59,18 +60,32 @@ export interface MeshPayload {
   normals: [number, number, number][];
 }
 
+export interface FieldPayload {
+  encoding: "f32-base64";
+  resolution: number;
+  bounds: [[number, number], [number, number], [number, number]];
+  data: string;
+}
+
 export interface PreviewStats {
   eval_ms: number;
-  mesh_ms: number;
+  mesh_ms?: number | null;
   tri_count: number;
+  voxel_count?: number;
   cache_hit?: boolean;
   compute_precision?: ComputePrecision;
   compute_backend?: "cpu" | "cuda";
   mesh_backend?: "cpu" | "cuda";
+  preview_mode?: "mesh" | "field";
 }
 
 export interface PreviewMeshResponse {
   mesh: MeshPayload;
+  stats: PreviewStats;
+}
+
+export interface PreviewFieldResponse {
+  field: FieldPayload;
   stats: PreviewStats;
 }
 

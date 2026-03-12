@@ -66,6 +66,45 @@ def test_preview_mesh_endpoint_accepts_quality_profile() -> None:
     assert payload["stats"]["compute_backend"] == "cpu"
 
 
+def test_preview_field_endpoint_returns_volume_payload() -> None:
+    compiled = client.post("/api/v1/scene/compile", json={"source": SOURCE}).json()["scene_ir"]
+    response = client.post(
+        "/api/v1/preview/field",
+        json={
+            "scene_ir": compiled,
+            "parameter_values": {"r": 0.7},
+            "quality_profile": "interactive",
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["field"]["encoding"] == "f32-base64"
+    assert payload["field"]["resolution"] == 64
+    assert payload["field"]["data"]
+    assert payload["stats"]["preview_mode"] == "field"
+    assert payload["stats"]["mesh_ms"] is None
+    assert payload["stats"]["voxel_count"] == 64 * 64 * 64
+
+
+def test_preview_field_endpoint_does_not_call_mesher(monkeypatch: pytest.MonkeyPatch) -> None:
+    compiled = client.post("/api/v1/scene/compile", json={"source": SIMPLE_SOURCE}).json()["scene_ir"]
+
+    def fail_mesher(*_args, **_kwargs):
+        raise AssertionError("Mesher should not run for field preview")
+
+    monkeypatch.setattr(main_module, "build_mesh_with_backend", fail_mesher)
+    response = client.post(
+        "/api/v1/preview/field",
+        json={
+            "scene_ir": compiled,
+            "parameter_values": {"r": 0.7},
+            "quality_profile": "interactive",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["stats"]["preview_mode"] == "field"
+
+
 def test_preview_mesh_endpoint_accepts_explicit_float16_precision() -> None:
     compiled = client.post("/api/v1/scene/compile", json={"source": SIMPLE_SOURCE}).json()["scene_ir"]
     response = client.post(
@@ -124,6 +163,22 @@ def test_export_endpoint_stl() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("model/stl")
     assert len(response.content) > 84
+
+
+def test_export_endpoint_accepts_adaptive_meshing_mode() -> None:
+    compiled = client.post("/api/v1/scene/compile", json={"source": SOURCE}).json()["scene_ir"]
+    response = client.post(
+        "/api/v1/export",
+        json={
+            "scene_ir": compiled,
+            "parameter_values": {"r": 0.8},
+            "format": "obj",
+            "quality_profile": "interactive",
+            "meshing_mode": "adaptive",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
 
 
 def test_mesh_preview_endpoint_obj_upload() -> None:

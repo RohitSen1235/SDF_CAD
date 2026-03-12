@@ -535,7 +535,88 @@ def _mesh_chunked(field: np.ndarray, bounds: list[list[float]], chunk_size: int 
         faces=np.array(faces, dtype=np.int32),
         normals=np.array(normals, dtype=np.float64),
     )
+ 
+def _mesh_adaptive_cpu(field: np.ndarray, bounds: list[list[float]], block_size: int = 28) -> MeshData:
+    resolution = field.shape[0]
+    dx = (bounds[0][1] - bounds[0][0]) / float(resolution - 1)
+    dy = (bounds[1][1] - bounds[1][0]) / float(resolution - 1)
+    dz = (bounds[2][1] - bounds[2][0]) / float(resolution - 1)
 
+    origin = np.array([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
+    step = max(8, min(block_size, resolution - 1))
+
+    vertex_map: dict[tuple[int, int, int], int] = {}
+    vertices: list[list[float]] = []
+    normals_accum: list[np.ndarray] = []
+    faces: list[list[int]] = []
+    quant = 1e-6
+
+    for i0 in range(0, resolution - 1, step):
+        i1 = min(resolution - 1, i0 + step)
+        for j0 in range(0, resolution - 1, step):
+            j1 = min(resolution - 1, j0 + step)
+            for k0 in range(0, resolution - 1, step):
+                k1 = min(resolution - 1, k0 + step)
+                block = field[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1]
+                if block.size == 0:
+                    continue
+                bmin = float(np.min(block))
+                bmax = float(np.max(block))
+                if not (bmin <= 0.0 <= bmax):
+                    continue
+
+                try:
+                    local_v, local_f, local_n, _ = marching_cubes(
+                        block,
+                        level=0.0,
+                        spacing=(dx, dy, dz),
+                        allow_degenerate=False,
+                    )
+                except ValueError:
+                    continue
+
+                local_v = local_v + origin + np.array([i0 * dx, j0 * dy, k0 * dz], dtype=np.float64)
+                remap: list[int] = []
+                for idx, vert in enumerate(local_v):
+                    key = (
+                        int(round(float(vert[0]) / quant)),
+                        int(round(float(vert[1]) / quant)),
+                        int(round(float(vert[2]) / quant)),
+                    )
+                    existing = vertex_map.get(key)
+                    if existing is None:
+                        existing = len(vertices)
+                        vertex_map[key] = existing
+                        vertices.append([float(vert[0]), float(vert[1]), float(vert[2])])
+                        normals_accum.append(np.array(local_n[idx], dtype=np.float64))
+                    else:
+                        normals_accum[existing] = normals_accum[existing] + np.array(
+                            local_n[idx], dtype=np.float64
+                        )
+                    remap.append(existing)
+
+                for tri in local_f:
+                    faces.append([remap[int(tri[0])], remap[int(tri[1])], remap[int(tri[2])]])
+
+    if not faces:
+        raise MeshingError(
+            "No zero level-set detected in current grid bounds. Expand bounds or change parameters."
+        )
+
+    normals: list[list[float]] = []
+    for n in normals_accum:
+        norm = float(np.linalg.norm(n))
+        if norm > 1e-12:
+            n = n / norm
+        else:
+            n = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        normals.append([float(n[0]), float(n[1]), float(n[2])])
+
+    return MeshData(
+        vertices=np.array(vertices, dtype=np.float64),
+        faces=np.array(faces, dtype=np.int32),
+        normals=np.array(normals, dtype=np.float64),
+    )
 
 
 def build_mesh(
@@ -543,8 +624,15 @@ def build_mesh(
     bounds: list[list[float]],
     chunk_size: int | None = None,
     backend: Literal["auto", "cpu", "cuda"] = "auto",
+    meshing_mode: Literal["uniform", "adaptive"] = "uniform",
 ) -> MeshData:
-    mesh, _ = build_mesh_with_backend(field, bounds, chunk_size=chunk_size, backend=backend)
+    mesh, _ = build_mesh_with_backend(
+        field,
+        bounds,
+        chunk_size=chunk_size,
+        backend=backend,
+        meshing_mode=meshing_mode,
+    )
     return mesh
 
 
@@ -553,6 +641,7 @@ def build_mesh_with_backend(
     bounds: list[list[float]],
     chunk_size: int | None = None,
     backend: Literal["auto", "cpu", "cuda"] = "auto",
+    meshing_mode: Literal["uniform", "adaptive"] = "uniform",
 ) -> tuple[MeshData, Literal["cpu", "cuda"]]:
     min_val = float(np.min(field))
     max_val = float(np.max(field))
@@ -560,6 +649,12 @@ def build_mesh_with_backend(
         raise MeshingError(
             "No zero level-set detected in current grid bounds. Expand bounds or change parameters."
         )
+
+    if meshing_mode == "adaptive":
+        try:
+            return _mesh_adaptive_cpu(field, bounds), "cpu"
+        except MemoryError:
+            return _mesh_chunked(field, bounds, chunk_size=chunk_size or 80), "cpu"
 
     resolved_backend = _resolve_mesh_backend(backend)
     if resolved_backend == "cuda":

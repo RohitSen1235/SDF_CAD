@@ -12,6 +12,7 @@ Local-first implicit modeling tool with a Python backend and React 3D frontend.
 - Turbomachinery concepts: `impeller_centrifugal`, `radial_turbine`, `volute_casing`
 - Mesh workflow: upload `.stl/.obj`, hollow with inward shell thickness `t`, fill cavity with TPMS (`gyroid`, `schwarz_p`, `diamond`)
 - Interactive 3D viewport with zoom/pan/rotate, transform gizmo, fit view, section cut, wireframe
+- Interactive field-volume preview mode (raymarched WebGL2 isosurface) for fast DSL edits
 - Preview quality tiers: `interactive (64)`, `medium (128)`, `high (192)`, `ultra (256)`
 - STL and OBJ export
 
@@ -40,6 +41,7 @@ Open `http://127.0.0.1:5173`.
 ## API
 
 - `POST /api/v1/scene/compile`
+- `POST /api/v1/preview/field`
 - `POST /api/v1/preview/mesh`
 - `POST /api/v1/export`
 - `POST /api/v1/mesh/preview` (multipart)
