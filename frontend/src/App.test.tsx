@@ -77,6 +77,7 @@ const meshPreviewPayload = {
 
 describe("App", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     window.localStorage.clear();
     compileScene.mockResolvedValue({
       sceneIr: compiledScene,
@@ -89,81 +90,124 @@ describe("App", () => {
     exportUploadedMesh.mockResolvedValue(new Blob(["ok"]));
   });
 
-  it("renders DSL workflow with parameter slider", async () => {
+  it("renders DSL workflow with manual compile controls", () => {
     render(<App />);
-
-    const slider = await screen.findByRole("slider");
-    expect(slider).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "DSL" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("button", { name: "Compile now" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Generate Shape" })).toBeInTheDocument();
   });
 
-  it("updates DSL preview only when Generate Shape is clicked", async () => {
+  it("does not auto-compile or auto-preview when source changes", () => {
     render(<App />);
-
-    const slider = await screen.findByRole("slider");
-    await waitFor(() => {
-      expect(previewField).toHaveBeenCalledTimes(2);
-    });
-    previewField.mockClear();
-
-    fireEvent.change(slider, { target: { value: "1.1" } });
-
+    fireEvent.change(screen.getByLabelText("DSL source editor"), { target: { value: "root = sphere(r=1.2)" } });
+    expect(compileScene).not.toHaveBeenCalled();
     expect(previewField).not.toHaveBeenCalled();
+    expect(previewMesh).not.toHaveBeenCalled();
+  });
 
+  it("compiles only when Compile now is clicked", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Compile now" }));
+
+    await waitFor(() => {
+      expect(compileScene).toHaveBeenCalledTimes(1);
+    });
+    expect(previewField).not.toHaveBeenCalled();
+    expect(previewMesh).not.toHaveBeenCalled();
+  });
+
+  it("runs exactly one field and one mesh preview on Generate Shape", async () => {
+    render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Generate Shape" }));
 
     await waitFor(() => {
-      expect(previewField).toHaveBeenCalled();
+      expect(previewMesh).toHaveBeenCalledTimes(1);
     });
 
-    const calls = previewField.mock.calls;
-    const lastCall = calls[calls.length - 1];
-    expect(lastCall?.[1]).toMatchObject({ radius: 1.1 });
-    expect(lastCall?.[2]).toBeDefined();
+    expect(compileScene).toHaveBeenCalledTimes(1);
+    expect(previewField).toHaveBeenCalledTimes(1);
+    expect(previewMesh).toHaveBeenCalledTimes(1);
+    const fieldCall = previewField.mock.calls[0];
+    const meshCall = previewMesh.mock.calls[0];
+    expect(fieldCall?.[2]).toBe("high");
+    expect(meshCall?.[2]).toBe("high");
+    expect(fieldCall?.[6]).toMatchObject({ resolution: 192 });
+    expect(meshCall?.[8]).toMatchObject({ resolution: 192 });
   });
 
-  it("sends selected SDF precision to preview API", async () => {
+  it("sends selected quality, precision, and backends only on Generate Shape", async () => {
     render(<App />);
 
-    await screen.findByRole("slider");
-    await waitFor(() => {
-      expect(previewField).toHaveBeenCalledTimes(2);
-    });
-    previewField.mockClear();
-
+    fireEvent.change(screen.getByLabelText("Quality"), { target: { value: "ultra" } });
     fireEvent.change(screen.getByLabelText("SDF Precision"), { target: { value: "float16" } });
-
-    await waitFor(() => {
-      expect(previewField).toHaveBeenCalled();
-    });
-    const calls = previewField.mock.calls;
-    const lastCall = calls[calls.length - 1];
-    expect(lastCall?.[3]).toBe("float16");
-  });
-
-  it("sends selected evaluator backend to field preview API", async () => {
-    render(<App />);
-
-    await screen.findByRole("slider");
-    await waitFor(() => {
-      expect(previewField).toHaveBeenCalledTimes(2);
-    });
-    previewField.mockClear();
-
     fireEvent.change(screen.getByLabelText("Eval Backend"), { target: { value: "cuda" } });
+    fireEvent.change(screen.getByLabelText("Mesh Backend"), { target: { value: "cuda" } });
+    fireEvent.change(screen.getByLabelText("Meshing Mode"), { target: { value: "adaptive" } });
 
+    expect(previewField).not.toHaveBeenCalled();
+    expect(previewMesh).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate Shape" }));
     await waitFor(() => {
-      expect(previewField).toHaveBeenCalled();
+      expect(previewMesh).toHaveBeenCalledTimes(1);
     });
-    const calls = previewField.mock.calls;
-    const lastCall = calls[calls.length - 1];
-    expect(lastCall?.[4]).toBe("cuda");
+
+    const fieldCall = previewField.mock.calls[0];
+    const meshCall = previewMesh.mock.calls[0];
+    expect(fieldCall?.[2]).toBe("ultra");
+    expect(fieldCall?.[3]).toBe("float16");
+    expect(fieldCall?.[4]).toBe("cuda");
+    expect(fieldCall?.[6]).toMatchObject({ resolution: 256 });
+    expect(meshCall?.[2]).toBe("ultra");
+    expect(meshCall?.[3]).toBe("float16");
+    expect(meshCall?.[4]).toBe("cuda");
+    expect(meshCall?.[5]).toBe("cuda");
+    expect(meshCall?.[6]).toBe("adaptive");
+    expect(meshCall?.[8]).toMatchObject({ resolution: 256 });
   });
 
-  it("saves and loads field expressions", async () => {
+  it("does not auto-rerun preview when quality/backend settings change", async () => {
     render(<App />);
 
-    await screen.findByRole("slider");
+    fireEvent.click(screen.getByRole("button", { name: "Generate Shape" }));
+    await waitFor(() => {
+      expect(previewMesh).toHaveBeenCalledTimes(1);
+    });
+
+    fireEvent.change(screen.getByLabelText("Quality"), { target: { value: "medium" } });
+    fireEvent.change(screen.getByLabelText("Eval Backend"), { target: { value: "cuda" } });
+    fireEvent.change(screen.getByLabelText("Mesh Backend"), { target: { value: "cuda" } });
+    fireEvent.change(screen.getByLabelText("Meshing Mode"), { target: { value: "adaptive" } });
+
+    expect(previewField).toHaveBeenCalledTimes(1);
+    expect(previewMesh).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate Shape" }));
+    await waitFor(() => {
+      expect(previewMesh).toHaveBeenCalledTimes(2);
+    });
+
+    expect(previewField).toHaveBeenCalledTimes(2);
+    expect(compileScene).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not preview when Generate Shape compile fails", async () => {
+    compileScene.mockRejectedValueOnce(new Error("Compile busted"));
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Generate Shape" }));
+
+    await waitFor(() => {
+      expect(compileScene).toHaveBeenCalledTimes(1);
+    });
+
+    expect(previewField).not.toHaveBeenCalled();
+    expect(previewMesh).not.toHaveBeenCalled();
+    expect(await screen.findByText("Compile busted")).toBeInTheDocument();
+  });
+
+  it("saves and loads field expressions", () => {
+    render(<App />);
 
     const editor = screen.getByLabelText("DSL source editor");
     const nameInput = screen.getByLabelText("Field expression name");
@@ -183,8 +227,6 @@ describe("App", () => {
 
   it("calls mesh preview API when Generate is clicked", async () => {
     render(<App />);
-
-    await screen.findByRole("slider");
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
 
     previewUploadedMesh.mockClear();
@@ -202,8 +244,6 @@ describe("App", () => {
 
   it("sends selected mesh workflow backends", async () => {
     render(<App />);
-
-    await screen.findByRole("slider");
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
     previewUploadedMesh.mockClear();
 
@@ -226,8 +266,6 @@ describe("App", () => {
 
   it("sends selected meshing mode for mesh workflow preview", async () => {
     render(<App />);
-
-    await screen.findByRole("slider");
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
     previewUploadedMesh.mockClear();
 
@@ -248,8 +286,6 @@ describe("App", () => {
 
   it("uses mesh export quality for uploaded export", async () => {
     render(<App />);
-
-    await screen.findByRole("slider");
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
 
     const file = new File(["v 0 0 0\n"], "test.obj", { type: "text/plain" });

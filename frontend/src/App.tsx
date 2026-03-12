@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Viewer } from "./components/Viewer";
 import {
@@ -24,23 +24,33 @@ import {
   SceneIR
 } from "./types";
 
-const EXAMPLES: Record<string, string> = {
-  "Gyroid Fill": `# Gyroid conformal fill
+interface SavedFieldExpression {
+  name: string;
+  source: string;
+  updatedAt: number;
+}
+
+const GYROID_FILL_SOURCE = `# Gyroid conformal fill
 param shell default=0.08 min=0.03 max=0.2 step=0.01
 host = sphere(r=1.0)
 lat = gyroid(pitch=0.45, thickness=0.1)
 root = conformal_fill(host, lat, wall=$shell, mode="hybrid")
-`,
-  "Compressor Stage": `# Centrifugal compressor with volute
+`;
+
+const COMPRESSOR_STAGE_SOURCE = `# Centrifugal compressor with volute
 param twist default=0.9 min=0.1 max=1.4 step=0.05
 imp = impeller_centrifugal(r_in=0.22, r_out=0.95, hub_h=0.45, blade_count=9, blade_twist=$twist)
 vol = volute_casing(throat_radius=0.34, outlet_radius=1.25, width=0.48, wall=0.08)
 root = union(imp, vol)
-`,
-  "Field Expression": `# Pure implicit expression
+`;
+
+const FIELD_EXPRESSION_SOURCE = `# Pure implicit expression
 a = sin(x * 3.0) + cos(y * 3.0) + sin(z * 3.0)
 root = abs(a) - 0.45
-`
+`;
+
+const EXAMPLES: Record<string, string> = {
+  "Field Expression": FIELD_EXPRESSION_SOURCE
 };
 
 const FUNCTION_SIGNATURES = [
@@ -65,29 +75,35 @@ const FUNCTION_SIGNATURES = [
 
 const QUALITY_ORDER: QualityProfile[] = ["interactive", "medium", "high", "ultra"];
 const SAVED_EXPRESSIONS_KEY = "sdfcad.savedFieldExpressions.v1";
+const BUILTIN_SAVED_EXPRESSIONS: SavedFieldExpression[] = [
+  {
+    name: "Gyroid Fill",
+    source: GYROID_FILL_SOURCE,
+    updatedAt: 0
+  },
+  {
+    name: "Compressor Stage",
+    source: COMPRESSOR_STAGE_SOURCE,
+    updatedAt: 0
+  }
+];
 
 type WorkflowMode = "dsl" | "mesh";
 
-interface SavedFieldExpression {
-  name: string;
-  source: string;
-  updatedAt: number;
-}
-
 function loadSavedExpressions(): SavedFieldExpression[] {
   if (typeof window === "undefined") {
-    return [];
+    return BUILTIN_SAVED_EXPRESSIONS;
   }
   try {
     const raw = window.localStorage.getItem(SAVED_EXPRESSIONS_KEY);
     if (!raw) {
-      return [];
+      return BUILTIN_SAVED_EXPRESSIONS;
     }
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) {
-      return [];
+      return BUILTIN_SAVED_EXPRESSIONS;
     }
-    return parsed
+    const loaded = parsed
       .map((item) => ({
         name: typeof item?.name === "string" ? item.name : "",
         source: typeof item?.source === "string" ? item.source : "",
@@ -95,8 +111,17 @@ function loadSavedExpressions(): SavedFieldExpression[] {
       }))
       .filter((item) => item.name.length > 0 && item.source.length > 0)
       .sort((a, b) => b.updatedAt - a.updatedAt);
+
+    const mergedByName = new Map<string, SavedFieldExpression>();
+    for (const entry of BUILTIN_SAVED_EXPRESSIONS) {
+      mergedByName.set(entry.name, entry);
+    }
+    for (const entry of loaded) {
+      mergedByName.set(entry.name, entry);
+    }
+    return [...mergedByName.values()].sort((a, b) => b.updatedAt - a.updatedAt);
   } catch {
-    return [];
+    return BUILTIN_SAVED_EXPRESSIONS;
   }
 }
 
@@ -115,15 +140,27 @@ function inferPreviewBounds(
   return expanded as [[number, number], [number, number], [number, number]];
 }
 
+function resolutionForQuality(profile: QualityProfile): number {
+  if (profile === "interactive") {
+    return 64;
+  }
+  if (profile === "medium") {
+    return 128;
+  }
+  if (profile === "high") {
+    return 192;
+  }
+  return 256;
+}
+
 export default function App() {
   const [workflow, setWorkflow] = useState<WorkflowMode>("dsl");
 
-  const [source, setSource] = useState(EXAMPLES["Gyroid Fill"]);
+  const [source, setSource] = useState(EXAMPLES["Field Expression"]);
+  const [sourceDirty, setSourceDirty] = useState(true);
   const [sceneIr, setSceneIr] = useState<SceneIR | null>(null);
   const [diagnostics, setDiagnostics] = useState<CompileDiagnostics | null>(null);
   const [params, setParams] = useState<Record<string, number>>({});
-  const [previewParams, setPreviewParams] = useState<Record<string, number>>({});
-  const [previewRevision, setPreviewRevision] = useState(0);
 
   const [meshFile, setMeshFile] = useState<File | null>(null);
   const [meshShellThickness, setMeshShellThickness] = useState(0.08);
@@ -157,8 +194,11 @@ export default function App() {
   const [expressionName, setExpressionName] = useState("");
   const [selectedExpressionName, setSelectedExpressionName] = useState("");
   const [expressionStatus, setExpressionStatus] = useState<string | null>(null);
-
-  const previewBounds = useMemo(() => inferPreviewBounds(diagnostics), [diagnostics]);
+  const previewRunIdRef = useRef(0);
+  const previewControllersRef = useRef<{ field: AbortController | null; mesh: AbortController | null }>({
+    field: null,
+    mesh: null
+  });
 
   const meshWorkflowParams = useMemo<MeshWorkflowParams>(
     () => ({
@@ -171,190 +211,149 @@ export default function App() {
     [meshShellThickness, meshLatticeType, meshLatticePitch, meshLatticeThickness, meshLatticePhase]
   );
 
+  const abortActivePreview = useCallback(() => {
+    previewControllersRef.current.field?.abort();
+    previewControllersRef.current.mesh?.abort();
+    previewControllersRef.current = { field: null, mesh: null };
+  }, []);
+
   const compileAndSync = useCallback(
-    async (nextSource: string) => {
+    async (
+      nextSource: string
+    ): Promise<{ sceneIr: SceneIR; diagnostics: CompileDiagnostics; params: Record<string, number> } | null> => {
       setIsCompiling(true);
       try {
         const compiled = await compileScene(nextSource);
+        const nextParams: Record<string, number> = {};
+        for (const spec of compiled.sceneIr.parameter_schema) {
+          nextParams[spec.name] = params[spec.name] ?? spec.default;
+        }
         setSceneIr(compiled.sceneIr);
         setDiagnostics(compiled.diagnostics);
-        setParams((previous) => {
-          const nextParams: Record<string, number> = {};
-          for (const spec of compiled.sceneIr.parameter_schema) {
-            nextParams[spec.name] = previous[spec.name] ?? spec.default;
-          }
-          setPreviewParams(nextParams);
-          setPreviewRevision((value) => value + 1);
-          return nextParams;
-        });
+        setParams(nextParams);
+        setSourceDirty(false);
         setError(null);
+        return { sceneIr: compiled.sceneIr, diagnostics: compiled.diagnostics, params: nextParams };
       } catch (compileError) {
         setError((compileError as Error).message);
+        return null;
       } finally {
         setIsCompiling(false);
       }
     },
-    [setSceneIr]
+    [params]
   );
 
-  useEffect(() => {
-    if (workflow !== "dsl") {
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      void compileAndSync(source);
-    }, 420);
-    return () => window.clearTimeout(timer);
-  }, [source, compileAndSync, workflow]);
-
-  useEffect(() => {
-    if (workflow !== "dsl" || !sceneIr || previewRevision === 0) {
-      return;
-    }
-
-    const controllers: AbortController[] = [];
-    let active = true;
-    let fineTimer: number | undefined;
-
-    const doPreview = async () => {
+  const runDslPreview = useCallback(
+    async (
+      nextSceneIr: SceneIR,
+      nextParams: Record<string, number>,
+      nextDiagnostics: CompileDiagnostics | null
+    ): Promise<void> => {
+      abortActivePreview();
+      const runId = previewRunIdRef.current + 1;
+      previewRunIdRef.current = runId;
       setIsPreviewing(true);
       setError(null);
+      // Clear stale visuals before starting a new Generate Shape run.
+      setField(null);
+      setMesh(null);
+      setStats(null);
 
-      const runStep = async (profile: QualityProfile) => {
-        const controller = new AbortController();
-        controllers.push(controller);
-        const resolution =
-          profile === "interactive" ? 64 : profile === "medium" ? 128 : profile === "high" ? 192 : 256;
-        const grid = previewBounds ? { bounds: previewBounds, resolution } : undefined;
+      try {
+        const gridBounds = inferPreviewBounds(nextDiagnostics);
+        const resolution = resolutionForQuality(quality);
+        const grid = gridBounds ? { bounds: gridBounds, resolution } : undefined;
+        let fieldSucceeded = false;
+        let lastError: Error | null = null;
+
         try {
+          const fieldController = new AbortController();
+          previewControllersRef.current.field = fieldController;
           const fieldResponse = await previewField(
-            sceneIr,
-            previewParams,
-            profile,
+            nextSceneIr,
+            nextParams,
+            quality,
             computePrecision,
             computeBackend,
-            controller.signal,
+            fieldController.signal,
             grid
           );
+          if (previewRunIdRef.current !== runId) {
+            return;
+          }
+          fieldSucceeded = true;
+          setField(fieldResponse.field);
+          setStats(fieldResponse.stats);
+        } catch (previewError) {
+          if ((previewError as Error).name === "AbortError") {
+            return;
+          }
+          lastError = previewError as Error;
+        } finally {
+          if (previewControllersRef.current.field?.signal.aborted !== true) {
+            previewControllersRef.current.field = null;
+          }
+        }
+
+        try {
           const meshController = new AbortController();
-          controllers.push(meshController);
-          void previewMesh(
-            sceneIr,
-            previewParams,
-            profile,
+          previewControllersRef.current.mesh = meshController;
+          const meshResponse = await previewMesh(
+            nextSceneIr,
+            nextParams,
+            quality,
             computePrecision,
             computeBackend,
             meshBackend,
             meshingMode,
             meshController.signal,
             grid
-          )
-            .then((meshResponse) => {
-              if (!active) {
-                return;
-              }
-              setMesh(meshResponse.mesh);
-            })
-            .catch(() => {
-              // Keep field preview active even if backup mesh fetch fails.
-            });
-          return { kind: "field" as const, response: fieldResponse };
-        } catch (error) {
-          if ((error as Error).name === "AbortError") {
-            throw error;
-          }
-          const meshResponse = await previewMesh(
-            sceneIr,
-            previewParams,
-            profile,
-            computePrecision,
-            computeBackend,
-            meshBackend,
-            meshingMode,
-            controller.signal,
-            grid
           );
-          return { kind: "mesh" as const, response: meshResponse };
+          if (previewRunIdRef.current !== runId) {
+            return;
+          }
+          // Mesh is the final display mode for generated previews.
+          setField(null);
+          setMesh(meshResponse.mesh);
+          setStats(meshResponse.stats);
+          setError(null);
+          return;
+        } catch (previewError) {
+          if ((previewError as Error).name === "AbortError") {
+            return;
+          }
+          lastError = previewError as Error;
+        } finally {
+          if (previewControllersRef.current.mesh?.signal.aborted !== true) {
+            previewControllersRef.current.mesh = null;
+          }
         }
-      };
 
-      try {
-        const coarse = await runStep("interactive");
-        if (!active) {
+        if (previewRunIdRef.current !== runId) {
           return;
         }
-        if (coarse.kind === "field") {
-          setField(coarse.response.field);
-          setStats(coarse.response.stats);
-        } else {
-          setField(null);
-          setMesh(coarse.response.mesh);
-          setStats(coarse.response.stats);
+        if (fieldSucceeded && lastError) {
+          setError(lastError.message);
+          return;
         }
-
-        if (quality !== "interactive") {
-          fineTimer = window.setTimeout(async () => {
-            try {
-              const fine = await runStep(quality);
-              if (!active) {
-                return;
-              }
-              if (fine.kind === "field") {
-                setField(fine.response.field);
-                setStats(fine.response.stats);
-              } else {
-                setField(null);
-                setMesh(fine.response.mesh);
-                setStats(fine.response.stats);
-              }
-              setIsPreviewing(false);
-            } catch (err) {
-              if (!active) {
-                return;
-              }
-              if ((err as Error).name !== "AbortError") {
-                setError((err as Error).message);
-              }
-              setIsPreviewing(false);
-            }
-          }, 550);
-        } else {
+        if (!fieldSucceeded && lastError) {
+          setError(lastError.message);
+        }
+      } finally {
+        if (previewRunIdRef.current === runId) {
           setIsPreviewing(false);
         }
-      } catch (err) {
-        if (!active) {
-          return;
-        }
-        if ((err as Error).name !== "AbortError") {
-          setError((err as Error).message);
-        }
-        setIsPreviewing(false);
       }
-    };
+    },
+    [abortActivePreview, quality, computePrecision, computeBackend, meshBackend, meshingMode]
+  );
 
-    void doPreview();
-
+  useEffect(() => {
     return () => {
-      active = false;
-      if (fineTimer !== undefined) {
-        window.clearTimeout(fineTimer);
-      }
-      for (const controller of controllers) {
-        controller.abort();
-      }
+      abortActivePreview();
     };
-  }, [
-    workflow,
-    sceneIr,
-    previewRevision,
-    quality,
-    computePrecision,
-    computeBackend,
-    meshBackend,
-    meshingMode,
-    previewBounds,
-    previewParams
-  ]);
+  }, [abortActivePreview]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -412,12 +411,30 @@ export default function App() {
     }
   };
 
-  const onGenerateDsl = () => {
-    if (!sceneIr) {
+  const onCompileDsl = async () => {
+    await compileAndSync(source);
+  };
+
+  const onGenerateDsl = async () => {
+    let activeScene = sceneIr;
+    let activeDiagnostics = diagnostics;
+    let activeParams = params;
+
+    if (!activeScene || sourceDirty) {
+      const compiled = await compileAndSync(source);
+      if (!compiled) {
+        return;
+      }
+      activeScene = compiled.sceneIr;
+      activeDiagnostics = compiled.diagnostics;
+      activeParams = compiled.params;
+    }
+
+    if (!activeScene) {
       return;
     }
-    setPreviewParams(params);
-    setPreviewRevision((value) => value + 1);
+
+    await runDslPreview(activeScene, activeParams, activeDiagnostics);
   };
 
   const onGenerateMesh = async () => {
@@ -506,6 +523,7 @@ export default function App() {
       return;
     }
     setSource(entry.source);
+    setSourceDirty(true);
     setExpressionName(entry.name);
     setExpressionStatus(`Loaded "${entry.name}".`);
     setError(null);
@@ -554,7 +572,13 @@ export default function App() {
               <div className="panel-title-row">
                 <h2>DSL Editor</h2>
                 <div className="inline-actions">
-                  <select onChange={(event) => setSource(EXAMPLES[event.target.value])} defaultValue="Gyroid Fill">
+                  <select
+                    onChange={(event) => {
+                      setSource(EXAMPLES[event.target.value]);
+                      setSourceDirty(true);
+                    }}
+                    defaultValue="Field Expression"
+                  >
                     {Object.keys(EXAMPLES).map((name) => (
                       <option key={name} value={name}>
                         {name}
@@ -564,8 +588,8 @@ export default function App() {
                   <button type="button" onClick={() => setIsSignatureHelpOpen(true)}>
                     Signature Help
                   </button>
-                  <button onClick={() => void compileAndSync(source)}>Compile now</button>
-                  <button type="button" onClick={onGenerateDsl}>
+                  <button onClick={() => void onCompileDsl()}>Compile now</button>
+                  <button type="button" onClick={() => void onGenerateDsl()}>
                     Generate Shape
                   </button>
                 </div>
@@ -573,7 +597,10 @@ export default function App() {
 
               <textarea
                 value={source}
-                onChange={(event) => setSource(event.target.value)}
+                onChange={(event) => {
+                  setSource(event.target.value);
+                  setSourceDirty(true);
+                }}
                 spellCheck={false}
                 className="editor"
                 aria-label="DSL source editor"

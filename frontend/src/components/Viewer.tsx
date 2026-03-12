@@ -130,7 +130,7 @@ const FIELD_FRAGMENT_SHADER = `
       discard;
     }
 
-    float eps = max(stepSize * 0.9, 1e-4);
+    float eps = max(voxel * 0.9, 1e-4);
     vec3 normal = estimateNormal(pHit, eps);
     vec3 lightDir = normalize(vec3(0.55, 0.75, 0.4));
     float diff = max(dot(normal, lightDir), 0.0);
@@ -450,9 +450,9 @@ export function Viewer({
             color="#8be9fd"
             roughness={0.25}
             metalness={0.05}
-            transparent
-            opacity={0.88}
             wireframe={wireframe}
+            clippingPlanes={clippingPlanes}
+            clipShadows
           />
         </mesh>
       ) : null}
