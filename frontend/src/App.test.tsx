@@ -74,11 +74,20 @@ describe("App", () => {
     expect(screen.getByRole("tab", { name: "DSL" })).toHaveAttribute("aria-selected", "true");
   });
 
-  it("triggers preview refresh when DSL parameter changes", async () => {
+  it("updates DSL preview only when Generate Shape is clicked", async () => {
     render(<App />);
 
     const slider = await screen.findByRole("slider");
+    await waitFor(() => {
+      expect(previewMesh).toHaveBeenCalledTimes(2);
+    });
+    previewMesh.mockClear();
+
     fireEvent.change(slider, { target: { value: "1.1" } });
+
+    expect(previewMesh).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate Shape" }));
 
     await waitFor(() => {
       expect(previewMesh).toHaveBeenCalled();
@@ -88,6 +97,46 @@ describe("App", () => {
     const lastCall = calls[calls.length - 1];
     expect(lastCall?.[1]).toMatchObject({ radius: 1.1 });
     expect(lastCall?.[2]).toBeDefined();
+  });
+
+  it("sends selected SDF precision to preview API", async () => {
+    render(<App />);
+
+    await screen.findByRole("slider");
+    await waitFor(() => {
+      expect(previewMesh).toHaveBeenCalledTimes(2);
+    });
+    previewMesh.mockClear();
+
+    fireEvent.change(screen.getByLabelText("SDF Precision"), { target: { value: "float16" } });
+
+    await waitFor(() => {
+      expect(previewMesh).toHaveBeenCalled();
+    });
+    const calls = previewMesh.mock.calls;
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall?.[3]).toBe("float16");
+  });
+
+  it("sends selected evaluator and mesher backends to preview API", async () => {
+    render(<App />);
+
+    await screen.findByRole("slider");
+    await waitFor(() => {
+      expect(previewMesh).toHaveBeenCalledTimes(2);
+    });
+    previewMesh.mockClear();
+
+    fireEvent.change(screen.getByLabelText("Eval Backend"), { target: { value: "cuda" } });
+    fireEvent.change(screen.getByLabelText("Mesh Backend"), { target: { value: "cuda" } });
+
+    await waitFor(() => {
+      expect(previewMesh).toHaveBeenCalled();
+    });
+    const calls = previewMesh.mock.calls;
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall?.[4]).toBe("cuda");
+    expect(lastCall?.[5]).toBe("cuda");
   });
 
   it("saves and loads field expressions", async () => {
@@ -128,6 +177,30 @@ describe("App", () => {
     await waitFor(() => {
       expect(previewUploadedMesh).toHaveBeenCalled();
     });
+  });
+
+  it("sends selected mesh workflow backends", async () => {
+    render(<App />);
+
+    await screen.findByRole("slider");
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    previewUploadedMesh.mockClear();
+
+    const file = new File(["v 0 0 0\n"], "test.obj", { type: "text/plain" });
+    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [file] } });
+    fireEvent.change(screen.getByLabelText("Mesh field backend"), { target: { value: "cuda" } });
+    fireEvent.change(screen.getByLabelText("Mesh mesher backend"), { target: { value: "cuda" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate Mesh Preview" }));
+    await waitFor(() => {
+      expect(previewUploadedMesh).toHaveBeenCalled();
+    });
+
+    const calls = previewUploadedMesh.mock.calls;
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall?.[3]).toBe("cuda");
+    expect(lastCall?.[4]).toBe("cuda");
   });
 
   it("uses mesh export quality for uploaded export", async () => {

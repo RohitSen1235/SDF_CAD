@@ -26,17 +26,31 @@ from .cache import (
     UploadedMeshCacheEntry,
 )
 from .dsl import DslError, compile_source_with_diagnostics
-from .evaluator import EvaluationError, ensure_scene_valid, evaluate_scene_field, merge_parameter_values
+from .evaluator import (
+    EvaluationError,
+    ensure_scene_valid,
+    evaluate_scene_field_with_backend,
+    merge_parameter_values,
+)
 from .mesh_upload import (
     MeshUploadError,
     ParsedMesh,
     build_host_field,
-    compose_hollow_lattice_field,
+    compose_hollow_lattice_field_with_backend,
     parse_mesh_bytes,
     validate_triangle_mesh,
 )
-from .meshing import MeshData, MeshingError, build_mesh, mesh_to_obj, mesh_to_stl
+from .meshing import (
+    MeshData,
+    MeshingError,
+    build_mesh_with_backend,
+    is_cuda_meshing_available,
+    mesh_to_obj,
+    mesh_to_stl,
+)
 from .models import (
+    ComputeBackend,
+    ComputePrecision,
     CompileSceneRequest,
     CompileSceneResponse,
     ExportMeshRequest,
@@ -47,6 +61,7 @@ from .models import (
     PreviewWsRequest,
     PreviewWsResponse,
     QualityProfile,
+    MeshBackend,
 )
 
 EVAL_TIMEOUT_SECONDS = 20.0
@@ -62,7 +77,7 @@ MESH_QUALITY_TO_RESOLUTION: dict[QualityProfile, int] = {
     "high": 96,
     "ultra": 128,
 }
-MESH_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
+MESH_UPLOAD_MAX_BYTES = 200 * 1024 * 1024
 
 app = FastAPI(title="SDF CAD", version="0.2.0")
 
@@ -230,12 +245,31 @@ def _run_preview(
     scene_ir,
     param_values: dict[str, float],
     grid: GridConfig,
+    compute_precision: ComputePrecision = "float32",
+    compute_backend: ComputeBackend = "auto",
+    mesh_backend: MeshBackend = "auto",
 ) -> PreviewMeshResponse:
     ensure_scene_valid(scene_ir)
     merged_params = merge_parameter_values(scene_ir, param_values)
 
-    cache_key = hash_preview_request(scene_ir, merged_params, grid)
+    cache_key = hash_preview_request(
+        scene_ir,
+        merged_params,
+        grid,
+        compute_precision=compute_precision,
+        compute_backend=compute_backend,
+        mesh_backend=mesh_backend,
+    )
     cached_mesh = mesh_preview_cache.get(cache_key)
+    if (
+        cached_mesh is not None
+        and mesh_backend != "cpu"
+        and str(cached_mesh.stats.get("mesh_backend", "cpu")) == "cpu"
+        and is_cuda_meshing_available()
+    ):
+        # Do not pin auto/cuda requests to stale CPU cache entries after CUDA
+        # becomes available or backend bugs are fixed.
+        cached_mesh = None
     if cached_mesh is not None:
         cached_stats = copy.deepcopy(cached_mesh.stats)
         cached_stats["cache_hit"] = True
@@ -249,17 +283,32 @@ def _run_preview(
         )
 
     eval_start = time.perf_counter()
-    field = field_preview_cache.get(cache_key)
-    field_cache_hit = field is not None
-    if field is None:
-        field = evaluate_scene_field(scene_ir, merged_params, grid)
-        field_preview_cache.set(cache_key, field)
+    cached_field = field_preview_cache.get(cache_key)
+    field_cache_hit = cached_field is not None
+    eval_backend: Literal["cpu", "cuda"] = "cpu"
+    if cached_field is None:
+        field, eval_backend = evaluate_scene_field_with_backend(
+            scene_ir,
+            merged_params,
+            grid,
+            compute_precision=compute_precision,
+            compute_backend=compute_backend,
+        )
+        field_preview_cache.set(cache_key, (field, eval_backend))
+    else:
+        field, cached_backend = cached_field
+        eval_backend = "cuda" if cached_backend == "cuda" else "cpu"
     eval_ms = (time.perf_counter() - eval_start) * 1000.0
     if eval_ms > EVAL_TIMEOUT_SECONDS * 1000.0:
         raise HTTPException(status_code=408, detail="Field evaluation timeout exceeded")
 
     mesh_start = time.perf_counter()
-    mesh = build_mesh(field, grid.bounds)
+    mesh_field = field.astype(np.float32, copy=False) if field.dtype == np.float16 else field
+    mesh, mesh_backend_used = build_mesh_with_backend(
+        mesh_field,
+        grid.bounds,
+        backend=mesh_backend,
+    )
     mesh_ms = (time.perf_counter() - mesh_start) * 1000.0
 
     vertices = mesh.vertices.tolist()
@@ -270,6 +319,9 @@ def _run_preview(
         mesh_ms=mesh_ms,
         tri_count=int(mesh.faces.shape[0]),
         cache_hit=field_cache_hit,
+        compute_precision=compute_precision,
+        compute_backend=eval_backend,
+        mesh_backend=mesh_backend_used,
     )
 
     mesh_preview_cache.set(
@@ -351,6 +403,8 @@ def _run_uploaded_mesh_preview(
     lattice_thickness: float,
     lattice_phase: float,
     quality_profile: QualityProfile,
+    compute_backend: ComputeBackend = "auto",
+    mesh_backend: MeshBackend = "auto",
 ) -> PreviewMeshResponse:
     cache_key = hash_uploaded_mesh_request(
         file_bytes=file_bytes,
@@ -361,8 +415,19 @@ def _run_uploaded_mesh_preview(
         lattice_thickness=lattice_thickness,
         lattice_phase=lattice_phase,
         quality_profile=quality_profile,
+        compute_backend=compute_backend,
+        mesh_backend=mesh_backend,
     )
     cached_mesh = uploaded_mesh_preview_cache.get(cache_key)
+    if (
+        cached_mesh is not None
+        and mesh_backend != "cpu"
+        and str(cached_mesh.stats.get("mesh_backend", "cpu")) == "cpu"
+        and is_cuda_meshing_available()
+    ):
+        # Do not pin auto/cuda requests to stale CPU cache entries after CUDA
+        # becomes available or backend bugs are fixed.
+        cached_mesh = None
     if cached_mesh is not None:
         cached_stats = copy.deepcopy(cached_mesh.stats)
         cached_stats["cache_hit"] = True
@@ -381,7 +446,7 @@ def _run_uploaded_mesh_preview(
         extension=extension,
         quality_profile=quality_profile,
     )
-    field = compose_hollow_lattice_field(
+    field, eval_backend_used = compose_hollow_lattice_field_with_backend(
         host_sdf,
         bounds,
         shell_thickness=shell_thickness,
@@ -389,11 +454,12 @@ def _run_uploaded_mesh_preview(
         lattice_pitch=lattice_pitch,
         lattice_thickness=lattice_thickness,
         lattice_phase=lattice_phase,
+        compute_backend=compute_backend,
     )
     eval_ms = (time.perf_counter() - eval_start) * 1000.0
 
     mesh_start = time.perf_counter()
-    generated = build_mesh(field, bounds)
+    generated, mesh_backend_used = build_mesh_with_backend(field, bounds, backend=mesh_backend)
     interior = _strip_outer_surface(generated, host_sdf, bounds)
     outer = _meshdata_from_parsed(parsed)
     mesh = _merge_meshes(outer, interior)
@@ -407,6 +473,8 @@ def _run_uploaded_mesh_preview(
         mesh_ms=mesh_ms,
         tri_count=int(mesh.faces.shape[0]),
         cache_hit=False,
+        compute_backend=eval_backend_used,
+        mesh_backend=mesh_backend_used,
     )
 
     uploaded_mesh_preview_cache.set(
@@ -428,7 +496,14 @@ def _run_uploaded_mesh_preview(
 def preview_mesh(payload: PreviewMeshRequest) -> PreviewMeshResponse:
     grid = _resolve_grid(payload.grid, payload.quality_profile)
     try:
-        return _run_preview(payload.scene_ir, payload.parameter_values, grid)
+        return _run_preview(
+            payload.scene_ir,
+            payload.parameter_values,
+            grid,
+            compute_precision=payload.compute_precision,
+            compute_backend=payload.compute_backend,
+            mesh_backend=payload.mesh_backend,
+        )
     except (DslError, EvaluationError, MeshingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -438,7 +513,14 @@ def export_mesh(payload: ExportMeshRequest) -> Response:
     grid = _resolve_grid(payload.grid, payload.quality_profile)
 
     try:
-        preview = _run_preview(payload.scene_ir, payload.parameter_values, grid)
+        preview = _run_preview(
+            payload.scene_ir,
+            payload.parameter_values,
+            grid,
+            compute_precision=payload.compute_precision,
+            compute_backend=payload.compute_backend,
+            mesh_backend=payload.mesh_backend,
+        )
     except (DslError, EvaluationError, MeshingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -470,6 +552,8 @@ async def preview_uploaded_mesh(
     lattice_thickness: float = Form(...),
     lattice_phase: float = Form(0.0),
     quality_profile: QualityProfile = Form("medium"),
+    compute_backend: ComputeBackend = Form("auto"),
+    mesh_backend: MeshBackend = Form("auto"),
 ) -> PreviewMeshResponse:
     file_bytes, extension = await _read_uploaded_mesh(file)
     try:
@@ -482,6 +566,8 @@ async def preview_uploaded_mesh(
             lattice_thickness=lattice_thickness,
             lattice_phase=lattice_phase,
             quality_profile=quality_profile,
+            compute_backend=compute_backend,
+            mesh_backend=mesh_backend,
         )
     except (MeshUploadError, MeshingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -496,6 +582,8 @@ async def export_uploaded_mesh(
     lattice_thickness: float = Form(...),
     lattice_phase: float = Form(0.0),
     quality_profile: QualityProfile = Form("high"),
+    compute_backend: ComputeBackend = Form("auto"),
+    mesh_backend: MeshBackend = Form("auto"),
     format: Literal["stl", "obj"] = Form("stl"),
 ) -> Response:
     file_bytes, extension = await _read_uploaded_mesh(file)
@@ -509,6 +597,8 @@ async def export_uploaded_mesh(
             lattice_thickness=lattice_thickness,
             lattice_phase=lattice_phase,
             quality_profile=quality_profile,
+            compute_backend=compute_backend,
+            mesh_backend=mesh_backend,
         )
     except (MeshUploadError, MeshingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -549,7 +639,14 @@ async def preview_ws(websocket: WebSocket) -> None:
                 coarse_grid = GridConfig(bounds=bounds, resolution=coarse_res)
                 fine_grid = GridConfig(bounds=bounds, resolution=fine_res)
 
-                coarse_preview = _run_preview(payload.scene_ir, payload.parameter_values, coarse_grid)
+                coarse_preview = _run_preview(
+                    payload.scene_ir,
+                    payload.parameter_values,
+                    coarse_grid,
+                    compute_precision=payload.compute_precision,
+                    compute_backend=payload.compute_backend,
+                    mesh_backend=payload.mesh_backend,
+                )
                 await websocket.send_json(
                     PreviewWsResponse(
                         phase="coarse", mesh=coarse_preview.mesh, stats=coarse_preview.stats
@@ -557,7 +654,14 @@ async def preview_ws(websocket: WebSocket) -> None:
                 )
 
                 if fine_res != coarse_res:
-                    fine_preview = _run_preview(payload.scene_ir, payload.parameter_values, fine_grid)
+                    fine_preview = _run_preview(
+                        payload.scene_ir,
+                        payload.parameter_values,
+                        fine_grid,
+                        compute_precision=payload.compute_precision,
+                        compute_backend=payload.compute_backend,
+                        mesh_backend=payload.mesh_backend,
+                    )
                     await websocket.send_json(
                         PreviewWsResponse(
                             phase="fine", mesh=fine_preview.mesh, stats=fine_preview.stats

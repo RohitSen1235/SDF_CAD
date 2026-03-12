@@ -1,7 +1,7 @@
 import numpy as np
 
 from app.dsl import compile_source
-from app.evaluator import evaluate_scene_field, merge_parameter_values
+from app.evaluator import CUPY_AVAILABLE, evaluate_scene_field, evaluate_scene_field_with_backend, merge_parameter_values
 from app.meshing import build_mesh
 from app.models import GridConfig
 
@@ -169,3 +169,35 @@ def test_freeform_surface_primitive_builds_mesh() -> None:
     assert np.all(np.isfinite(field))
     assert mesh.vertices.shape[0] > 0
     assert mesh.faces.shape[0] > 0
+
+
+def test_evaluator_respects_requested_compute_precision() -> None:
+    scene = compile_source("root = sphere(r=0.6)")
+    params = merge_parameter_values(scene, {})
+    grid = GridConfig(bounds=[[-1, 1], [-1, 1], [-1, 1]], resolution=33)
+
+    field32 = evaluate_scene_field(scene, params, grid, compute_precision="float32")
+    field16 = evaluate_scene_field(scene, params, grid, compute_precision="float16")
+
+    assert field32.dtype == np.float32
+    assert field16.dtype == np.float16
+    assert np.all(np.isfinite(field16))
+
+
+def test_cuda_backend_selection_reports_fallback_or_cuda() -> None:
+    scene = compile_source("root = sphere(r=0.55)")
+    params = merge_parameter_values(scene, {})
+    grid = GridConfig(bounds=[[-1, 1], [-1, 1], [-1, 1]], resolution=24)
+    field, backend = evaluate_scene_field_with_backend(
+        scene,
+        params,
+        grid,
+        compute_precision="float32",
+        compute_backend="cuda",
+    )
+
+    assert field.dtype == np.float32
+    if CUPY_AVAILABLE:
+        assert backend in {"cpu", "cuda"}
+    else:
+        assert backend == "cpu"

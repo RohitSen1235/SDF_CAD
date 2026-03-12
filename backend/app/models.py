@@ -19,6 +19,9 @@ ScalarRef = dict[str, str]
 ScalarValue = float | int | str | ScalarRef
 
 QualityProfile = Literal["interactive", "medium", "high", "ultra"]
+ComputePrecision = Literal["float32", "float16"]
+ComputeBackend = Literal["auto", "cpu", "cuda"]
+MeshBackend = Literal["auto", "cpu", "cuda"]
 
 
 class ParameterSpec(BaseModel):
@@ -109,6 +112,9 @@ class PreviewMeshRequest(BaseModel):
     parameter_values: dict[str, float] = Field(default_factory=dict)
     grid: GridConfig | None = None
     quality_profile: QualityProfile = "interactive"
+    compute_precision: ComputePrecision = "float32"
+    compute_backend: ComputeBackend = "auto"
+    mesh_backend: MeshBackend = "auto"
 
 
 class MeshPayload(BaseModel):
@@ -122,6 +128,9 @@ class PreviewStats(BaseModel):
     mesh_ms: float
     tri_count: int
     cache_hit: bool = False
+    compute_precision: ComputePrecision = "float32"
+    compute_backend: Literal["cpu", "cuda"] = "cpu"
+    mesh_backend: Literal["cpu", "cuda"] = "cpu"
 
 
 class PreviewMeshResponse(BaseModel):
@@ -135,6 +144,9 @@ class ExportMeshRequest(BaseModel):
     format: Literal["stl", "obj"] = "stl"
     quality_profile: QualityProfile = "high"
     grid: GridConfig | None = None
+    compute_precision: ComputePrecision = "float32"
+    compute_backend: ComputeBackend = "auto"
+    mesh_backend: MeshBackend = "auto"
 
 
 class PreviewWsRequest(BaseModel):
@@ -142,6 +154,9 @@ class PreviewWsRequest(BaseModel):
     parameter_values: dict[str, float] = Field(default_factory=dict)
     base_grid: GridConfig | None = None
     quality_profile: QualityProfile = "high"
+    compute_precision: ComputePrecision = "float32"
+    compute_backend: ComputeBackend = "auto"
+    mesh_backend: MeshBackend = "auto"
 
 
 class PreviewWsResponse(BaseModel):

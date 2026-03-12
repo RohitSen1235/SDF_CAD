@@ -3,9 +3,18 @@ from __future__ import annotations
 import math
 import struct
 from dataclasses import dataclass
+from typing import Any, Literal
 
 import numpy as np
 from scipy import ndimage
+
+try:
+    import cupy as cp
+
+    CUPY_AVAILABLE = True
+except Exception:
+    cp = None  # type: ignore[assignment]
+    CUPY_AVAILABLE = False
 
 
 class MeshUploadError(ValueError):
@@ -107,6 +116,77 @@ def compose_hollow_lattice_field(
     lattice_thickness: float,
     lattice_phase: float,
 ) -> np.ndarray:
+    field, _ = compose_hollow_lattice_field_with_backend(
+        host_sdf,
+        bounds,
+        shell_thickness=shell_thickness,
+        lattice_type=lattice_type,
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+        compute_backend="cpu",
+    )
+    return field
+
+
+def _resolve_compute_backend(requested: Literal["auto", "cpu", "cuda"]) -> Literal["cpu", "cuda"]:
+    if requested == "cpu":
+        return "cpu"
+    if requested == "cuda":
+        return "cuda" if CUPY_AVAILABLE else "cpu"
+    return "cuda" if CUPY_AVAILABLE else "cpu"
+
+
+def compose_hollow_lattice_field_with_backend(
+    host_sdf: np.ndarray,
+    bounds: list[list[float]],
+    shell_thickness: float,
+    lattice_type: str,
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+    compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
+) -> tuple[np.ndarray, Literal["cpu", "cuda"]]:
+    resolved_backend = _resolve_compute_backend(compute_backend)
+    if resolved_backend == "cuda":
+        try:
+            return (
+                _compose_hollow_lattice_field_cuda(
+                    host_sdf,
+                    bounds,
+                    shell_thickness=shell_thickness,
+                    lattice_type=lattice_type,
+                    lattice_pitch=lattice_pitch,
+                    lattice_thickness=lattice_thickness,
+                    lattice_phase=lattice_phase,
+                ),
+                "cuda",
+            )
+        except Exception:
+            pass
+    return (
+        _compose_hollow_lattice_field_cpu(
+            host_sdf,
+            bounds,
+            shell_thickness=shell_thickness,
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+        ),
+        "cpu",
+    )
+
+
+def _compose_hollow_lattice_field_cpu(
+    host_sdf: np.ndarray,
+    bounds: list[list[float]],
+    shell_thickness: float,
+    lattice_type: str,
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+) -> np.ndarray:
     if shell_thickness <= 0.0:
         raise MeshUploadError("shell_thickness must be > 0")
     if lattice_pitch <= 0.0:
@@ -144,6 +224,57 @@ def compose_hollow_lattice_field(
         lattice_clipped[mask] = np.maximum(lattice_values, cavity[mask])
 
     return np.minimum(shell_field, lattice_clipped)
+
+
+def _compose_hollow_lattice_field_cuda(
+    host_sdf: np.ndarray,
+    bounds: list[list[float]],
+    shell_thickness: float,
+    lattice_type: str,
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+) -> np.ndarray:
+    if not CUPY_AVAILABLE or cp is None:
+        raise MeshUploadError("CUDA backend requested but CuPy is not available")
+    if shell_thickness <= 0.0:
+        raise MeshUploadError("shell_thickness must be > 0")
+    if lattice_pitch <= 0.0:
+        raise MeshUploadError("lattice_pitch must be > 0")
+    if lattice_thickness <= 0.0:
+        raise MeshUploadError("lattice_thickness must be > 0")
+    if host_sdf.ndim != 3:
+        raise MeshUploadError("host_sdf must be a 3D grid")
+
+    host = cp.asarray(host_sdf, dtype=cp.float32)
+    shell_field = cp.maximum(host, -host - abs(shell_thickness))
+    cavity = host + abs(shell_thickness)
+    lattice_clipped = cavity.copy()
+
+    mask = cavity < 0.0
+    if bool(cp.any(mask).item()):
+        resolution = host.shape[0]
+        x_axis = cp.linspace(bounds[0][0], bounds[0][1], resolution, dtype=cp.float32)
+        y_axis = cp.linspace(bounds[1][0], bounds[1][1], resolution, dtype=cp.float32)
+        z_axis = cp.linspace(bounds[2][0], bounds[2][1], resolution, dtype=cp.float32)
+        ix, iy, iz = cp.nonzero(mask)
+        qx = x_axis[ix]
+        qy = y_axis[iy]
+        qz = z_axis[iz]
+        lattice_values = _tpms_field_xp(
+            cp,
+            qx,
+            qy,
+            qz,
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+        )
+        lattice_clipped[mask] = cp.maximum(lattice_values, cavity[mask])
+
+    out = cp.minimum(shell_field, lattice_clipped)
+    return cp.asnumpy(out)
 
 
 def build_hollow_lattice_field(
@@ -431,7 +562,8 @@ def _touches_boundary(mask: np.ndarray) -> bool:
     )
 
 
-def _tpms_field(
+def _tpms_field_xp(
+    xp: Any,
     qx: np.ndarray,
     qy: np.ndarray,
     qz: np.ndarray,
@@ -444,21 +576,42 @@ def _tpms_field(
     if op not in {"gyroid", "schwarz_p", "diamond"}:
         raise MeshUploadError(f"Unsupported lattice_type '{lattice_type}'")
 
-    scale = 2.0 * np.pi / max(abs(lattice_pitch), 1e-6)
+    scale = 2.0 * xp.pi / max(abs(lattice_pitch), 1e-6)
     u = qx * scale + lattice_phase
     v = qy * scale + lattice_phase
     w = qz * scale + lattice_phase
 
     if op == "gyroid":
-        base = np.sin(u) * np.cos(v) + np.sin(v) * np.cos(w) + np.sin(w) * np.cos(u)
+        base = xp.sin(u) * xp.cos(v) + xp.sin(v) * xp.cos(w) + xp.sin(w) * xp.cos(u)
     elif op == "schwarz_p":
-        base = np.cos(u) + np.cos(v) + np.cos(w)
+        base = xp.cos(u) + xp.cos(v) + xp.cos(w)
     else:
         base = (
-            np.sin(u) * np.sin(v) * np.sin(w)
-            + np.sin(u) * np.cos(v) * np.cos(w)
-            + np.cos(u) * np.sin(v) * np.cos(w)
-            + np.cos(u) * np.cos(v) * np.sin(w)
+            xp.sin(u) * xp.sin(v) * xp.sin(w)
+            + xp.sin(u) * xp.cos(v) * xp.cos(w)
+            + xp.cos(u) * xp.sin(v) * xp.cos(w)
+            + xp.cos(u) * xp.cos(v) * xp.sin(w)
         )
 
-    return np.abs(base) - abs(lattice_thickness)
+    return xp.abs(base) - abs(lattice_thickness)
+
+
+def _tpms_field(
+    qx: np.ndarray,
+    qy: np.ndarray,
+    qz: np.ndarray,
+    lattice_type: str,
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+) -> np.ndarray:
+    return _tpms_field_xp(
+        np,
+        qx,
+        qy,
+        qz,
+        lattice_type=lattice_type,
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+    )

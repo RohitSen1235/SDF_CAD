@@ -7,7 +7,14 @@ from typing import Any, Generic, TypeVar
 
 import numpy as np
 
-from .models import CompileDiagnostics, GridConfig, SceneIR
+from .models import (
+    CompileDiagnostics,
+    ComputeBackend,
+    ComputePrecision,
+    GridConfig,
+    MeshBackend,
+    SceneIR,
+)
 
 T = TypeVar("T")
 
@@ -49,11 +56,11 @@ class MeshCacheEntry:
     vertices: list[list[float]]
     indices: list[list[int]]
     normals: list[list[float]]
-    stats: dict[str, float | int | bool]
+    stats: dict[str, float | int | bool | str]
 
 
 mesh_preview_cache: LruCache[MeshCacheEntry] = LruCache(maxsize=24)
-field_preview_cache: LruCache[np.ndarray] = LruCache(maxsize=8)
+field_preview_cache: LruCache[tuple[np.ndarray, str]] = LruCache(maxsize=8)
 
 
 @dataclass
@@ -61,7 +68,7 @@ class UploadedMeshCacheEntry:
     vertices: list[list[float]]
     indices: list[list[int]]
     normals: list[list[float]]
-    stats: dict[str, float | int | bool]
+    stats: dict[str, float | int | bool | str]
 
 
 uploaded_mesh_preview_cache: LruCache[UploadedMeshCacheEntry] = LruCache(maxsize=12)
@@ -82,11 +89,21 @@ def hash_source(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
-def hash_preview_request(scene_ir: SceneIR, params: dict[str, float], grid: GridConfig) -> str:
+def hash_preview_request(
+    scene_ir: SceneIR,
+    params: dict[str, float],
+    grid: GridConfig,
+    compute_precision: ComputePrecision = "float32",
+    compute_backend: ComputeBackend = "auto",
+    mesh_backend: MeshBackend = "auto",
+) -> str:
     payload: dict[str, Any] = {
         "scene": scene_ir.model_dump(mode="json"),
         "params": {k: float(v) for k, v in sorted(params.items())},
         "grid": grid.model_dump(mode="json"),
+        "compute_precision": compute_precision,
+        "compute_backend": compute_backend,
+        "mesh_backend": mesh_backend,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -102,6 +119,8 @@ def hash_uploaded_mesh_request(
     lattice_thickness: float,
     lattice_phase: float,
     quality_profile: str,
+    compute_backend: str = "auto",
+    mesh_backend: str = "auto",
 ) -> str:
     payload: dict[str, Any] = {
         "file_hash": hashlib.sha256(file_bytes).hexdigest(),
@@ -112,6 +131,8 @@ def hash_uploaded_mesh_request(
         "lattice_thickness": float(lattice_thickness),
         "lattice_phase": float(lattice_phase),
         "quality_profile": quality_profile,
+        "compute_backend": compute_backend,
+        "mesh_backend": mesh_backend,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()

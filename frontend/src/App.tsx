@@ -10,6 +10,9 @@ import {
 } from "./lib/api";
 import {
   CompileDiagnostics,
+  ComputeBackend,
+  ComputePrecision,
+  MeshBackend,
   MeshLatticeType,
   MeshPayload,
   MeshWorkflowParams,
@@ -116,6 +119,8 @@ export default function App() {
   const [sceneIr, setSceneIr] = useState<SceneIR | null>(null);
   const [diagnostics, setDiagnostics] = useState<CompileDiagnostics | null>(null);
   const [params, setParams] = useState<Record<string, number>>({});
+  const [previewParams, setPreviewParams] = useState<Record<string, number>>({});
+  const [previewRevision, setPreviewRevision] = useState(0);
 
   const [meshFile, setMeshFile] = useState<File | null>(null);
   const [meshShellThickness, setMeshShellThickness] = useState(0.08);
@@ -137,6 +142,9 @@ export default function App() {
   const [transformMode, setTransformMode] = useState<"translate" | "rotate" | "scale">("translate");
   const [fitSignal, setFitSignal] = useState(0);
   const [quality, setQuality] = useState<QualityProfile>("high");
+  const [computePrecision, setComputePrecision] = useState<ComputePrecision>("float32");
+  const [computeBackend, setComputeBackend] = useState<ComputeBackend>("auto");
+  const [meshBackend, setMeshBackend] = useState<MeshBackend>("auto");
   const [sectionEnabled, setSectionEnabled] = useState(false);
   const [sectionLevel, setSectionLevel] = useState(0);
   const [isSignatureHelpOpen, setIsSignatureHelpOpen] = useState(false);
@@ -145,7 +153,6 @@ export default function App() {
   const [selectedExpressionName, setSelectedExpressionName] = useState("");
   const [expressionStatus, setExpressionStatus] = useState<string | null>(null);
 
-  const paramsSignature = useMemo(() => JSON.stringify(params), [params]);
   const previewBounds = useMemo(() => inferPreviewBounds(diagnostics), [diagnostics]);
 
   const meshWorkflowParams = useMemo<MeshWorkflowParams>(
@@ -171,6 +178,8 @@ export default function App() {
           for (const spec of compiled.sceneIr.parameter_schema) {
             nextParams[spec.name] = previous[spec.name] ?? spec.default;
           }
+          setPreviewParams(nextParams);
+          setPreviewRevision((value) => value + 1);
           return nextParams;
         });
         setError(null);
@@ -194,7 +203,7 @@ export default function App() {
   }, [source, compileAndSync, workflow]);
 
   useEffect(() => {
-    if (workflow !== "dsl" || !sceneIr) {
+    if (workflow !== "dsl" || !sceneIr || previewRevision === 0) {
       return;
     }
 
@@ -213,8 +222,11 @@ export default function App() {
           profile === "interactive" ? 64 : profile === "medium" ? 128 : profile === "high" ? 192 : 256;
         return previewMesh(
           sceneIr,
-          params,
+          previewParams,
           profile,
+          computePrecision,
+          computeBackend,
+          meshBackend,
           controller.signal,
           previewBounds ? { bounds: previewBounds, resolution } : undefined
         );
@@ -273,7 +285,7 @@ export default function App() {
         controller.abort();
       }
     };
-  }, [workflow, sceneIr, paramsSignature, quality, previewBounds, params]);
+  }, [workflow, sceneIr, previewRevision, quality, computePrecision, computeBackend, meshBackend, previewBounds, previewParams]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -311,7 +323,15 @@ export default function App() {
       return;
     }
     try {
-      const blob = await exportMesh(sceneIr, params, format, quality === "interactive" ? "high" : quality);
+      const blob = await exportMesh(
+        sceneIr,
+        params,
+        format,
+        quality === "interactive" ? "high" : quality,
+        computePrecision,
+        computeBackend,
+        meshBackend
+      );
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
       link.download = `sdf-model.${format}`;
@@ -320,6 +340,14 @@ export default function App() {
     } catch (exportError) {
       setError((exportError as Error).message);
     }
+  };
+
+  const onGenerateDsl = () => {
+    if (!sceneIr) {
+      return;
+    }
+    setPreviewParams(params);
+    setPreviewRevision((value) => value + 1);
   };
 
   const onGenerateMesh = async () => {
@@ -331,7 +359,13 @@ export default function App() {
     setIsPreviewing(true);
     setError(null);
     try {
-      const response = await previewUploadedMesh(meshFile, meshWorkflowParams, meshPreviewQuality);
+      const response = await previewUploadedMesh(
+        meshFile,
+        meshWorkflowParams,
+        meshPreviewQuality,
+        computeBackend,
+        meshBackend
+      );
       setMesh(response.mesh);
       setStats(response.stats);
     } catch (previewError) {
@@ -348,7 +382,14 @@ export default function App() {
     }
 
     try {
-      const blob = await exportUploadedMesh(meshFile, meshWorkflowParams, format, meshExportQuality);
+      const blob = await exportUploadedMesh(
+        meshFile,
+        meshWorkflowParams,
+        format,
+        meshExportQuality,
+        computeBackend,
+        meshBackend
+      );
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
       link.download = `mesh-lattice.${format}`;
@@ -451,6 +492,9 @@ export default function App() {
                     Signature Help
                   </button>
                   <button onClick={() => void compileAndSync(source)}>Compile now</button>
+                  <button type="button" onClick={onGenerateDsl}>
+                    Generate Shape
+                  </button>
                 </div>
               </div>
 
@@ -641,6 +685,32 @@ export default function App() {
                   </select>
                 </label>
 
+                <label className="slider-row">
+                  <span>Field backend</span>
+                  <select
+                    aria-label="Mesh field backend"
+                    value={computeBackend}
+                    onChange={(event) => setComputeBackend(event.target.value as ComputeBackend)}
+                  >
+                    <option value="auto">auto</option>
+                    <option value="cpu">cpu</option>
+                    <option value="cuda">cuda</option>
+                  </select>
+                </label>
+
+                <label className="slider-row">
+                  <span>Mesher backend</span>
+                  <select
+                    aria-label="Mesh mesher backend"
+                    value={meshBackend}
+                    onChange={(event) => setMeshBackend(event.target.value as MeshBackend)}
+                  >
+                    <option value="auto">auto</option>
+                    <option value="cpu">cpu</option>
+                    <option value="cuda">cuda</option>
+                  </select>
+                </label>
+
                 <button type="button" onClick={() => void onGenerateMesh()}>
                   Generate Mesh Preview
                 </button>
@@ -670,6 +740,38 @@ export default function App() {
                       {item}
                     </option>
                   ))}
+                </select>
+              </label>
+            ) : null}
+            {workflow === "dsl" ? (
+              <label className="inline-label">
+                SDF Precision
+                <select
+                  value={computePrecision}
+                  onChange={(event) => setComputePrecision(event.target.value as ComputePrecision)}
+                >
+                  <option value="float32">Float32 (default)</option>
+                  <option value="float16">Float16 (explicit)</option>
+                </select>
+              </label>
+            ) : null}
+            {workflow === "dsl" ? (
+              <label className="inline-label">
+                Eval Backend
+                <select value={computeBackend} onChange={(event) => setComputeBackend(event.target.value as ComputeBackend)}>
+                  <option value="auto">Auto</option>
+                  <option value="cpu">CPU</option>
+                  <option value="cuda">CUDA</option>
+                </select>
+              </label>
+            ) : null}
+            {workflow === "dsl" ? (
+              <label className="inline-label">
+                Mesh Backend
+                <select value={meshBackend} onChange={(event) => setMeshBackend(event.target.value as MeshBackend)}>
+                  <option value="auto">Auto</option>
+                  <option value="cpu">CPU</option>
+                  <option value="cuda">CUDA</option>
                 </select>
               </label>
             ) : null}
@@ -712,6 +814,8 @@ export default function App() {
             <span>Triangles: {stats?.tri_count ?? 0}</span>
             <span>Eval: {stats ? stats.eval_ms.toFixed(1) : "0.0"} ms</span>
             <span>Mesh: {stats ? stats.mesh_ms.toFixed(1) : "0.0"} ms</span>
+            <span>Eval backend: {stats?.compute_backend ?? "cpu"}</span>
+            <span>Mesh backend: {stats?.mesh_backend ?? "cpu"}</span>
             <span>Cache: {stats?.cache_hit ? "hit" : "miss"}</span>
           </div>
           {error ? <p className="error">{error}</p> : null}

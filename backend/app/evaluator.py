@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import math
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
 from .dsl import DslError
-from .models import GridConfig, SceneIR, SceneNode
+from .models import ComputeBackend, ComputePrecision, GridConfig, SceneIR, SceneNode
+
+try:
+    import cupy as cp
+
+    CUPY_AVAILABLE = True
+except Exception:
+    cp = None  # type: ignore[assignment]
+    CUPY_AVAILABLE = False
 
 try:
     from numba import vectorize
@@ -33,34 +41,61 @@ class EvaluationError(ValueError):
 
 LEAF_TYPES_WITH_AABB_SKIP = {"primitive", "field_expr", "turbomachine"}
 
+EVAL_DTYPE_MAP: dict[ComputePrecision, np.dtype[Any]] = {
+    "float32": np.dtype(np.float32),
+    "float16": np.dtype(np.float16),
+}
+
+
+def _resolve_eval_dtype(compute_precision: ComputePrecision) -> np.dtype[Any]:
+    return EVAL_DTYPE_MAP[compute_precision]
+
+
+def _resolve_compute_backend(requested: ComputeBackend) -> Literal["cpu", "cuda"]:
+    if requested == "cpu":
+        return "cpu"
+    if requested == "cuda":
+        return "cuda" if CUPY_AVAILABLE else "cpu"
+    return "cuda" if CUPY_AVAILABLE else "cpu"
+
 
 @lru_cache(maxsize=48)
-def _cached_grid(bounds_key: tuple[float, ...], resolution: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _cached_grid(
+    bounds_key: tuple[float, ...],
+    resolution: int,
+    dtype_name: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     xmin, xmax, ymin, ymax, zmin, zmax = bounds_key
-    x = np.linspace(xmin, xmax, resolution, dtype=np.float64)
-    y = np.linspace(ymin, ymax, resolution, dtype=np.float64)
-    z = np.linspace(zmin, zmax, resolution, dtype=np.float64)
+    dtype = np.dtype(dtype_name)
+    x = np.linspace(xmin, xmax, resolution, dtype=dtype)
+    y = np.linspace(ymin, ymax, resolution, dtype=dtype)
+    z = np.linspace(zmin, zmax, resolution, dtype=dtype)
     return np.meshgrid(x, y, z, indexing="ij")
 
 
 @lru_cache(maxsize=48)
-def _cached_axes(bounds_key: tuple[float, ...], resolution: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _cached_axes(
+    bounds_key: tuple[float, ...],
+    resolution: int,
+    dtype_name: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     xmin, xmax, ymin, ymax, zmin, zmax = bounds_key
-    x = np.linspace(xmin, xmax, resolution, dtype=np.float64)
-    y = np.linspace(ymin, ymax, resolution, dtype=np.float64)
-    z = np.linspace(zmin, zmax, resolution, dtype=np.float64)
+    dtype = np.dtype(dtype_name)
+    x = np.linspace(xmin, xmax, resolution, dtype=dtype)
+    y = np.linspace(ymin, ymax, resolution, dtype=dtype)
+    z = np.linspace(zmin, zmax, resolution, dtype=dtype)
     return x, y, z
 
 
-def _rotation_matrix_xyz(deg: tuple[float, float, float]) -> np.ndarray:
+def _rotation_matrix_xyz(deg: tuple[float, float, float], dtype: np.dtype[Any]) -> np.ndarray:
     rx, ry, rz = np.deg2rad(np.array(deg, dtype=np.float64))
     cx, sx = np.cos(rx), np.sin(rx)
     cy, sy = np.cos(ry), np.sin(ry)
     cz, sz = np.cos(rz), np.sin(rz)
 
-    mx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]])
-    my = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
-    mz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
+    mx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=dtype)
+    my = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=dtype)
+    mz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=dtype)
     return mz @ my @ mx
 
 
@@ -99,12 +134,12 @@ def _resolve_vec3(
     )
 
 
-def _smooth_union(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:
+def _smooth_union(a: np.ndarray, b: np.ndarray, k: float, xp: Any = np) -> np.ndarray:
     if k <= 0:
-        return np.minimum(a, b)
-    if NUMBA_AVAILABLE and _smin_numba is not None:
+        return xp.minimum(a, b)
+    if xp is np and NUMBA_AVAILABLE and _smin_numba is not None:
         return _smin_numba(a, b, a.dtype.type(k))
-    h = np.clip(0.5 + 0.5 * (b - a) / k, 0.0, 1.0)
+    h = xp.clip(0.5 + 0.5 * (b - a) / k, 0.0, 1.0)
     return (b * (1.0 - h) + a * h) - k * h * (1.0 - h)
 
 
@@ -113,22 +148,21 @@ def _distance_to_aabb(
     py: np.ndarray,
     pz: np.ndarray,
     bounds: tuple[float, float, float, float, float, float],
+    xp: Any = np,
 ) -> np.ndarray:
     xmin, xmax, ymin, ymax, zmin, zmax = bounds
-    dx = np.maximum(np.maximum(xmin - px, 0.0), px - xmax)
-    dy = np.maximum(np.maximum(ymin - py, 0.0), py - ymax)
-    dz = np.maximum(np.maximum(zmin - pz, 0.0), pz - zmax)
-    outside = np.sqrt(dx * dx + dy * dy + dz * dz)
+    dx = xp.maximum(xp.maximum(xmin - px, 0.0), px - xmax)
+    dy = xp.maximum(xp.maximum(ymin - py, 0.0), py - ymax)
+    dz = xp.maximum(xp.maximum(zmin - pz, 0.0), pz - zmax)
+    outside = xp.sqrt(dx * dx + dy * dy + dz * dz)
 
-    inside = np.minimum.reduce([
-        px - xmin,
-        xmax - px,
-        py - ymin,
-        ymax - py,
-        pz - zmin,
-        zmax - pz,
-    ])
-    return outside - np.maximum(inside, 0.0)
+    inside = px - xmin
+    inside = xp.minimum(inside, xmax - px)
+    inside = xp.minimum(inside, py - ymin)
+    inside = xp.minimum(inside, ymax - py)
+    inside = xp.minimum(inside, pz - zmin)
+    inside = xp.minimum(inside, zmax - pz)
+    return outside - xp.maximum(inside, 0.0)
 
 
 def _dist_to_segment(
@@ -137,6 +171,7 @@ def _dist_to_segment(
     pz: np.ndarray,
     a: tuple[float, float, float],
     b: tuple[float, float, float],
+    xp: Any = np,
 ) -> np.ndarray:
     ax, ay, az = a
     bx, by, bz = b
@@ -145,18 +180,18 @@ def _dist_to_segment(
     abz = bz - az
     denom = abx * abx + aby * aby + abz * abz
     if denom < 1e-12:
-        return np.sqrt((px - ax) ** 2 + (py - ay) ** 2 + (pz - az) ** 2)
+        return xp.sqrt((px - ax) ** 2 + (py - ay) ** 2 + (pz - az) ** 2)
 
     apx = px - ax
     apy = py - ay
     apz = pz - az
     t = (apx * abx + apy * aby + apz * abz) / denom
-    t = np.clip(t, 0.0, 1.0)
+    t = xp.clip(t, 0.0, 1.0)
 
     cx = ax + t * abx
     cy = ay + t * aby
     cz = az + t * abz
-    return np.sqrt((px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2)
+    return xp.sqrt((px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2)
 
 
 def _repeat_local(coord: np.ndarray, pitch: float) -> np.ndarray:
@@ -193,7 +228,7 @@ def _parse_heights_grid(raw: str) -> np.ndarray | None:
     values = _parse_float_tokens(raw)
     if values is None or len(values) != 16:
         return None
-    return np.asarray(values, dtype=np.float64).reshape(4, 4)
+    return np.asarray(values, dtype=np.float32).reshape(4, 4)
 
 
 def _catmull_rom_sample(
@@ -325,9 +360,18 @@ def _strut_segments(kind: str) -> list[tuple[tuple[float, float, float], tuple[f
 
 
 class _FieldRuntime:
-    def __init__(self, scene_ir: SceneIR, parameter_values: dict[str, float]) -> None:
+    def __init__(
+        self,
+        scene_ir: SceneIR,
+        parameter_values: dict[str, float],
+        eval_dtype: np.dtype[Any],
+        xp: Any = np,
+    ) -> None:
         self.scene_ir = scene_ir
         self.parameter_values = parameter_values
+        self.eval_dtype = np.dtype(eval_dtype)
+        self.xp = xp
+        self._small_eps = 1e-4 if self.eval_dtype == np.dtype(np.float16) else 1e-12
         self.node_lookup: dict[str, SceneNode] = {node.id: node for node in scene_ir.nodes}
         self._bounds_hint_cache: dict[str, tuple[float, float, float, float, float, float] | None] = {
             node.id: self._resolve_bounds_hint(node) for node in scene_ir.nodes
@@ -339,7 +383,7 @@ class _FieldRuntime:
             tuple[str, str, bool, int],
             list[tuple[float, float, float]],
         ] = {}
-        self._freeform_grid_cache: dict[tuple[str, str], np.ndarray] = {}
+        self._freeform_grid_cache: dict[tuple[str, str, str, str], np.ndarray] = {}
 
     def _node_scalar_param(self, node: SceneNode, key: str, default: Any) -> float:
         cache_key = (node.id, key)
@@ -384,7 +428,7 @@ class _FieldRuntime:
         if abs(sx) < 1e-6 or abs(sy) < 1e-6 or abs(sz) < 1e-6:
             raise EvaluationError(f"Node '{node.id}' has singular scale")
 
-        inv_rotation = _rotation_matrix_xyz(rotate).T if any(abs(v) > 1e-9 for v in rotate) else None
+        inv_rotation = _rotation_matrix_xyz(rotate, self.eval_dtype).T if any(abs(v) > 1e-9 for v in rotate) else None
         tx, ty, tz = translate
         out = (tx, ty, tz, sx, sy, sz, inv_rotation)
         self._transform_cache[node.id] = out
@@ -419,7 +463,8 @@ class _FieldRuntime:
             "heights",
             "0 0 0 0; 0 0.2 0.2 0; 0 0.2 0.2 0; 0 0 0 0",
         )
-        cache_key = (node.id, heights_raw)
+        xp_name = "cupy" if cp is not None and self.xp is cp else "numpy"
+        cache_key = (node.id, heights_raw, self.eval_dtype.name, xp_name)
         if cache_key in self._freeform_grid_cache:
             return self._freeform_grid_cache[cache_key]
 
@@ -428,11 +473,29 @@ class _FieldRuntime:
             raise EvaluationError(
                 f"freeform_surface primitive '{node.id}' expects exactly 16 numeric values in 'heights'"
             )
-        self._freeform_grid_cache[cache_key] = grid
-        return grid
+        cast_grid = self.xp.asarray(grid, dtype=self.eval_dtype)
+        self._freeform_grid_cache[cache_key] = cast_grid
+        return cast_grid
 
     def evaluate(self, px: np.ndarray, py: np.ndarray, pz: np.ndarray) -> np.ndarray:
+        xp = self.xp
         memo: dict[tuple[str, int, int, int], np.ndarray] = {}
+
+        def to_bool(value: Any) -> bool:
+            if hasattr(value, "item"):
+                return bool(value.item())
+            return bool(value)
+
+        def coerce_eval_array(value: Any, ref_shape: tuple[int, ...]) -> np.ndarray:
+            arr = xp.asarray(value, dtype=self.eval_dtype)
+            if arr.shape == ref_shape:
+                return arr
+            try:
+                return xp.broadcast_to(arr, ref_shape).astype(self.eval_dtype, copy=False)
+            except ValueError as exc:
+                raise EvaluationError(
+                    f"Node produced non-broadcastable shape {arr.shape}; expected {ref_shape}"
+                ) from exc
 
         def eval_node(node_id: str, qx: np.ndarray, qy: np.ndarray, qz: np.ndarray) -> np.ndarray:
             key = (node_id, id(qx), id(qy), id(qz))
@@ -455,24 +518,24 @@ class _FieldRuntime:
                     & (qz <= zmax)
                 )
 
-                if not np.any(mask):
-                    out = _distance_to_aabb(qx, qy, qz, bounds_hint)
+                if not to_bool(xp.any(mask)):
+                    out = coerce_eval_array(_distance_to_aabb(qx, qy, qz, bounds_hint, xp=xp), qx.shape)
                     memo[key] = out
                     return out
 
-                if np.all(mask):
-                    out = eval_node_core(node, qx, qy, qz)
+                if to_bool(xp.all(mask)):
+                    out = coerce_eval_array(eval_node_core(node, qx, qy, qz), qx.shape)
                     memo[key] = out
                     return out
 
-                out = _distance_to_aabb(qx, qy, qz, bounds_hint)
+                out = _distance_to_aabb(qx, qy, qz, bounds_hint, xp=xp)
                 sub = eval_node_core(node, qx[mask], qy[mask], qz[mask])
-                out = out.astype(np.float64, copy=True)
+                out = out.astype(self.eval_dtype, copy=True)
                 out[mask] = sub
                 memo[key] = out
                 return out
 
-            out = eval_node_core(node, qx, qy, qz)
+            out = coerce_eval_array(eval_node_core(node, qx, qy, qz), qx.shape)
             memo[key] = out
             return out
 
@@ -533,9 +596,10 @@ class _FieldRuntime:
                 if op == "*":
                     return left * right
                 if op == "/":
-                    return left / np.where(np.abs(right) < 1e-12, 1e-12, right)
+                    eps = self.eval_dtype.type(self._small_eps)
+                    return left / xp.where(xp.abs(right) < eps, eps, right)
                 if op == "^":
-                    return np.power(left, right)
+                    return xp.power(left, right)
                 raise EvaluationError(f"Unsupported binary op '{op}'")
             if kind == "func":
                 name = expr.get("name")
@@ -543,49 +607,50 @@ class _FieldRuntime:
                 if name == "sin":
                     if len(args) != 1:
                         raise EvaluationError("sin expects exactly 1 argument")
-                    return np.sin(args[0])
+                    return xp.sin(args[0])
                 if name == "cos":
                     if len(args) != 1:
                         raise EvaluationError("cos expects exactly 1 argument")
-                    return np.cos(args[0])
+                    return xp.cos(args[0])
                 if name == "tan":
                     if len(args) != 1:
                         raise EvaluationError("tan expects exactly 1 argument")
-                    return np.tan(args[0])
+                    return xp.tan(args[0])
                 if name == "abs":
                     if len(args) != 1:
                         raise EvaluationError("abs expects exactly 1 argument")
-                    return np.abs(args[0])
+                    return xp.abs(args[0])
                 if name == "sqrt":
                     if len(args) != 1:
                         raise EvaluationError("sqrt expects exactly 1 argument")
-                    return np.sqrt(np.maximum(args[0], 0.0))
+                    return xp.sqrt(xp.maximum(args[0], 0.0))
                 if name == "exp":
                     if len(args) != 1:
                         raise EvaluationError("exp expects exactly 1 argument")
-                    return np.exp(args[0])
+                    return xp.exp(args[0])
                 if name == "log":
                     if len(args) != 1:
                         raise EvaluationError("log expects exactly 1 argument")
-                    return np.log(np.maximum(args[0], 1e-12))
+                    eps = self.eval_dtype.type(self._small_eps)
+                    return xp.log(xp.maximum(args[0], eps))
                 if name == "min":
                     if not args:
                         raise EvaluationError("min expects at least 1 argument")
                     out = args[0]
                     for arg in args[1:]:
-                        out = np.minimum(out, arg)
+                        out = xp.minimum(out, arg)
                     return out
                 if name == "max":
                     if not args:
                         raise EvaluationError("max expects at least 1 argument")
                     out = args[0]
                     for arg in args[1:]:
-                        out = np.maximum(out, arg)
+                        out = xp.maximum(out, arg)
                     return out
                 if name == "clamp":
                     if len(args) != 3:
                         raise EvaluationError("clamp expects exactly 3 arguments")
-                    return np.clip(args[0], args[1], args[2])
+                    return xp.clip(args[0], args[1], args[2])
                 raise EvaluationError(f"Unsupported function '{name}'")
 
             raise EvaluationError(f"Unsupported expression kind '{kind}'")
@@ -594,11 +659,11 @@ class _FieldRuntime:
             if node.expr is None:
                 raise EvaluationError(f"field_expr node '{node.id}' missing expression payload")
             out = eval_expr(node.expr, qx, qy, qz)
-            arr = np.asarray(out, dtype=np.float64)
+            arr = xp.asarray(out, dtype=self.eval_dtype)
             if arr.shape == qx.shape:
                 return arr
             try:
-                return np.broadcast_to(arr, qx.shape).astype(np.float64, copy=False)
+                return xp.broadcast_to(arr, qx.shape).astype(self.eval_dtype, copy=False)
             except ValueError as exc:
                 raise EvaluationError(
                     f"field_expr node '{node.id}' produced non-broadcastable shape {arr.shape}"
@@ -608,44 +673,46 @@ class _FieldRuntime:
             primitive = node.primitive
             if primitive == "sphere":
                 r = self._node_scalar_param(node, "r", 1.0)
-                return np.sqrt(qx * qx + qy * qy + qz * qz) - r
+                return xp.sqrt(qx * qx + qy * qy + qz * qz) - r
 
             if primitive == "box":
                 bx = self._node_scalar_param(node, "x", 0.5)
                 by = self._node_scalar_param(node, "y", 0.5)
                 bz = self._node_scalar_param(node, "z", 0.5)
-                qmx = np.abs(qx) - bx
-                qmy = np.abs(qy) - by
-                qmz = np.abs(qz) - bz
-                ox = np.maximum(qmx, 0.0)
-                oy = np.maximum(qmy, 0.0)
-                oz = np.maximum(qmz, 0.0)
-                outside = np.sqrt(ox * ox + oy * oy + oz * oz)
-                inside = np.minimum(np.maximum.reduce([qmx, qmy, qmz]), 0.0)
+                qmx = xp.abs(qx) - bx
+                qmy = xp.abs(qy) - by
+                qmz = xp.abs(qz) - bz
+                ox = xp.maximum(qmx, 0.0)
+                oy = xp.maximum(qmy, 0.0)
+                oz = xp.maximum(qmz, 0.0)
+                outside = xp.sqrt(ox * ox + oy * oy + oz * oz)
+                inside = xp.maximum(qmx, qmy)
+                inside = xp.maximum(inside, qmz)
+                inside = xp.minimum(inside, 0.0)
                 return outside + inside
 
             if primitive == "cylinder":
                 r = self._node_scalar_param(node, "r", 0.4)
                 h = self._node_scalar_param(node, "h", 1.0)
-                d1 = np.sqrt(qx * qx + qz * qz) - r
-                d2 = np.abs(qy) - h * 0.5
-                outside = np.sqrt(np.maximum(d1, 0.0) ** 2 + np.maximum(d2, 0.0) ** 2)
-                inside = np.minimum(np.maximum(d1, d2), 0.0)
+                d1 = xp.sqrt(qx * qx + qz * qz) - r
+                d2 = xp.abs(qy) - h * 0.5
+                outside = xp.sqrt(xp.maximum(d1, 0.0) ** 2 + xp.maximum(d2, 0.0) ** 2)
+                inside = xp.minimum(xp.maximum(d1, d2), 0.0)
                 return outside + inside
 
             if primitive == "torus":
                 major_r = self._node_scalar_param(node, "R", 0.8)
                 minor_r = self._node_scalar_param(node, "r", 0.2)
-                q = np.sqrt(qx * qx + qz * qz) - major_r
-                return np.sqrt(q * q + qy * qy) - minor_r
+                q = xp.sqrt(qx * qx + qz * qz) - major_r
+                return xp.sqrt(q * q + qy * qy) - minor_r
 
             if primitive == "spline":
                 radius = self._node_scalar_param(node, "radius", 0.08)
                 curve = self._node_spline_polyline(node)
-                dist = np.full_like(qx, fill_value=np.inf, dtype=np.float64)
+                dist = xp.full_like(qx, fill_value=xp.inf, dtype=self.eval_dtype)
                 for idx in range(len(curve) - 1):
-                    dseg = _dist_to_segment(qx, qy, qz, curve[idx], curve[idx + 1])
-                    dist = np.minimum(dist, dseg)
+                    dseg = _dist_to_segment(qx, qy, qz, curve[idx], curve[idx + 1], xp=xp)
+                    dist = xp.minimum(dist, dseg)
                 return dist - abs(radius)
 
             if primitive == "freeform_surface":
@@ -656,8 +723,8 @@ class _FieldRuntime:
                 if x_extent < 1e-6 or z_extent < 1e-6:
                     raise EvaluationError("freeform_surface x/z extents must be non-zero")
 
-                u = np.clip(qx / (2.0 * x_extent) + 0.5, 0.0, 1.0)
-                v = np.clip(qz / (2.0 * z_extent) + 0.5, 0.0, 1.0)
+                u = xp.clip(qx / (2.0 * x_extent) + 0.5, 0.0, 1.0)
+                v = xp.clip(qz / (2.0 * z_extent) + 0.5, 0.0, 1.0)
                 bu0, bu1, bu2, bu3 = _cubic_bezier_basis(u)
                 bv0, bv1, bv2, bv3 = _cubic_bezier_basis(v)
 
@@ -667,14 +734,14 @@ class _FieldRuntime:
                 row3 = bv0 * grid[3, 0] + bv1 * grid[3, 1] + bv2 * grid[3, 2] + bv3 * grid[3, 3]
                 surface_y = bu0 * row0 + bu1 * row1 + bu2 * row2 + bu3 * row3
 
-                sheet = np.abs(qy - surface_y) - thickness
+                sheet = xp.abs(qy - surface_y) - thickness
 
-                rx = np.abs(qx) - x_extent
-                rz = np.abs(qz) - z_extent
-                outside = np.sqrt(np.maximum(rx, 0.0) ** 2 + np.maximum(rz, 0.0) ** 2)
-                inside = np.minimum(np.maximum(rx, rz), 0.0)
+                rx = xp.abs(qx) - x_extent
+                rz = xp.abs(qz) - z_extent
+                outside = xp.sqrt(xp.maximum(rx, 0.0) ** 2 + xp.maximum(rz, 0.0) ** 2)
+                inside = xp.minimum(xp.maximum(rx, rz), 0.0)
                 footprint = outside + inside
-                return np.maximum(sheet, footprint)
+                return xp.maximum(sheet, footprint)
 
             if primitive == "plane":
                 nx = self._node_scalar_param(node, "nx", 0.0)
@@ -698,19 +765,25 @@ class _FieldRuntime:
 
             op = node.op
             if op == "union":
-                return np.minimum.reduce(fields)
+                result = fields[0]
+                for field in fields[1:]:
+                    result = xp.minimum(result, field)
+                return result
             if op == "intersection":
-                return np.maximum.reduce(fields)
+                result = fields[0]
+                for field in fields[1:]:
+                    result = xp.maximum(result, field)
+                return result
             if op == "difference":
                 result = fields[0]
                 for field in fields[1:]:
-                    result = np.maximum(result, -field)
+                    result = xp.maximum(result, -field)
                 return result
             if op == "smooth_union":
                 k = self._node_scalar_param(node, "k", 0.2)
                 result = fields[0]
                 for field in fields[1:]:
-                    result = _smooth_union(result, field, k)
+                    result = _smooth_union(result, field, k, xp=xp)
                 return result
 
             raise EvaluationError(f"Unknown boolean op '{op}'")
@@ -757,21 +830,21 @@ class _FieldRuntime:
                 axis = self._node_string_param(node, "axis", "y").lower()
                 if axis == "y":
                     angle = k * qy
-                    ca = np.cos(angle)
-                    sa = np.sin(angle)
+                    ca = xp.cos(angle)
+                    sa = xp.sin(angle)
                     rx = ca * qx - sa * qz
                     rz = sa * qx + ca * qz
                     return eval_node(node.inputs[0], rx, qy, rz)
                 if axis == "x":
                     angle = k * qx
-                    ca = np.cos(angle)
-                    sa = np.sin(angle)
+                    ca = xp.cos(angle)
+                    sa = xp.sin(angle)
                     ry = ca * qy - sa * qz
                     rz = sa * qy + ca * qz
                     return eval_node(node.inputs[0], qx, ry, rz)
                 angle = k * qz
-                ca = np.cos(angle)
-                sa = np.sin(angle)
+                ca = xp.cos(angle)
+                sa = xp.sin(angle)
                 rx = ca * qx - sa * qy
                 ry = sa * qx + ca * qy
                 return eval_node(node.inputs[0], rx, ry, qz)
@@ -781,21 +854,21 @@ class _FieldRuntime:
                 axis = self._node_string_param(node, "axis", "x").lower()
                 if axis == "x":
                     angle = k * qx
-                    ca = np.cos(angle)
-                    sa = np.sin(angle)
+                    ca = xp.cos(angle)
+                    sa = xp.sin(angle)
                     ry = ca * qy - sa * qz
                     rz = sa * qy + ca * qz
                     return eval_node(node.inputs[0], qx, ry, rz)
                 if axis == "y":
                     angle = k * qy
-                    ca = np.cos(angle)
-                    sa = np.sin(angle)
+                    ca = xp.cos(angle)
+                    sa = xp.sin(angle)
                     rx = ca * qx - sa * qz
                     rz = sa * qx + ca * qz
                     return eval_node(node.inputs[0], rx, qy, rz)
                 angle = k * qz
-                ca = np.cos(angle)
-                sa = np.sin(angle)
+                ca = xp.cos(angle)
+                sa = xp.sin(angle)
                 rx = ca * qx - sa * qy
                 ry = sa * qx + ca * qy
                 return eval_node(node.inputs[0], rx, ry, qz)
@@ -803,7 +876,7 @@ class _FieldRuntime:
             if op == "shell":
                 thickness = self._node_scalar_param(node, "t", 0.1)
                 inner = eval_node(node.inputs[0], qx, qy, qz)
-                return np.abs(inner) - abs(thickness)
+                return xp.abs(inner) - abs(thickness)
 
             if op == "offset":
                 d = self._node_scalar_param(node, "d", 0.0)
@@ -819,7 +892,7 @@ class _FieldRuntime:
                 if count == 1:
                     return eval_node(node.inputs[0], qx, qy, qz)
 
-                result = np.full_like(qx, np.inf, dtype=np.float64)
+                result = xp.full_like(qx, xp.inf, dtype=self.eval_dtype)
                 step = (2.0 * np.pi) / float(count)
 
                 for idx in range(count):
@@ -840,7 +913,7 @@ class _FieldRuntime:
                         rz = sa * qx + ca * qz
                         child = eval_node(node.inputs[0], rx, qy, rz)
 
-                    result = np.minimum(result, child)
+                    result = xp.minimum(result, child)
                 return result
 
             raise EvaluationError(f"Unsupported domain op '{op}'")
@@ -858,18 +931,18 @@ class _FieldRuntime:
                 w = qz * scale + phase
 
                 if op == "gyroid":
-                    base = np.sin(u) * np.cos(v) + np.sin(v) * np.cos(w) + np.sin(w) * np.cos(u)
+                    base = xp.sin(u) * xp.cos(v) + xp.sin(v) * xp.cos(w) + xp.sin(w) * xp.cos(u)
                 elif op == "schwarz_p":
-                    base = np.cos(u) + np.cos(v) + np.cos(w)
+                    base = xp.cos(u) + xp.cos(v) + xp.cos(w)
                 else:
                     base = (
-                        np.sin(u) * np.sin(v) * np.sin(w)
-                        + np.sin(u) * np.cos(v) * np.cos(w)
-                        + np.cos(u) * np.sin(v) * np.cos(w)
-                        + np.cos(u) * np.cos(v) * np.sin(w)
+                        xp.sin(u) * xp.sin(v) * xp.sin(w)
+                        + xp.sin(u) * xp.cos(v) * xp.cos(w)
+                        + xp.cos(u) * xp.sin(v) * xp.cos(w)
+                        + xp.cos(u) * xp.cos(v) * xp.sin(w)
                     )
 
-                return np.abs(base) - abs(thickness)
+                return xp.abs(base) - abs(thickness)
 
             if op == "strut_lattice":
                 kind = self._node_string_param(node, "type", "bcc").lower()
@@ -880,11 +953,11 @@ class _FieldRuntime:
                 ry = _repeat_local(qy, pitch) / max(abs(pitch), 1e-6)
                 rz = _repeat_local(qz, pitch) / max(abs(pitch), 1e-6)
 
-                dist = np.full_like(rx, fill_value=np.inf, dtype=np.float64)
+                dist = xp.full_like(rx, fill_value=xp.inf, dtype=self.eval_dtype)
                 segments = _strut_segments(kind)
                 for a, b in segments:
-                    dseg = _dist_to_segment(rx, ry, rz, a, b)
-                    dist = np.minimum(dist, dseg)
+                    dseg = _dist_to_segment(rx, ry, rz, a, b, xp=xp)
+                    dist = xp.minimum(dist, dseg)
 
                 return dist * abs(pitch) - abs(radius)
 
@@ -898,21 +971,21 @@ class _FieldRuntime:
                 mode = self._node_string_param(node, "mode", "shell").lower()
 
                 host_shifted = host + offset
-                clipped = np.maximum(lattice, host_shifted)
-                shell_band = np.maximum(lattice, np.abs(host_shifted) - abs(wall))
+                clipped = xp.maximum(lattice, host_shifted)
+                shell_band = xp.maximum(lattice, xp.abs(host_shifted) - abs(wall))
 
                 if mode == "clip":
                     return clipped
                 if mode == "hybrid":
-                    return np.minimum(clipped, shell_band)
+                    return xp.minimum(clipped, shell_band)
                 return shell_band
 
             raise EvaluationError(f"Unsupported lattice operation '{op}'")
 
         def eval_turbomachine(node: SceneNode, qx: np.ndarray, qy: np.ndarray, qz: np.ndarray) -> np.ndarray:
             op = node.op
-            r = np.sqrt(qx * qx + qz * qz)
-            theta = np.arctan2(qz, qx)
+            r = xp.sqrt(qx * qx + qz * qz)
+            theta = xp.arctan2(qz, qx)
 
             if op in {"impeller_centrifugal", "radial_turbine"}:
                 r_in = self._node_scalar_param(node, "r_in", 0.25)
@@ -930,23 +1003,23 @@ class _FieldRuntime:
                     blade_twist_dir = blade_twist
 
                 radial_span = max(r_out - r_in, 1e-6)
-                t = np.clip((r - r_in) / radial_span, 0.0, 1.0)
+                t = xp.clip((r - r_in) / radial_span, 0.0, 1.0)
 
-                hub = np.maximum(r - r_out, np.abs(qy) - hub_h * 0.25)
-                shroud = np.maximum(np.abs(r - r_out) - abs(shroud_gap), np.abs(qy) - hub_h * 0.5)
+                hub = xp.maximum(r - r_out, xp.abs(qy) - hub_h * 0.25)
+                shroud = xp.maximum(xp.abs(r - r_out) - abs(shroud_gap), xp.abs(qy) - hub_h * 0.5)
 
-                blades = np.full_like(r, np.inf, dtype=np.float64)
+                blades = xp.full_like(r, xp.inf, dtype=self.eval_dtype)
                 for idx in range(blade_count):
                     base_angle = 2.0 * np.pi * idx / float(blade_count)
                     target = base_angle + blade_twist_dir * t
                     ang = _angle_wrap(theta - target)
-                    arc_dist = np.abs(ang) * np.maximum(r, 1e-6)
-                    blade_field = np.maximum(arc_dist - abs(blade_thickness) * 0.5, np.abs(qy) - hub_h * 0.5)
-                    blades = np.minimum(blades, blade_field)
+                    arc_dist = xp.abs(ang) * xp.maximum(r, 1e-6)
+                    blade_field = xp.maximum(arc_dist - abs(blade_thickness) * 0.5, xp.abs(qy) - hub_h * 0.5)
+                    blades = xp.minimum(blades, blade_field)
 
-                solid = np.minimum(np.minimum(hub, shroud), blades)
+                solid = xp.minimum(xp.minimum(hub, shroud), blades)
                 bore = r_in - r
-                return np.maximum(solid, bore)
+                return xp.maximum(solid, bore)
 
             if op == "volute_casing":
                 throat_radius = self._node_scalar_param(node, "throat_radius", 0.35)
@@ -960,19 +1033,19 @@ class _FieldRuntime:
                 centerline = throat_radius + (outlet_radius - throat_radius) * theta01
                 tube_r = 0.12 + area_growth * 0.25 * theta01
 
-                radial = np.abs(r - centerline) - tube_r
-                height = np.abs(qy) - width * 0.5
-                channel = np.maximum(radial, height)
-                wall_field = np.abs(channel) - abs(wall)
+                radial = xp.abs(r - centerline) - tube_r
+                height = xp.abs(qy) - width * 0.5
+                channel = xp.maximum(radial, height)
+                wall_field = xp.abs(channel) - abs(wall)
 
                 # Tongue shaping near positive-x side.
                 tongue_plane = qx - (throat_radius + tongue_clearance)
-                tongue_slot = np.maximum(np.abs(qz) - tongue_clearance, tongue_plane)
-                return np.maximum(wall_field, -tongue_slot)
+                tongue_slot = xp.maximum(xp.abs(qz) - tongue_clearance, tongue_plane)
+                return xp.maximum(wall_field, -tongue_slot)
 
             raise EvaluationError(f"Unsupported turbomachine op '{op}'")
 
-        return eval_node(self.scene_ir.root_node_id, px, py, pz)
+        return xp.asarray(eval_node(self.scene_ir.root_node_id, px, py, pz), dtype=self.eval_dtype)
 
     def _resolve_bounds_hint(
         self, node: SceneNode
@@ -1003,26 +1076,47 @@ def merge_parameter_values(scene_ir: SceneIR, overrides: dict[str, float]) -> di
 
 
 
-def evaluate_scene_field(scene_ir: SceneIR, parameter_values: dict[str, float], grid: GridConfig) -> np.ndarray:
-    if scene_ir.root_node_id not in {node.id for node in scene_ir.nodes}:
-        raise EvaluationError("Scene root node is not present in nodes list")
-
-    bounds = grid.bounds
-    bounds_key = (
-        float(bounds[0][0]),
-        float(bounds[0][1]),
-        float(bounds[1][0]),
-        float(bounds[1][1]),
-        float(bounds[2][0]),
-        float(bounds[2][1]),
+def evaluate_scene_field(
+    scene_ir: SceneIR,
+    parameter_values: dict[str, float],
+    grid: GridConfig,
+    compute_precision: ComputePrecision = "float32",
+    compute_backend: ComputeBackend = "auto",
+) -> np.ndarray:
+    field, _ = evaluate_scene_field_with_backend(
+        scene_ir,
+        parameter_values,
+        grid,
+        compute_precision=compute_precision,
+        compute_backend=compute_backend,
     )
+    return field
 
-    if grid.resolution > 160:
-        return evaluate_scene_field_chunked(scene_ir, parameter_values, grid)
 
-    x, y, z = _cached_grid(bounds_key, grid.resolution)
-    runtime = _FieldRuntime(scene_ir, parameter_values)
-    return runtime.evaluate(x, y, z)
+def evaluate_scene_field_with_backend(
+    scene_ir: SceneIR,
+    parameter_values: dict[str, float],
+    grid: GridConfig,
+    compute_precision: ComputePrecision = "float32",
+    compute_backend: ComputeBackend = "auto",
+) -> tuple[np.ndarray, Literal["cpu", "cuda"]]:
+    resolved_backend = _resolve_compute_backend(compute_backend)
+    if resolved_backend == "cuda":
+        try:
+            return (
+                _evaluate_scene_field_cuda(scene_ir, parameter_values, grid, compute_precision=compute_precision),
+                "cuda",
+            )
+        except Exception:
+            return (
+                _evaluate_scene_field_cpu(scene_ir, parameter_values, grid, compute_precision=compute_precision),
+                "cpu",
+            )
+
+    return (
+        _evaluate_scene_field_cpu(scene_ir, parameter_values, grid, compute_precision=compute_precision),
+        "cpu",
+    )
 
 
 
@@ -1031,8 +1125,29 @@ def evaluate_scene_field_chunked(
     parameter_values: dict[str, float],
     grid: GridConfig,
     chunk_size: int = 72,
+    compute_precision: ComputePrecision = "float32",
 ) -> np.ndarray:
+    return _evaluate_scene_field_cpu(
+        scene_ir,
+        parameter_values,
+        grid,
+        chunk_size=chunk_size,
+        compute_precision=compute_precision,
+    )
+
+
+def _evaluate_scene_field_cpu(
+    scene_ir: SceneIR,
+    parameter_values: dict[str, float],
+    grid: GridConfig,
+    chunk_size: int = 72,
+    compute_precision: ComputePrecision = "float32",
+) -> np.ndarray:
+    if scene_ir.root_node_id not in {node.id for node in scene_ir.nodes}:
+        raise EvaluationError("Scene root node is not present in nodes list")
+
     bounds = grid.bounds
+    eval_dtype = _resolve_eval_dtype(compute_precision)
     bounds_key = (
         float(bounds[0][0]),
         float(bounds[0][1]),
@@ -1041,16 +1156,67 @@ def evaluate_scene_field_chunked(
         float(bounds[2][0]),
         float(bounds[2][1]),
     )
-    x_axis, y_axis, z_axis = _cached_axes(bounds_key, grid.resolution)
 
-    runtime = _FieldRuntime(scene_ir, parameter_values)
-    field = np.empty((grid.resolution, grid.resolution, grid.resolution), dtype=np.float64)
+    if grid.resolution <= 160:
+        x, y, z = _cached_grid(bounds_key, grid.resolution, eval_dtype.name)
+        runtime = _FieldRuntime(scene_ir, parameter_values, eval_dtype=eval_dtype, xp=np)
+        return runtime.evaluate(x, y, z)
+
+    x_axis, y_axis, z_axis = _cached_axes(bounds_key, grid.resolution, eval_dtype.name)
+
+    runtime = _FieldRuntime(scene_ir, parameter_values, eval_dtype=eval_dtype, xp=np)
+    field = np.empty((grid.resolution, grid.resolution, grid.resolution), dtype=eval_dtype)
 
     for start in range(0, grid.resolution, chunk_size):
         stop = min(grid.resolution, start + chunk_size)
         x = x_axis[start:stop]
         px, py, pz = np.meshgrid(x, y_axis, z_axis, indexing="ij")
         field[start:stop, :, :] = runtime.evaluate(px, py, pz)
+
+    return field
+
+
+def _evaluate_scene_field_cuda(
+    scene_ir: SceneIR,
+    parameter_values: dict[str, float],
+    grid: GridConfig,
+    chunk_size: int = 72,
+    compute_precision: ComputePrecision = "float32",
+) -> np.ndarray:
+    if not CUPY_AVAILABLE or cp is None:
+        raise EvaluationError("CUDA evaluation requested but CuPy is not available")
+
+    if scene_ir.root_node_id not in {node.id for node in scene_ir.nodes}:
+        raise EvaluationError("Scene root node is not present in nodes list")
+
+    bounds = grid.bounds
+    eval_dtype = _resolve_eval_dtype(compute_precision)
+    bounds_key = (
+        float(bounds[0][0]),
+        float(bounds[0][1]),
+        float(bounds[1][0]),
+        float(bounds[1][1]),
+        float(bounds[2][0]),
+        float(bounds[2][1]),
+    )
+
+    runtime = _FieldRuntime(scene_ir, parameter_values, eval_dtype=eval_dtype, xp=cp)
+
+    if grid.resolution <= 160:
+        x, y, z = _cached_grid(bounds_key, grid.resolution, eval_dtype.name)
+        field_gpu = runtime.evaluate(cp.asarray(x), cp.asarray(y), cp.asarray(z))
+        return cp.asnumpy(field_gpu)
+
+    x_axis, y_axis, z_axis = _cached_axes(bounds_key, grid.resolution, eval_dtype.name)
+    y_gpu = cp.asarray(y_axis)
+    z_gpu = cp.asarray(z_axis)
+    field = np.empty((grid.resolution, grid.resolution, grid.resolution), dtype=eval_dtype)
+
+    for start in range(0, grid.resolution, chunk_size):
+        stop = min(grid.resolution, start + chunk_size)
+        x_gpu = cp.asarray(x_axis[start:stop])
+        px, py, pz = cp.meshgrid(x_gpu, y_gpu, z_gpu, indexing="ij")
+        field[start:stop, :, :] = cp.asnumpy(runtime.evaluate(px, py, pz))
 
     return field
 

@@ -13,6 +13,7 @@ body = sphere(r=$r)
 lat = gyroid(pitch=0.5, thickness=0.1)
 root = conformal_fill(body, lat, wall=0.08, mode="hybrid")
 """
+SIMPLE_SOURCE = "root = sphere(r=0.72)"
 
 MESH_OBJ = b"""
 v 0 0 0
@@ -61,6 +62,52 @@ def test_preview_mesh_endpoint_accepts_quality_profile() -> None:
     payload = response.json()
     assert payload["stats"]["tri_count"] > 0
     assert len(payload["mesh"]["vertices"]) > 0
+    assert payload["stats"]["compute_precision"] == "float32"
+    assert payload["stats"]["compute_backend"] == "cpu"
+
+
+def test_preview_mesh_endpoint_accepts_explicit_float16_precision() -> None:
+    compiled = client.post("/api/v1/scene/compile", json={"source": SIMPLE_SOURCE}).json()["scene_ir"]
+    response = client.post(
+        "/api/v1/preview/mesh",
+        json={
+            "scene_ir": compiled,
+            "parameter_values": {"r": 0.7},
+            "quality_profile": "interactive",
+            "compute_precision": "float16",
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["stats"]["compute_precision"] == "float16"
+    assert payload["stats"]["compute_backend"] == "cpu"
+
+
+def test_preview_cache_isolated_by_compute_precision() -> None:
+    compiled = client.post("/api/v1/scene/compile", json={"source": SIMPLE_SOURCE}).json()["scene_ir"]
+    request_base = {
+        "scene_ir": compiled,
+        "parameter_values": {"r": 0.73},
+        "quality_profile": "interactive",
+    }
+
+    first = client.post("/api/v1/preview/mesh", json=request_base)
+    assert first.status_code == 200
+    assert first.json()["stats"]["cache_hit"] is False
+    assert first.json()["stats"]["compute_precision"] == "float32"
+
+    float16 = client.post(
+        "/api/v1/preview/mesh",
+        json={**request_base, "compute_precision": "float16"},
+    )
+    assert float16.status_code == 200
+    assert float16.json()["stats"]["cache_hit"] is False
+    assert float16.json()["stats"]["compute_precision"] == "float16"
+
+    second = client.post("/api/v1/preview/mesh", json=request_base)
+    assert second.status_code == 200
+    assert second.json()["stats"]["cache_hit"] is True
+    assert second.json()["stats"]["compute_precision"] == "float32"
 
 
 def test_export_endpoint_stl() -> None:
@@ -120,6 +167,24 @@ def test_mesh_preview_supports_tpms_variants(lattice_type: str) -> None:
     )
     assert response.status_code == 200
     assert response.json()["stats"]["tri_count"] > 0
+
+
+def test_mesh_preview_accepts_backend_selectors_with_fallback() -> None:
+    form = _mesh_form()
+    form["compute_backend"] = "cuda"
+    form["mesh_backend"] = "cuda"
+    response = client.post(
+        "/api/v1/mesh/preview",
+        data=form,
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    if response.status_code == 200:
+        stats = response.json()["stats"]
+        assert stats["mesh_backend"] == "cuda"
+        assert stats["compute_backend"] in {"cpu", "cuda"}
+    else:
+        assert response.status_code == 400
+        assert "CUDA meshing failed" in response.json()["detail"]
 
 
 def test_mesh_export_endpoint_obj() -> None:

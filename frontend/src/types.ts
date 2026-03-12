@@ -10,6 +10,9 @@ export type SceneNodeType =
   | "turbomachine";
 
 export type QualityProfile = "interactive" | "medium" | "high" | "ultra";
+export type ComputePrecision = "float32" | "float16";
+export type ComputeBackend = "auto" | "cpu" | "cuda";
+export type MeshBackend = "auto" | "cpu" | "cuda";
 export type MeshLatticeType = "gyroid" | "schwarz_p" | "diamond";
 
 export interface ParameterSpec {
@@ -61,6 +64,9 @@ export interface PreviewStats {
   mesh_ms: number;
   tri_count: number;
   cache_hit?: boolean;
+  compute_precision?: ComputePrecision;
+  compute_backend?: "cpu" | "cuda";
+  mesh_backend?: "cpu" | "cuda";
 }
 
 export interface PreviewMeshResponse {
