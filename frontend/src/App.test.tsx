@@ -15,16 +15,22 @@ vi.mock("./components/Viewer", () => ({
 const compileScene = vi.fn();
 const previewField = vi.fn();
 const previewMesh = vi.fn();
+const previewProgram = vi.fn();
 const exportMesh = vi.fn();
 const previewUploadedMesh = vi.fn();
+const previewUploadedMeshPhased = vi.fn();
+const previewUploadedMeshProgram = vi.fn();
 const exportUploadedMesh = vi.fn();
 
 vi.mock("./lib/api", () => ({
   compileScene: (...args: unknown[]) => compileScene(...args),
   previewField: (...args: unknown[]) => previewField(...args),
   previewMesh: (...args: unknown[]) => previewMesh(...args),
+  previewProgram: (...args: unknown[]) => previewProgram(...args),
   exportMesh: (...args: unknown[]) => exportMesh(...args),
   previewUploadedMesh: (...args: unknown[]) => previewUploadedMesh(...args),
+  previewUploadedMeshPhased: (...args: unknown[]) => previewUploadedMeshPhased(...args),
+  previewUploadedMeshProgram: (...args: unknown[]) => previewUploadedMeshProgram(...args),
   exportUploadedMesh: (...args: unknown[]) => exportUploadedMesh(...args)
 }));
 
@@ -38,6 +44,15 @@ const compiledScene = {
   parameter_schema: [{ name: "radius", type: "float", default: 0.8, min: 0.2, max: 1.5, step: 0.1 }],
   source_hash: "abc"
 };
+
+function encodeBuffer(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
 
 const fieldPreviewPayload = {
   field: {
@@ -61,17 +76,12 @@ const fieldPreviewPayload = {
 
 const meshPreviewPayload = {
   mesh: {
-    vertices: [
-      [0, 0, 0],
-      [1, 0, 0],
-      [0, 1, 0]
-    ],
-    indices: [[0, 1, 2]],
-    normals: [
-      [0, 0, 1],
-      [0, 0, 1],
-      [0, 0, 1]
-    ]
+    encoding: "mesh-f32-u32-base64-v1",
+    vertex_count: 3,
+    face_count: 1,
+    vertices_b64: encodeBuffer(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]).buffer),
+    indices_b64: encodeBuffer(new Uint32Array([0, 1, 2]).buffer),
+    normals_b64: encodeBuffer(new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]).buffer)
   },
   stats: {
     eval_ms: 3,
@@ -91,8 +101,19 @@ describe("App", () => {
     });
     previewField.mockResolvedValue(fieldPreviewPayload);
     previewMesh.mockResolvedValue(meshPreviewPayload);
+    previewProgram.mockResolvedValue({
+      program: null,
+      capabilities: { analytic_supported: false, fallback_reason: "unsupported in tests" },
+      stats: { eval_ms: 0, tri_count: 0, preview_mode: "analytic_raymarch" }
+    });
     exportMesh.mockResolvedValue(new Blob(["ok"]));
     previewUploadedMesh.mockResolvedValue(meshPreviewPayload);
+    previewUploadedMeshPhased.mockResolvedValue(meshPreviewPayload);
+    previewUploadedMeshProgram.mockResolvedValue({
+      program: null,
+      capabilities: { analytic_supported: false, fallback_reason: "unsupported in tests" },
+      stats: { eval_ms: 0, tri_count: 0, preview_mode: "analytic_raymarch" }
+    });
     exportUploadedMesh.mockResolvedValue(new Blob(["ok"]));
   });
 
@@ -235,11 +256,11 @@ describe("App", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
 
-    previewUploadedMesh.mockResolvedValueOnce({
+    previewUploadedMeshPhased.mockResolvedValueOnce({
       ...meshPreviewPayload,
       field: fieldPreviewPayload.field
     });
-    previewUploadedMesh.mockClear();
+    previewUploadedMeshPhased.mockClear();
 
     const file = new File(["v 0 0 0\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
@@ -248,10 +269,10 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Generate Mesh Preview" }));
 
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(previewUploadedMeshPhased).toHaveBeenCalled();
     });
 
-    const latestViewerProps = viewerMock.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
     expect(latestViewerProps.mesh).toEqual(meshPreviewPayload.mesh);
     expect(latestViewerProps.field).toEqual(fieldPreviewPayload.field);
   });
@@ -259,7 +280,7 @@ describe("App", () => {
   it("sends selected mesh workflow backends", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
-    previewUploadedMesh.mockClear();
+    previewUploadedMeshPhased.mockClear();
 
     const file = new File(["v 0 0 0\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
@@ -269,10 +290,10 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Generate Mesh Preview" }));
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(previewUploadedMeshPhased).toHaveBeenCalled();
     });
 
-    const calls = previewUploadedMesh.mock.calls;
+    const calls = previewUploadedMeshPhased.mock.calls;
     const lastCall = calls[calls.length - 1];
     expect(lastCall?.[3]).toBe("cuda");
     expect(lastCall?.[4]).toBe("cuda");
@@ -281,7 +302,7 @@ describe("App", () => {
   it("sends selected meshing mode for mesh workflow preview", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
-    previewUploadedMesh.mockClear();
+    previewUploadedMeshPhased.mockClear();
 
     const file = new File(["v 0 0 0\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
@@ -290,10 +311,10 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Generate Mesh Preview" }));
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(previewUploadedMeshPhased).toHaveBeenCalled();
     });
 
-    const calls = previewUploadedMesh.mock.calls;
+    const calls = previewUploadedMeshPhased.mock.calls;
     const lastCall = calls[calls.length - 1];
     expect(lastCall?.[5]).toBe("adaptive");
   });

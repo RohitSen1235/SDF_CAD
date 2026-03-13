@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
@@ -13,6 +14,7 @@ from .models import (
     ComputePrecision,
     GridConfig,
     MeshBackend,
+    MeshPayload,
     MeshingMode,
     SceneIR,
 )
@@ -23,24 +25,21 @@ T = TypeVar("T")
 class LruCache(Generic[T]):
     def __init__(self, maxsize: int = 64) -> None:
         self.maxsize = maxsize
-        self._data: dict[str, T] = {}
-        self._order: list[str] = []
+        self._data: OrderedDict[str, T] = OrderedDict()
 
     def get(self, key: str) -> T | None:
-        if key not in self._data:
+        value = self._data.get(key)
+        if value is None:
             return None
-        self._order.remove(key)
-        self._order.append(key)
-        return self._data[key]
+        self._data.move_to_end(key, last=True)
+        return value
 
     def set(self, key: str, value: T) -> None:
         if key in self._data:
-            self._order.remove(key)
+            self._data.move_to_end(key, last=True)
         self._data[key] = value
-        self._order.append(key)
-        while len(self._order) > self.maxsize:
-            old = self._order.pop(0)
-            self._data.pop(old, None)
+        while len(self._data) > self.maxsize:
+            self._data.popitem(last=False)
 
 
 @dataclass
@@ -54,9 +53,10 @@ scene_compile_cache: LruCache[CompileCacheEntry] = LruCache(maxsize=64)
 
 @dataclass
 class MeshCacheEntry:
-    vertices: list[list[float]]
-    indices: list[list[int]]
-    normals: list[list[float]]
+    mesh: MeshPayload
+    vertices: np.ndarray
+    faces: np.ndarray
+    normals: np.ndarray
     stats: dict[str, float | int | bool | str]
 
 
@@ -66,9 +66,10 @@ field_preview_cache: LruCache[tuple[np.ndarray, str]] = LruCache(maxsize=8)
 
 @dataclass
 class UploadedMeshCacheEntry:
-    vertices: list[list[float]]
-    indices: list[list[int]]
-    normals: list[list[float]]
+    mesh: MeshPayload
+    vertices: np.ndarray
+    faces: np.ndarray
+    normals: np.ndarray
     stats: dict[str, float | int | bool | str]
     field_resolution: int | None = None
     field_bounds: list[list[float]] | None = None
@@ -102,8 +103,11 @@ def hash_preview_request(
     mesh_backend: MeshBackend = "auto",
     meshing_mode: MeshingMode = "uniform",
 ) -> str:
+    scene_key = scene_ir.source_hash
+    if not scene_key:
+        scene_key = json.dumps(scene_ir.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
     payload: dict[str, Any] = {
-        "scene": scene_ir.model_dump(mode="json"),
+        "scene_key": scene_key,
         "params": {k: float(v) for k, v in sorted(params.items())},
         "grid": grid.model_dump(mode="json"),
         "compute_precision": compute_precision,
@@ -122,8 +126,11 @@ def hash_field_preview_request(
     compute_precision: ComputePrecision = "float32",
     compute_backend: ComputeBackend = "auto",
 ) -> str:
+    scene_key = scene_ir.source_hash
+    if not scene_key:
+        scene_key = json.dumps(scene_ir.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
     payload: dict[str, Any] = {
-        "scene": scene_ir.model_dump(mode="json"),
+        "scene_key": scene_key,
         "params": {k: float(v) for k, v in sorted(params.items())},
         "grid": grid.model_dump(mode="json"),
         "compute_precision": compute_precision,

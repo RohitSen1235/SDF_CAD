@@ -1,3 +1,6 @@
+import base64
+
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -25,6 +28,13 @@ f 1 2 4
 f 2 3 4
 f 3 1 4
 """
+
+
+def _decode_mesh_arrays(mesh_payload: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    vertices = np.frombuffer(base64.b64decode(mesh_payload["vertices_b64"]), dtype=np.float32).reshape(-1, 3)
+    indices = np.frombuffer(base64.b64decode(mesh_payload["indices_b64"]), dtype=np.uint32).reshape(-1, 3)
+    normals = np.frombuffer(base64.b64decode(mesh_payload["normals_b64"]), dtype=np.float32).reshape(-1, 3)
+    return vertices, indices, normals
 
 
 def _mesh_form(lattice_type: str = "gyroid") -> dict[str, str]:
@@ -61,7 +71,11 @@ def test_preview_mesh_endpoint_accepts_quality_profile() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["stats"]["tri_count"] > 0
-    assert len(payload["mesh"]["vertices"]) > 0
+    assert payload["mesh"]["encoding"] == "mesh-f32-u32-base64-v1"
+    vertices, indices, normals = _decode_mesh_arrays(payload["mesh"])
+    assert vertices.shape[0] == payload["mesh"]["vertex_count"]
+    assert indices.shape[0] == payload["mesh"]["face_count"]
+    assert normals.shape[0] == payload["mesh"]["vertex_count"]
     assert payload["stats"]["compute_precision"] == "float32"
     assert payload["stats"]["compute_backend"] == "cpu"
 
@@ -190,7 +204,7 @@ def test_mesh_preview_endpoint_obj_upload() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["stats"]["tri_count"] > 0
-    assert len(payload["mesh"]["vertices"]) > 0
+    assert payload["mesh"]["encoding"] == "mesh-f32-u32-base64-v1"
     assert payload["field"]["encoding"] == "f32-base64"
     assert payload["field"]["resolution"] == 48
     assert payload["field"]["data"]
@@ -203,7 +217,7 @@ def test_mesh_preview_preserves_original_outer_vertices() -> None:
         files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
     )
     assert response.status_code == 200
-    vertices = response.json()["mesh"]["vertices"]
+    vertices, _, _ = _decode_mesh_arrays(response.json()["mesh"])
 
     def has_vertex(target: list[float]) -> bool:
         for vx, vy, vz in vertices:

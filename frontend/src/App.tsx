@@ -6,8 +6,10 @@ import {
   exportMesh,
   exportUploadedMesh,
   previewField,
+  previewProgram,
   previewMesh,
-  previewUploadedMesh
+  previewUploadedMeshProgram,
+  previewUploadedMeshPhased
 } from "./lib/api";
 import {
   CompileDiagnostics,
@@ -18,8 +20,10 @@ import {
   MeshLatticeType,
   MeshingMode,
   MeshPayload,
+  MeshProgramPayload,
   MeshWorkflowParams,
   PreviewStats,
+  SceneProgramPayload,
   QualityProfile,
   SceneIR
 } from "./types";
@@ -154,6 +158,7 @@ function resolutionForQuality(profile: QualityProfile): number {
 }
 
 export default function App() {
+  const enableAnalyticPreview = import.meta.env.VITE_ENABLE_ANALYTIC_PREVIEW !== "0";
   const [workflow, setWorkflow] = useState<WorkflowMode>("dsl");
 
   const [source, setSource] = useState(EXAMPLES["Field Expression"]);
@@ -173,6 +178,8 @@ export default function App() {
 
   const [field, setField] = useState<FieldPayload | null>(null);
   const [mesh, setMesh] = useState<MeshPayload | null>(null);
+  const [analyticSceneProgram, setAnalyticSceneProgram] = useState<SceneProgramPayload | null>(null);
+  const [analyticMeshProgram, setAnalyticMeshProgram] = useState<MeshProgramPayload | null>(null);
   const [stats, setStats] = useState<PreviewStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isCompiling, setIsCompiling] = useState(false);
@@ -258,44 +265,96 @@ export default function App() {
       // Clear stale visuals before starting a new Generate Shape run.
       setField(null);
       setMesh(null);
+      setAnalyticSceneProgram(null);
+      setAnalyticMeshProgram(null);
       setStats(null);
 
       try {
         const gridBounds = inferPreviewBounds(nextDiagnostics);
         const resolution = resolutionForQuality(quality);
         const grid = gridBounds ? { bounds: gridBounds, resolution } : undefined;
-        let fieldSucceeded = false;
-        let lastError: Error | null = null;
-
-        try {
-          const fieldController = new AbortController();
-          previewControllersRef.current.field = fieldController;
-          const fieldResponse = await previewField(
-            nextSceneIr,
-            nextParams,
-            quality,
-            computePrecision,
-            computeBackend,
-            fieldController.signal,
-            grid
-          );
-          if (previewRunIdRef.current !== runId) {
-            return;
-          }
-          fieldSucceeded = true;
-          setField(fieldResponse.field);
-          setStats(fieldResponse.stats);
-        } catch (previewError) {
-          if ((previewError as Error).name === "AbortError") {
-            return;
-          }
-          lastError = previewError as Error;
-        } finally {
-          if (previewControllersRef.current.field?.signal.aborted !== true) {
-            previewControllersRef.current.field = null;
+        // Step 1: Try analytic GLSL program for immediate smooth display.
+        // If supported, show it right away — but do NOT return early; continue
+        // to generate the mesh so it can replace the analytic preview once ready.
+        let analyticShown = false;
+        if (enableAnalyticPreview) {
+          try {
+            const programController = new AbortController();
+            previewControllersRef.current.field = programController;
+            const programResponse = await previewProgram(
+              nextSceneIr,
+              nextParams,
+              quality,
+              programController.signal,
+              grid
+            );
+            if (previewRunIdRef.current !== runId) {
+              return;
+            }
+            if (programResponse.capabilities.analytic_supported && programResponse.program?.mode === "dsl") {
+              setField(null);
+              setMesh(null);
+              setAnalyticMeshProgram(null);
+              setAnalyticSceneProgram(programResponse.program);
+              setStats(programResponse.stats);
+              setError(null);
+              analyticShown = true;
+              // Do NOT return — fall through to generate the mesh.
+            } else if (programResponse.capabilities.fallback_reason) {
+              setError(programResponse.capabilities.fallback_reason);
+            }
+          } catch (previewError) {
+            if ((previewError as Error).name === "AbortError") {
+              return;
+            }
+            // Analytic program failed — fall through to field/mesh path.
+          } finally {
+            if (previewControllersRef.current.field?.signal.aborted !== true) {
+              previewControllersRef.current.field = null;
+            }
           }
         }
 
+        // Step 2: If analytic was not shown, evaluate the SDF field grid and
+        // display it as a raymarched volume while the mesh is being generated.
+        let fieldSucceeded = false;
+        let lastError: Error | null = null;
+
+        if (!analyticShown) {
+          try {
+            const fieldController = new AbortController();
+            previewControllersRef.current.field = fieldController;
+            const fieldResponse = await previewField(
+              nextSceneIr,
+              nextParams,
+              quality,
+              computePrecision,
+              computeBackend,
+              fieldController.signal,
+              grid
+            );
+            if (previewRunIdRef.current !== runId) {
+              return;
+            }
+            fieldSucceeded = true;
+            setField(fieldResponse.field);
+            setAnalyticSceneProgram(null);
+            setAnalyticMeshProgram(null);
+            setStats(fieldResponse.stats);
+          } catch (previewError) {
+            if ((previewError as Error).name === "AbortError") {
+              return;
+            }
+            lastError = previewError as Error;
+          } finally {
+            if (previewControllersRef.current.field?.signal.aborted !== true) {
+              previewControllersRef.current.field = null;
+            }
+          }
+        }
+
+        // Step 3: Generate the triangle mesh. Once ready it replaces the
+        // analytic program or field volume as the final display.
         try {
           const meshController = new AbortController();
           previewControllersRef.current.mesh = meshController;
@@ -313,9 +372,11 @@ export default function App() {
           if (previewRunIdRef.current !== runId) {
             return;
           }
-          // Mesh is the final display mode for generated previews.
+          // Mesh is the final display — clear analytic program and field volume.
           setField(null);
           setMesh(meshResponse.mesh);
+          setAnalyticSceneProgram(null);
+          setAnalyticMeshProgram(null);
           setStats(meshResponse.stats);
           setError(null);
           return;
@@ -333,6 +394,13 @@ export default function App() {
         if (previewRunIdRef.current !== runId) {
           return;
         }
+        if (analyticShown) {
+          // Analytic program is still showing; mesh failed but that's OK.
+          if (lastError) {
+            setError(lastError.message);
+          }
+          return;
+        }
         if (fieldSucceeded && lastError) {
           setError(lastError.message);
           return;
@@ -346,7 +414,7 @@ export default function App() {
         }
       }
     },
-    [abortActivePreview, quality, computePrecision, computeBackend, meshBackend, meshingMode]
+    [abortActivePreview, quality, computePrecision, computeBackend, meshBackend, meshingMode, enableAnalyticPreview]
   );
 
   useEffect(() => {
@@ -445,17 +513,40 @@ export default function App() {
 
     setIsPreviewing(true);
     setError(null);
+    setField(null);
+    setMesh(null);
+    setAnalyticSceneProgram(null);
+    setAnalyticMeshProgram(null);
+    setStats(null);
     try {
-      const response = await previewUploadedMesh(
+      if (enableAnalyticPreview) {
+        const analytic = await previewUploadedMeshProgram(meshFile, meshWorkflowParams, meshPreviewQuality);
+        if (analytic.capabilities.analytic_supported && analytic.program?.mode === "mesh_lattice") {
+          setAnalyticSceneProgram(null);
+          setAnalyticMeshProgram(analytic.program);
+          setStats(analytic.stats);
+          setError(null);
+          return;
+        }
+      }
+      const response = await previewUploadedMeshPhased(
         meshFile,
         meshWorkflowParams,
         meshPreviewQuality,
         computeBackend,
         meshBackend,
-        meshingMode
+        meshingMode,
+        (fieldPayload, fieldStats) => {
+          setField(fieldPayload);
+          if (fieldStats) {
+            setStats(fieldStats);
+          }
+        }
       );
       setField(response.field ?? null);
       setMesh(response.mesh);
+      setAnalyticSceneProgram(null);
+      setAnalyticMeshProgram(null);
       setStats(response.stats);
     } catch (previewError) {
       setError((previewError as Error).message);
@@ -922,6 +1013,8 @@ export default function App() {
             <Viewer
               mesh={mesh}
               field={field}
+              analyticSceneProgram={analyticSceneProgram}
+              analyticMeshProgram={analyticMeshProgram}
               wireframe={wireframe}
               transformMode={transformMode}
               fitSignal={fitSignal}
@@ -938,6 +1031,8 @@ export default function App() {
             <span>Voxels: {stats?.voxel_count ?? 0}</span>
             <span>Eval: {stats ? stats.eval_ms.toFixed(1) : "0.0"} ms</span>
             <span>Mesh: {stats?.mesh_ms != null ? stats.mesh_ms.toFixed(1) : "n/a"} ms</span>
+            <span>Compile: {stats?.compile_ms != null ? stats.compile_ms.toFixed(1) : "n/a"} ms</span>
+            <span>Program: {stats?.program_bytes != null ? stats.program_bytes : "n/a"} B</span>
             <span>Eval backend: {stats?.compute_backend ?? "cpu"}</span>
             <span>Mesh backend: {stats?.mesh_backend ?? "cpu"}</span>
             <span>Cache: {stats?.cache_hit ? "hit" : "miss"}</span>

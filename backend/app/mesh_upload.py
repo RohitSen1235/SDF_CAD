@@ -79,19 +79,20 @@ def validate_triangle_mesh(mesh: ParsedMesh) -> None:
     if np.any(area2 <= area_eps):
         raise MeshUploadError("Mesh contains degenerate triangles")
 
-    edge_counts: dict[tuple[int, int], int] = {}
-    for f0, f1, f2 in faces:
-        a = int(f0)
-        b = int(f1)
-        c = int(f2)
-        for u, v in ((a, b), (b, c), (c, a)):
-            if u == v:
-                raise MeshUploadError("Mesh contains invalid zero-length edges")
-            key = (u, v) if u < v else (v, u)
-            edge_counts[key] = edge_counts.get(key, 0) + 1
+    edges = np.concatenate(
+        [
+            faces[:, [0, 1]],
+            faces[:, [1, 2]],
+            faces[:, [2, 0]],
+        ],
+        axis=0,
+    )
+    if np.any(edges[:, 0] == edges[:, 1]):
+        raise MeshUploadError("Mesh contains invalid zero-length edges")
 
-    bad_edges = [count for count in edge_counts.values() if count != 2]
-    if bad_edges:
+    edges = np.sort(edges, axis=1)
+    _, counts = np.unique(edges, axis=0, return_counts=True)
+    if np.any(counts != 2):
         raise MeshUploadError(
             "Mesh must be watertight and edge-manifold (each edge must be shared by exactly two triangles)"
         )
@@ -399,19 +400,19 @@ def _parse_stl_binary(data: bytes) -> ParsedMesh | None:
     if expected != len(data):
         return None
 
-    triangles = np.empty((tri_count, 3, 3), dtype=np.float64)
-    offset = 84
-    for idx in range(tri_count):
-        v0 = struct.unpack_from("<3f", data, offset + 12)
-        v1 = struct.unpack_from("<3f", data, offset + 24)
-        v2 = struct.unpack_from("<3f", data, offset + 36)
-        triangles[idx, 0, :] = v0
-        triangles[idx, 1, :] = v1
-        triangles[idx, 2, :] = v2
-        offset += 50
-
     if tri_count == 0:
         raise MeshUploadError("Binary STL contains no triangles")
+    tri_dtype = np.dtype(
+        [
+            ("normal", "<f4", 3),
+            ("v0", "<f4", 3),
+            ("v1", "<f4", 3),
+            ("v2", "<f4", 3),
+            ("attr", "<u2"),
+        ]
+    )
+    records = np.frombuffer(data, dtype=tri_dtype, count=tri_count, offset=84)
+    triangles = np.stack([records["v0"], records["v1"], records["v2"]], axis=1).astype(np.float64, copy=False)
     return _triangles_to_indexed_mesh(triangles)
 
 
@@ -449,31 +450,18 @@ def _parse_stl_ascii(data: bytes) -> ParsedMesh:
 
 
 def _triangles_to_indexed_mesh(triangles: np.ndarray) -> ParsedMesh:
-    vert_map: dict[tuple[int, int, int], int] = {}
-    vertices: list[tuple[float, float, float]] = []
-    faces: list[tuple[int, int, int]] = []
+    flat_vertices = np.ascontiguousarray(triangles.reshape(-1, 3), dtype=np.float64)
     quant = 1e-9
+    quantized = np.rint(flat_vertices / quant).astype(np.int64)
+    _, inverse = np.unique(quantized, axis=0, return_inverse=True)
 
-    for tri in triangles:
-        face: list[int] = []
-        for vx, vy, vz in tri:
-            key = (
-                int(round(float(vx) / quant)),
-                int(round(float(vy) / quant)),
-                int(round(float(vz) / quant)),
-            )
-            existing = vert_map.get(key)
-            if existing is None:
-                existing = len(vertices)
-                vert_map[key] = existing
-                vertices.append((float(vx), float(vy), float(vz)))
-            face.append(existing)
-        faces.append((face[0], face[1], face[2]))
+    order = np.argsort(inverse, kind="stable")
+    sorted_inverse = inverse[order]
+    first_positions = order[np.concatenate(([0], np.flatnonzero(np.diff(sorted_inverse)) + 1))]
+    vertices = flat_vertices[first_positions]
+    faces = inverse.reshape(-1, 3).astype(np.int32, copy=False)
 
-    return ParsedMesh(
-        vertices=np.asarray(vertices, dtype=np.float64),
-        faces=np.asarray(faces, dtype=np.int32),
-    )
+    return ParsedMesh(vertices=vertices, faces=faces)
 
 
 def _build_bounds(mesh: ParsedMesh) -> list[list[float]]:
@@ -653,7 +641,24 @@ def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: 
             "Voxelization leaked to grid boundary. Upload a cleaner watertight mesh or increase geometric scale."
         )
 
-    if np.count_nonzero(filled) <= np.count_nonzero(surface):
+    surface_count = int(np.count_nonzero(surface))
+    filled_count = int(np.count_nonzero(filled))
+
+    if filled_count <= surface_count:
+        # Some meshes voxelize as an already-solid occupancy where hole-fill does
+        # not increase voxel count (filled == surface). Accept if the occupancy
+        # has interior thickness; otherwise try a stronger sealing pass.
+        solid_core = ndimage.binary_erosion(surface, iterations=1)
+        if np.any(solid_core):
+            return surface
+
+        sealed = ndimage.binary_closing(surface, structure=np.ones((3, 3, 3), dtype=bool), iterations=2)
+        sealed_filled = ndimage.binary_fill_holes(sealed)
+        if np.any(sealed_filled) and not _touches_boundary(sealed_filled):
+            sealed_core = ndimage.binary_erosion(sealed_filled, iterations=1)
+            if np.any(sealed_core):
+                return sealed_filled
+
         raise MeshUploadError(
             "Voxelization could not recover interior volume. Mesh may be self-intersecting or non-solid."
         )

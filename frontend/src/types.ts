@@ -55,9 +55,12 @@ export interface GridConfig {
 }
 
 export interface MeshPayload {
-  vertices: [number, number, number][];
-  indices: [number, number, number][];
-  normals: [number, number, number][];
+  encoding: "mesh-f32-u32-base64-v1";
+  vertex_count: number;
+  face_count: number;
+  vertices_b64: string;
+  indices_b64: string;
+  normals_b64: string;
 }
 
 export interface FieldPayload {
@@ -76,7 +79,11 @@ export interface PreviewStats {
   compute_precision?: ComputePrecision;
   compute_backend?: "cpu" | "cuda";
   mesh_backend?: "cpu" | "cuda";
-  preview_mode?: "mesh" | "field";
+  preview_mode?: "mesh" | "field" | "analytic_raymarch";
+  compile_ms?: number | null;
+  program_bytes?: number | null;
+  gpu_eval_mode?: string | null;
+  fallback_reason?: string | null;
 }
 
 export interface PreviewMeshResponse {
@@ -87,6 +94,45 @@ export interface PreviewMeshResponse {
 
 export interface PreviewFieldResponse {
   field: FieldPayload;
+  stats: PreviewStats;
+}
+
+export interface SceneProgramPayload {
+  mode: "dsl";
+  bounds: [[number, number], [number, number], [number, number]];
+  glsl_sdf: string;
+  quality_profile: QualityProfile;
+  max_steps: number;
+  hit_epsilon: number;
+  normal_epsilon: number;
+}
+
+export interface MeshProgramPayload {
+  mode: "mesh_lattice";
+  bounds: [[number, number], [number, number], [number, number]];
+  quality_profile: QualityProfile;
+  triangles_encoding: "f32-base64";
+  triangles_data: string;
+  triangle_count: number;
+  bvh_encoding: "f32-base64";
+  bvh_data: string;
+  bvh_node_count: number;
+  shell_thickness: number;
+  lattice_type: "gyroid" | "schwarz_p" | "diamond";
+  lattice_pitch: number;
+  lattice_thickness: number;
+  lattice_phase: number;
+  max_steps: number;
+  hit_epsilon: number;
+  normal_epsilon: number;
+}
+
+export interface PreviewProgramResponse {
+  program: SceneProgramPayload | MeshProgramPayload | null;
+  capabilities: {
+    analytic_supported: boolean;
+    fallback_reason?: string | null;
+  };
   stats: PreviewStats;
 }
 

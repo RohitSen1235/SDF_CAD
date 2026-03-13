@@ -994,29 +994,31 @@ class _FieldRuntime:
                 if count == 1:
                     return eval_node(node.inputs[0], qx, qy, qz)
 
-                result = xp.full_like(qx, xp.inf, dtype=self.eval_dtype)
                 step = (2.0 * np.pi) / float(count)
+                half_step = 0.5 * step
 
-                for idx in range(count):
-                    angle = phase + step * idx
-                    ca = math.cos(angle)
-                    sa = math.sin(angle)
+                if axis == "x":
+                    r = xp.sqrt(qy * qy + qz * qz)
+                    theta = xp.arctan2(qz, qy)
+                    folded = ((theta - phase + half_step) % step) - half_step + phase
+                    ry = r * xp.cos(folded)
+                    rz = r * xp.sin(folded)
+                    return eval_node(node.inputs[0], qx, ry, rz)
 
-                    if axis == "x":
-                        ry = ca * qy - sa * qz
-                        rz = sa * qy + ca * qz
-                        child = eval_node(node.inputs[0], qx, ry, rz)
-                    elif axis == "z":
-                        rx = ca * qx - sa * qy
-                        ry = sa * qx + ca * qy
-                        child = eval_node(node.inputs[0], rx, ry, qz)
-                    else:
-                        rx = ca * qx - sa * qz
-                        rz = sa * qx + ca * qz
-                        child = eval_node(node.inputs[0], rx, qy, rz)
+                if axis == "z":
+                    r = xp.sqrt(qx * qx + qy * qy)
+                    theta = xp.arctan2(qy, qx)
+                    folded = ((theta - phase + half_step) % step) - half_step + phase
+                    rx = r * xp.cos(folded)
+                    ry = r * xp.sin(folded)
+                    return eval_node(node.inputs[0], rx, ry, qz)
 
-                    result = xp.minimum(result, child)
-                return result
+                r = xp.sqrt(qx * qx + qz * qz)
+                theta = xp.arctan2(qz, qx)
+                folded = ((theta - phase + half_step) % step) - half_step + phase
+                rx = r * xp.cos(folded)
+                rz = r * xp.sin(folded)
+                return eval_node(node.inputs[0], rx, qy, rz)
 
             raise EvaluationError(f"Unsupported domain op '{op}'")
 
@@ -1057,9 +1059,21 @@ class _FieldRuntime:
 
                 dist = xp.full_like(rx, fill_value=xp.inf, dtype=self.eval_dtype)
                 segments = _strut_segments(kind)
-                for a, b in segments:
-                    dseg = _dist_to_segment(rx, ry, rz, a, b, xp=xp)
-                    dist = xp.minimum(dist, dseg)
+                if xp is np and NUMBA_AVAILABLE and _spline_min_dist_numba is not None:
+                    segment_array = np.asarray(
+                        [(a[0], a[1], a[2], b[0], b[1], b[2]) for a, b in segments],
+                        dtype=self.eval_dtype,
+                    )
+                    dist = _spline_min_dist_numba(
+                        np.asarray(rx, dtype=self.eval_dtype).reshape(-1),
+                        np.asarray(ry, dtype=self.eval_dtype).reshape(-1),
+                        np.asarray(rz, dtype=self.eval_dtype).reshape(-1),
+                        segment_array,
+                    ).reshape(rx.shape).astype(self.eval_dtype, copy=False)
+                else:
+                    for a, b in segments:
+                        dseg = _dist_to_segment(rx, ry, rz, a, b, xp=xp)
+                        dist = xp.minimum(dist, dseg)
 
                 return dist * abs(pitch) - abs(radius)
 

@@ -350,6 +350,28 @@ def _compute_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarr
     return normals
 
 
+def _weld_vertices(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    quant: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray]:
+    if vertices.size == 0 or faces.size == 0:
+        return vertices, faces
+
+    quantized = np.rint(vertices / quant).astype(np.int64)
+    _, unique_idx, inverse = np.unique(quantized, axis=0, return_index=True, return_inverse=True)
+    welded_vertices = vertices[unique_idx]
+    welded_faces = inverse[faces]
+
+    valid_mask = (
+        (welded_faces[:, 0] != welded_faces[:, 1])
+        & (welded_faces[:, 1] != welded_faces[:, 2])
+        & (welded_faces[:, 2] != welded_faces[:, 0])
+    )
+    welded_faces = welded_faces[valid_mask].astype(np.int32, copy=False)
+    return welded_vertices, welded_faces
+
+
 
 def _resolve_mesh_backend(requested: Literal["auto", "cpu", "cuda"]) -> Literal["cpu", "cuda"]:
     cuda_ready = _cuda_meshing_available()
@@ -453,6 +475,7 @@ def _mesh_single_cuda(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
 
     vertices = cp.asnumpy(vertices_flat).reshape(-1, 3).astype(np.float64, copy=False)
     faces = cp.asnumpy(faces_flat).reshape(-1, 3).astype(np.int32, copy=False)
+    vertices, faces = _weld_vertices(vertices, faces)
     normals = _compute_vertex_normals(vertices, faces)
     return MeshData(vertices=vertices, faces=faces, normals=normals)
 
@@ -673,13 +696,14 @@ def build_mesh_with_backend(
 
 def mesh_to_obj(mesh: MeshData) -> bytes:
     buf = io.StringIO()
-    for vx, vy, vz in mesh.vertices:
-        buf.write(f"v {vx:.8f} {vy:.8f} {vz:.8f}\n")
-    for nx, ny, nz in mesh.normals:
-        buf.write(f"vn {nx:.8f} {ny:.8f} {nz:.8f}\n")
-    for i1, i2, i3 in mesh.faces:
-        a, b, c = i1 + 1, i2 + 1, i3 + 1
-        buf.write(f"f {a}//{a} {b}//{b} {c}//{c}\n")
+    if mesh.vertices.size > 0:
+        np.savetxt(buf, np.asarray(mesh.vertices, dtype=np.float64), fmt="v %.8f %.8f %.8f")
+    if mesh.normals.size > 0:
+        np.savetxt(buf, np.asarray(mesh.normals, dtype=np.float64), fmt="vn %.8f %.8f %.8f")
+    if mesh.faces.size > 0:
+        faces = np.asarray(mesh.faces, dtype=np.int64) + 1
+        lines = [f"f {a}//{a} {b}//{b} {c}//{c}\n" for a, b, c in faces]
+        buf.writelines(lines)
     return buf.getvalue().encode("utf-8")
 
 
@@ -687,8 +711,16 @@ def mesh_to_obj(mesh: MeshData) -> bytes:
 def mesh_to_stl(mesh: MeshData) -> bytes:
     # Binary STL output.
     header = b"SDF_CAD" + b" " * (80 - len("SDF_CAD"))
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    tri_verts = np.asarray(mesh.vertices, dtype=np.float64)[faces]
+    face_normals = np.cross(tri_verts[:, 1] - tri_verts[:, 0], tri_verts[:, 2] - tri_verts[:, 0])
+    lengths = np.linalg.norm(face_normals, axis=1)
+    valid = lengths > 1e-12
+    face_normals[valid] = face_normals[valid] / lengths[valid, None]
+    face_normals[~valid] = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
     triangles = np.zeros(
-        len(mesh.faces),
+        faces.shape[0],
         dtype=[
             ("normal", "<f4", 3),
             ("v0", "<f4", 3),
@@ -698,22 +730,11 @@ def mesh_to_stl(mesh: MeshData) -> bytes:
         ],
     )
 
-    for idx, (i0, i1, i2) in enumerate(mesh.faces):
-        v0 = mesh.vertices[i0]
-        v1 = mesh.vertices[i1]
-        v2 = mesh.vertices[i2]
-        normal = np.cross(v1 - v0, v2 - v0)
-        norm = np.linalg.norm(normal)
-        if norm > 1e-12:
-            normal = normal / norm
-        else:
-            normal = np.array([0.0, 0.0, 1.0])
-
-        triangles[idx]["normal"] = normal.astype(np.float32)
-        triangles[idx]["v0"] = v0.astype(np.float32)
-        triangles[idx]["v1"] = v1.astype(np.float32)
-        triangles[idx]["v2"] = v2.astype(np.float32)
-        triangles[idx]["attr"] = 0
+    triangles["normal"] = face_normals.astype(np.float32, copy=False)
+    triangles["v0"] = tri_verts[:, 0].astype(np.float32, copy=False)
+    triangles["v1"] = tri_verts[:, 1].astype(np.float32, copy=False)
+    triangles["v2"] = tri_verts[:, 2].astype(np.float32, copy=False)
+    triangles["attr"] = np.uint16(0)
 
     out = io.BytesIO()
     out.write(header)
