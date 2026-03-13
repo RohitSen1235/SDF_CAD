@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app import main as main_module
 from app.main import app
+from app.worker import celery_app
 
 client = TestClient(app)
 
@@ -46,6 +47,19 @@ def _mesh_form(lattice_type: str = "gyroid") -> dict[str, str]:
         "lattice_phase": "0.0",
         "quality_profile": "interactive",
     }
+
+
+@pytest.fixture(autouse=True)
+def eager_celery() -> None:
+    prev_eager = celery_app.conf.task_always_eager
+    prev_store = celery_app.conf.task_store_eager_result
+    celery_app.conf.task_always_eager = True
+    celery_app.conf.task_store_eager_result = True
+    try:
+        yield
+    finally:
+        celery_app.conf.task_always_eager = prev_eager
+        celery_app.conf.task_store_eager_result = prev_store
 
 
 def test_compile_endpoint_returns_diagnostics() -> None:
@@ -290,3 +304,45 @@ def test_mesh_preview_rejects_oversized_upload(monkeypatch: pytest.MonkeyPatch) 
         files={"file": ("big.obj", b"x" * 129, "text/plain")},
     )
     assert response.status_code == 413
+
+
+def test_preview_mesh_queued_mode_returns_job_and_result() -> None:
+    compiled = client.post("/api/v1/scene/compile", json={"source": SIMPLE_SOURCE}).json()["scene_ir"]
+    submit = client.post(
+        "/api/v1/preview/mesh",
+        json={
+            "scene_ir": compiled,
+            "parameter_values": {"r": 0.7},
+            "quality_profile": "interactive",
+            "execution_mode": "queued",
+        },
+    )
+    assert submit.status_code == 200
+    payload = submit.json()
+    assert payload["job_id"]
+    status = client.get(f"/api/v1/jobs/{payload['job_id']}")
+    assert status.status_code == 200
+    assert status.json()["status"] in {"queued", "running", "succeeded"}
+    result = client.get(f"/api/v1/jobs/{payload['job_id']}/result")
+    assert result.status_code == 200
+    result_payload = result.json()
+    assert result_payload["mesh"]["encoding"] == "mesh-f32-u32-base64-v1"
+
+
+def test_export_queued_mode_returns_streaming_result() -> None:
+    compiled = client.post("/api/v1/scene/compile", json={"source": SIMPLE_SOURCE}).json()["scene_ir"]
+    submit = client.post(
+        "/api/v1/jobs/export",
+        json={
+            "scene_ir": compiled,
+            "parameter_values": {"r": 0.75},
+            "quality_profile": "interactive",
+            "format": "stl",
+        },
+    )
+    assert submit.status_code == 200
+    payload = submit.json()
+    result = client.get(f"/api/v1/jobs/{payload['job_id']}/result")
+    assert result.status_code == 200
+    assert result.headers["content-type"].startswith("model/stl")
+    assert len(result.content) > 84

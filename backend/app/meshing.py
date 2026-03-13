@@ -741,3 +741,15 @@ def mesh_to_stl(mesh: MeshData) -> bytes:
     out.write(np.uint32(len(mesh.faces)).tobytes())
     out.write(triangles.tobytes())
     return out.getvalue()
+
+
+def iter_obj_chunks(mesh: MeshData, chunk_size: int = 1024 * 1024):
+    payload = mesh_to_obj(mesh)
+    for start in range(0, len(payload), chunk_size):
+        yield payload[start : start + chunk_size]
+
+
+def iter_stl_chunks(mesh: MeshData, chunk_size: int = 1024 * 1024):
+    payload = mesh_to_stl(mesh)
+    for start in range(0, len(payload), chunk_size):
+        yield payload[start : start + chunk_size]

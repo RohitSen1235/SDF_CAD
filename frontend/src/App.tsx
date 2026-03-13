@@ -519,6 +519,7 @@ export default function App() {
     setAnalyticMeshProgram(null);
     setStats(null);
     try {
+      let analyticShown = false;
       if (enableAnalyticPreview) {
         const analytic = await previewUploadedMeshProgram(meshFile, meshWorkflowParams, meshPreviewQuality);
         if (analytic.capabilities.analytic_supported && analytic.program?.mode === "mesh_lattice") {
@@ -526,7 +527,7 @@ export default function App() {
           setAnalyticMeshProgram(analytic.program);
           setStats(analytic.stats);
           setError(null);
-          return;
+          analyticShown = true;
         }
       }
       const response = await previewUploadedMeshPhased(
@@ -548,6 +549,9 @@ export default function App() {
       setAnalyticSceneProgram(null);
       setAnalyticMeshProgram(null);
       setStats(response.stats);
+      if (!analyticShown) {
+        setError(null);
+      }
     } catch (previewError) {
       setError((previewError as Error).message);
     } finally {

@@ -23,6 +23,7 @@ ComputePrecision = Literal["float32", "float16"]
 ComputeBackend = Literal["auto", "cpu", "cuda"]
 MeshBackend = Literal["auto", "cpu", "cuda"]
 MeshingMode = Literal["uniform", "adaptive"]
+ExecutionMode = Literal["auto", "inline", "queued"]
 
 
 class ParameterSpec(BaseModel):
@@ -117,6 +118,7 @@ class PreviewMeshRequest(BaseModel):
     compute_backend: ComputeBackend = "auto"
     mesh_backend: MeshBackend = "auto"
     meshing_mode: MeshingMode = "uniform"
+    execution_mode: ExecutionMode = "auto"
 
 
 class MeshPayload(BaseModel):
@@ -181,6 +183,21 @@ class ExportMeshRequest(BaseModel):
     compute_backend: ComputeBackend = "auto"
     mesh_backend: MeshBackend = "auto"
     meshing_mode: MeshingMode = "uniform"
+    execution_mode: ExecutionMode = "auto"
+
+
+class JobAcceptedResponse(BaseModel):
+    job_id: str
+    status: Literal["queued", "running", "succeeded", "failed"] = "queued"
+    status_url: str
+    result_url: str
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: Literal["queued", "running", "succeeded", "failed"]
+    task_name: str
+    detail: str | None = None
 
 
 class PreviewWsRequest(BaseModel):

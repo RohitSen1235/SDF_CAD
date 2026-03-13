@@ -1110,45 +1110,83 @@ class _FieldRuntime:
                 blade_count = int(max(1, round(self._node_scalar_param(node, "blade_count", 8.0))))
                 blade_thickness = self._node_scalar_param(node, "blade_thickness", 0.08)
                 blade_twist = self._node_scalar_param(node, "blade_twist", 0.8)
+                shroud_gap = self._node_scalar_param(node, "shroud_gap", 0.05)
 
-                if op == "impeller_centrifugal":
-                    shroud_gap = self._node_scalar_param(node, "shroud_gap", 0.05)
-                    blade_twist_dir = blade_twist
-                else:
-                    shroud_gap = self._node_scalar_param(node, "shroud_gap", 0.03)
-                    blade_twist_dir = blade_twist
+                if op == "radial_turbine":
+                    blade_twist = -abs(blade_twist)
 
                 radial_span = max(r_out - r_in, 1e-6)
+                # t=0 at inducer (r_in), t=1 at exducer tip (r_out)
                 t = xp.clip((r - r_in) / radial_span, 0.0, 1.0)
 
-                hub = xp.maximum(r - r_out, xp.abs(qy) - hub_h * 0.25)
-                shroud = xp.maximum(xp.abs(r - r_out) - abs(shroud_gap), xp.abs(qy) - hub_h * 0.5)
+                # ── Hub: conical solid ────────────────────────────────────────
+                # Hub top surface follows a cone: y_top(r) = hub_h*(1-t)
+                # Hub base is a flat disc at y = hub_base_y
+                hub_top_y = hub_h * (1.0 - t)
+                hub_base_y = -hub_h * 0.12
 
-                if xp is np and NUMBA_AVAILABLE and _blade_field_numba is not None:
-                    blades = _blade_field_numba(
-                        np.asarray(r, dtype=np.float32).reshape(-1),
-                        np.asarray(theta, dtype=np.float32).reshape(-1),
-                        np.asarray(qy, dtype=np.float32).reshape(-1),
-                        float(r_in),
-                        float(radial_span),
-                        int(blade_count),
-                        float(blade_thickness),
-                        float(hub_h),
-                        float(blade_twist_dir),
-                    ).reshape(r.shape).astype(self.eval_dtype, copy=False)
-                else:
-                    blades = xp.full_like(r, xp.inf, dtype=self.eval_dtype)
-                    for idx in range(blade_count):
-                        base_angle = 2.0 * np.pi * idx / float(blade_count)
-                        target = base_angle + blade_twist_dir * t
-                        ang = _angle_wrap(theta - target)
-                        arc_dist = xp.abs(ang) * xp.maximum(r, 1e-6)
-                        blade_field = xp.maximum(arc_dist - abs(blade_thickness) * 0.5, xp.abs(qy) - hub_h * 0.5)
-                        blades = xp.minimum(blades, blade_field)
+                # Conical hub SDF: inside when below top surface, above base, inside r_out
+                d_hub_top = qy - hub_top_y      # negative = below cone surface (inside)
+                d_hub_base = hub_base_y - qy    # negative = above base (inside)
+                d_hub_outer = r - r_out         # negative = inside outer radius
+                hub = xp.maximum(xp.maximum(d_hub_top, d_hub_base), d_hub_outer)
 
-                solid = xp.minimum(xp.minimum(hub, shroud), blades)
-                bore = r_in - r
-                return xp.maximum(solid, bore)
+                # ── Shaft bore ────────────────────────────────────────────────
+                bore_r = r_in * 0.60
+                bore_top = hub_h * 1.05
+                bore_bot = hub_base_y - 0.01
+                # Bore cylinder SDF (positive outside, negative inside)
+                d_bore_radial = r - bore_r
+                d_bore_axial = xp.maximum(qy - bore_top, bore_bot - qy)
+                bore = xp.maximum(d_bore_radial, d_bore_axial)
+                # Subtract bore from hub: hub = max(hub, -bore)
+                hub = xp.maximum(hub, -bore)
+
+                # ── Blade fins ────────────────────────────────────────────────
+                # Blades are thin fins that protrude ABOVE the hub cone surface.
+                # Blade bottom = hub cone surface (hub_top_y)
+                # Blade top    = hub_top_y + blade_fin_height(r)
+                # Blade fin height: tall at centre (inducer), shorter at tip
+                blade_fin_h = hub_h * (0.55 - 0.30 * t)   # 0.55*hub_h at r_in → 0.25*hub_h at r_out
+
+                # Blade half-thickness in arc-length units (tapers toward tip)
+                blade_t_half = abs(blade_thickness) * 0.5 * (1.0 - 0.30 * t)
+
+                blades = xp.full_like(r, xp.asarray(1e30, dtype=self.eval_dtype))
+                for idx in range(blade_count):
+                    base_angle = 2.0 * np.pi * idx / float(blade_count)
+                    # Backward-swept blade centre angle increases with radius
+                    target = base_angle + blade_twist * t
+                    ang = _angle_wrap(theta - target)
+                    arc_dist = xp.abs(ang) * xp.maximum(r, 1e-6)
+
+                    # Blade fin vertical bounds
+                    blade_y_bot = hub_top_y                     # sits on hub surface
+                    blade_y_top = hub_top_y + blade_fin_h       # protrudes above hub
+
+                    d_ang = arc_dist - blade_t_half             # negative = within blade thickness
+                    d_fin_top = qy - blade_y_top                # negative = below blade top
+                    d_fin_bot = blade_y_bot - qy                # negative = above blade bottom
+                    d_r_in = r_in - r                           # negative = outside inner bore
+                    d_r_out = r - r_out                         # negative = inside outer radius
+
+                    blade_field = xp.maximum(
+                        xp.maximum(d_ang, d_fin_top),
+                        xp.maximum(d_fin_bot, xp.maximum(d_r_in, d_r_out))
+                    )
+                    blades = xp.minimum(blades, blade_field)
+
+                # ── Outer rim / shroud band ───────────────────────────────────
+                shroud_inner = r_out - abs(shroud_gap) * 0.5
+                shroud_outer = r_out + abs(shroud_gap) * 0.5
+                shroud_y_lo = hub_base_y
+                shroud_y_hi = hub_h * 0.20
+                d_shroud_r = xp.maximum(r - shroud_outer, shroud_inner - r)
+                d_shroud_y = xp.maximum(qy - shroud_y_hi, shroud_y_lo - qy)
+                shroud = xp.maximum(d_shroud_r, d_shroud_y)
+
+                # Final: union of hub cone, blade fins, and shroud rim
+                return xp.minimum(xp.minimum(hub, blades), shroud)
 
             if op == "volute_casing":
                 throat_radius = self._node_scalar_param(node, "throat_radius", 0.35)
