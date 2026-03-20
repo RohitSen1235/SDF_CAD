@@ -17,6 +17,7 @@ const previewField = vi.fn();
 const previewMesh = vi.fn();
 const exportMesh = vi.fn();
 const previewUploadedMesh = vi.fn();
+const previewUploadedMeshField = vi.fn();
 const exportUploadedMesh = vi.fn();
 
 vi.mock("./lib/api", () => ({
@@ -25,6 +26,7 @@ vi.mock("./lib/api", () => ({
   previewMesh: (...args: unknown[]) => previewMesh(...args),
   exportMesh: (...args: unknown[]) => exportMesh(...args),
   previewUploadedMesh: (...args: unknown[]) => previewUploadedMesh(...args),
+  previewUploadedMeshField: (...args: unknown[]) => previewUploadedMeshField(...args),
   exportUploadedMesh: (...args: unknown[]) => exportUploadedMesh(...args)
 }));
 
@@ -38,6 +40,15 @@ const compiledScene = {
   parameter_schema: [{ name: "radius", type: "float", default: 0.8, min: 0.2, max: 1.5, step: 0.1 }],
   source_hash: "abc"
 };
+
+function encodeBuffer(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
 
 const fieldPreviewPayload = {
   field: {
@@ -61,17 +72,12 @@ const fieldPreviewPayload = {
 
 const meshPreviewPayload = {
   mesh: {
-    vertices: [
-      [0, 0, 0],
-      [1, 0, 0],
-      [0, 1, 0]
-    ],
-    indices: [[0, 1, 2]],
-    normals: [
-      [0, 0, 1],
-      [0, 0, 1],
-      [0, 0, 1]
-    ]
+    encoding: "mesh-f32-u32-base64-v1",
+    vertex_count: 3,
+    face_count: 1,
+    vertices_b64: encodeBuffer(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]).buffer),
+    indices_b64: encodeBuffer(new Uint32Array([0, 1, 2]).buffer),
+    normals_b64: encodeBuffer(new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]).buffer)
   },
   stats: {
     eval_ms: 3,
@@ -93,6 +99,7 @@ describe("App", () => {
     previewMesh.mockResolvedValue(meshPreviewPayload);
     exportMesh.mockResolvedValue(new Blob(["ok"]));
     previewUploadedMesh.mockResolvedValue(meshPreviewPayload);
+    previewUploadedMeshField.mockResolvedValue(fieldPreviewPayload);
     exportUploadedMesh.mockResolvedValue(new Blob(["ok"]));
   });
 
@@ -231,43 +238,71 @@ describe("App", () => {
     expect(editor).toHaveValue(savedSource);
   });
 
-  it("calls mesh preview API when Generate is clicked", async () => {
+  it("calls uploaded field preview API when Preview Field is clicked", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
 
-    previewUploadedMesh.mockResolvedValueOnce({
-      ...meshPreviewPayload,
-      field: fieldPreviewPayload.field
-    });
+    previewUploadedMeshField.mockResolvedValueOnce(fieldPreviewPayload);
+    previewUploadedMeshField.mockClear();
     previewUploadedMesh.mockClear();
 
-    const file = new File(["v 0 0 0\n"], "test.obj", { type: "text/plain" });
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
 
-    fireEvent.click(screen.getByRole("button", { name: "Generate Mesh Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
 
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(previewUploadedMeshField).toHaveBeenCalled();
     });
+    expect(previewUploadedMesh).not.toHaveBeenCalled();
 
-    const latestViewerProps = viewerMock.mock.calls.at(-1)?.[0] as Record<string, unknown>;
-    expect(latestViewerProps.mesh).toEqual(meshPreviewPayload.mesh);
+    const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
     expect(latestViewerProps.field).toEqual(fieldPreviewPayload.field);
+    expect(latestViewerProps.mesh).toBeNull();
   });
 
-  it("sends selected mesh workflow backends", async () => {
+  it("renders uploaded source mesh locally right after file selection", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [file] } });
+
+    await waitFor(() => {
+      const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
+      expect(latestViewerProps.mesh).not.toBeNull();
+    });
+  });
+
+  it("commits mesh only when commit button is clicked", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
     previewUploadedMesh.mockClear();
 
-    const file = new File(["v 0 0 0\n"], "test.obj", { type: "text/plain" });
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [file] } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
+    await waitFor(() => {
+      expect(previewUploadedMesh).toHaveBeenCalled();
+    });
+  });
+
+  it("sends selected mesh workflow backends on commit", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    previewUploadedMesh.mockClear();
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
     fireEvent.change(screen.getByLabelText("Mesh field backend"), { target: { value: "cuda" } });
     fireEvent.change(screen.getByLabelText("Mesh mesher backend"), { target: { value: "cuda" } });
 
-    fireEvent.click(screen.getByRole("button", { name: "Generate Mesh Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
     await waitFor(() => {
       expect(previewUploadedMesh).toHaveBeenCalled();
     });
@@ -278,17 +313,17 @@ describe("App", () => {
     expect(lastCall?.[4]).toBe("cuda");
   });
 
-  it("sends selected meshing mode for mesh workflow preview", async () => {
+  it("sends selected meshing mode for mesh workflow commit", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
     previewUploadedMesh.mockClear();
 
-    const file = new File(["v 0 0 0\n"], "test.obj", { type: "text/plain" });
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
     fireEvent.change(screen.getByLabelText("Mesh meshing mode"), { target: { value: "adaptive" } });
 
-    fireEvent.click(screen.getByRole("button", { name: "Generate Mesh Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
     await waitFor(() => {
       expect(previewUploadedMesh).toHaveBeenCalled();
     });
@@ -298,16 +333,25 @@ describe("App", () => {
     expect(lastCall?.[5]).toBe("adaptive");
   });
 
-  it("uses mesh export quality for uploaded export", async () => {
+  it("disables mesh export until commit completes and resets on input changes", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
 
-    const file = new File(["v 0 0 0\n"], "test.obj", { type: "text/plain" });
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
 
+    const exportStl = screen.getByRole("button", { name: "Export STL" });
+    expect(exportStl).toBeDisabled();
+
     fireEvent.change(screen.getByLabelText("Mesh export quality"), { target: { value: "ultra" } });
-    fireEvent.click(screen.getByRole("button", { name: "Export STL" }));
+    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
+    await waitFor(() => {
+      expect(previewUploadedMesh).toHaveBeenCalled();
+    });
+
+    expect(exportStl).not.toBeDisabled();
+    fireEvent.click(exportStl);
 
     await waitFor(() => {
       expect(exportUploadedMesh).toHaveBeenCalled();
@@ -317,5 +361,8 @@ describe("App", () => {
     const lastCall = calls[calls.length - 1];
     expect(lastCall?.[2]).toBe("stl");
     expect(lastCall?.[3]).toBe("ultra");
+
+    fireEvent.change(screen.getByLabelText("Lattice pitch"), { target: { value: "0.55" } });
+    expect(exportStl).toBeDisabled();
   });
 });

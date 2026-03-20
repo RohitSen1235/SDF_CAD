@@ -16,6 +16,9 @@ export interface ViewerProps {
   showGrid: boolean;
   sectionEnabled: boolean;
   sectionLevel: number;
+  /** When true the field renderer uses a ghost outer shell so the interior
+   *  TPMS lattice is visible through it. Used by the Mesh workflow. */
+  transparentShell?: boolean;
 }
 
 const FIELD_VERTEX_SHADER = `
@@ -27,6 +30,13 @@ const FIELD_VERTEX_SHADER = `
   }
 `;
 
+// Smooth ray-marched field renderer.
+// Uses hardware LinearFilter on the 3D texture for smooth trilinear sampling,
+// and a wider normal-estimation epsilon to avoid voxel-grid bumpiness.
+//
+// When uTransparentShell > 0.5 (mesh workflow), the shader performs multi-hit
+// compositing: the outer shell is rendered as a ghost (low alpha) so the
+// interior TPMS lattice struts are visible through it.
 const FIELD_FRAGMENT_SHADER = `
   precision highp float;
   precision highp sampler3D;
@@ -39,6 +49,9 @@ const FIELD_FRAGMENT_SHADER = `
   uniform float uSectionLevel;
   uniform float uResolution;
   uniform float uStepScale;
+  // When > 0.5: render outer shell as semi-transparent ghost so interior
+  // lattice is visible. Used by the Mesh workflow field preview.
+  uniform float uTransparentShell;
 
   in vec3 vWorldPos;
   out vec4 outColor;
@@ -53,11 +66,15 @@ const FIELD_FRAGMENT_SHADER = `
     return vec2(tNear, tFar);
   }
 
+  // Hardware-interpolated field sample — relies on LinearFilter set on the texture.
+  // The GPU sampler performs trilinear interpolation natively, giving smooth results.
   float sampleField(vec3 worldPos) {
-    vec3 uvw = (worldPos - uBoundsMin) / (uBoundsMax - uBoundsMin);
-    return texture(uField, clamp(uvw, 0.0, 1.0)).r;
+    vec3 uvw = clamp((worldPos - uBoundsMin) / (uBoundsMax - uBoundsMin), 0.0, 1.0);
+    return texture(uField, uvw).r;
   }
 
+  // Normal estimation with a wide epsilon (2x voxel size) to smooth out
+  // quantization noise from the discrete SDF grid.
   vec3 estimateNormal(vec3 worldPos, float eps) {
     vec3 ex = vec3(eps, 0.0, 0.0);
     vec3 ey = vec3(0.0, eps, 0.0);
@@ -66,6 +83,15 @@ const FIELD_FRAGMENT_SHADER = `
     float dy = sampleField(worldPos + ey) - sampleField(worldPos - ey);
     float dz = sampleField(worldPos + ez) - sampleField(worldPos - ez);
     return normalize(vec3(dx, dy, dz));
+  }
+
+  vec3 shade(vec3 p, float voxel) {
+    float normalEps = max(voxel * 2.0, 1e-3);
+    vec3 normal = estimateNormal(p, normalEps);
+    vec3 lightDir = normalize(vec3(0.55, 0.75, 0.4));
+    float diff = max(dot(normal, lightDir), 0.0);
+    float hemi = 0.4 + 0.6 * (normal.y * 0.5 + 0.5);
+    return uColor * (0.28 + 0.72 * diff) * hemi;
   }
 
   void main() {
@@ -83,38 +109,124 @@ const FIELD_FRAGMENT_SHADER = `
       discard;
     }
 
-    const int MAX_STEPS = 1536;
     vec3 extent = (uBoundsMax - uBoundsMin);
     float voxel = min(min(extent.x, extent.y), extent.z) / max(uResolution, 2.0);
     float minStep = max(voxel * 0.25, 1e-4);
     float maxStep = max(voxel * 1.25, minStep);
     float hitEps = max(voxel * 0.8, 1e-4);
 
+    // ── Opaque mode (DSL workflow) ────────────────────────────────────────────
+    if (uTransparentShell < 0.5) {
+      const int MAX_STEPS = 1536;
+      float t = tStart;
+      float prev = sampleField(ro + rd * tStart);
+      bool hitSurface = false;
+      vec3 pHit = vec3(0.0);
+
+      for (int i = 0; i < MAX_STEPS; i++) {
+        if (t > tEnd) break;
+        vec3 p = ro + rd * t;
+        float s = sampleField(p);
+
+        if (abs(s) <= hitEps) {
+          pHit = p;
+          hitSurface = true;
+          break;
+        }
+
+        bool crossed = (prev > 0.0 && s <= 0.0) || (prev < 0.0 && s >= 0.0);
+        if (crossed) {
+          float a = prev / (prev - s + 1e-6);
+          float prevT = max(t - minStep, tStart);
+          pHit = mix(ro + rd * prevT, p, clamp(a, 0.0, 1.0));
+          hitSurface = true;
+          break;
+        }
+
+        float stepSize = clamp(abs(s) * 0.55, minStep, maxStep) * uStepScale;
+        prev = s;
+        t += stepSize;
+      }
+
+      if (!hitSurface) { discard; }
+      if (uSectionEnabled > 0.5 && pHit.y > uSectionLevel) { discard; }
+
+      // Use 2x voxel size for normal epsilon — wider neighbourhood averages out
+      // grid quantization and produces smooth, non-bumpy shading.
+      outColor = vec4(shade(pHit, voxel), 1.0);
+      return;
+    }
+
+    // ── Transparent-shell mode (Mesh workflow) ────────────────────────────────
+    // Multi-hit compositing: collect up to 2 surface crossings.
+    // Hit 0 = outer shell → ghost alpha (0.18).
+    // Hit 1 = interior lattice strut → full alpha (1.0).
+    // This lets the user see the TPMS lattice through the translucent skin.
+    const int MAX_STEPS_T = 1536;
+    const float SHELL_ALPHA = 0.18;
+    // After the first hit we step past the surface by a small skip (relative to
+    // voxel size) to avoid re-detecting the same crossing immediately.
+    float SKIP_DIST = voxel * 3.0;
+
+    vec4 accum = vec4(0.0);   // accumulated RGBA (pre-multiplied alpha)
     float t = tStart;
     float prev = sampleField(ro + rd * tStart);
-    bool hitSurface = false;
-    vec3 pHit = vec3(0.0);
+    int hitCount = 0;
 
-    for (int i = 0; i < MAX_STEPS; i++) {
-      if (t > tEnd) {
-        break;
-      }
+    for (int i = 0; i < MAX_STEPS_T; i++) {
+      if (t > tEnd) break;
+      if (accum.a >= 0.99) break;   // fully opaque — early exit
+
       vec3 p = ro + rd * t;
       float s = sampleField(p);
 
-      if (abs(s) <= hitEps) {
-        pHit = p;
-        hitSurface = true;
-        break;
-      }
+      bool onSurface = abs(s) <= hitEps;
+      bool crossed   = (prev > 0.0 && s <= 0.0) || (prev < 0.0 && s >= 0.0);
 
-      bool crossed = (prev > 0.0 && s <= 0.0) || (prev < 0.0 && s >= 0.0);
-      if (crossed) {
-        float a = prev / (prev - s + 1e-6);
-        float prevT = max(t - minStep, tStart);
-        pHit = mix(ro + rd * prevT, p, clamp(a, 0.0, 1.0));
-        hitSurface = true;
-        break;
+      if (onSurface || crossed) {
+        vec3 pHit;
+        if (onSurface) {
+          pHit = p;
+        } else {
+          float a = prev / (prev - s + 1e-6);
+          float prevT = max(t - minStep, tStart);
+          pHit = mix(ro + rd * prevT, p, clamp(a, 0.0, 1.0));
+        }
+
+        // Section plane clipping — discard the whole ray if the first visible
+        // hit is above the section level.
+        if (uSectionEnabled > 0.5 && pHit.y > uSectionLevel) {
+          // Skip past this surface and keep looking below the cut plane.
+          t += SKIP_DIST + minStep;
+          prev = sampleField(ro + rd * t);
+          hitCount++;
+          if (hitCount >= 2) break;
+          continue;
+        }
+
+        vec3 litColor = shade(pHit, voxel);
+
+        float hitAlpha;
+        if (hitCount == 0) {
+          // Outer shell — ghost/transparent
+          hitAlpha = SHELL_ALPHA;
+        } else {
+          // Interior lattice — fully opaque
+          hitAlpha = 1.0;
+        }
+
+        // Alpha-over compositing (front-to-back)
+        float remaining = 1.0 - accum.a;
+        accum.rgb += litColor * hitAlpha * remaining;
+        accum.a   += hitAlpha * remaining;
+
+        hitCount++;
+        if (hitCount >= 2) break;
+
+        // Skip past this surface to find the next one.
+        t += SKIP_DIST;
+        prev = sampleField(ro + rd * t);
+        continue;
       }
 
       float stepSize = clamp(abs(s) * 0.55, minStep, maxStep) * uStepScale;
@@ -122,22 +234,8 @@ const FIELD_FRAGMENT_SHADER = `
       t += stepSize;
     }
 
-    if (!hitSurface) {
-      discard;
-    }
-
-    if (uSectionEnabled > 0.5 && pHit.y > uSectionLevel) {
-      discard;
-    }
-
-    float eps = max(voxel * 0.9, 1e-4);
-    vec3 normal = estimateNormal(pHit, eps);
-    vec3 lightDir = normalize(vec3(0.55, 0.75, 0.4));
-    float diff = max(dot(normal, lightDir), 0.0);
-    float hemi = 0.4 + 0.6 * (normal.y * 0.5 + 0.5);
-    vec3 lit = uColor * (0.28 + 0.72 * diff) * hemi;
-
-    outColor = vec4(lit, 1.0);
+    if (accum.a < 0.01) { discard; }
+    outColor = accum;
   }
 `;
 
@@ -180,47 +278,44 @@ const SECTION_CAP_FRAGMENT_SHADER = `
   }
 `;
 
-function packVec3(values: [number, number, number][]): Float32Array {
-  const out = new Float32Array(values.length * 3);
-  for (let i = 0; i < values.length; i += 1) {
-    const offset = i * 3;
-    const value = values[i];
-    out[offset] = value[0];
-    out[offset + 1] = value[1];
-    out[offset + 2] = value[2];
+function decodeBase64Bytes(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
   }
-  return out;
-}
-
-function packIndices(
-  faces: [number, number, number][],
-  vertexCount: number
-): Uint16Array | Uint32Array {
-  const out =
-    vertexCount > 65535 ? new Uint32Array(faces.length * 3) : new Uint16Array(faces.length * 3);
-  for (let i = 0; i < faces.length; i += 1) {
-    const offset = i * 3;
-    const tri = faces[i];
-    out[offset] = tri[0];
-    out[offset + 1] = tri[1];
-    out[offset + 2] = tri[2];
-  }
-  return out;
+  return bytes;
 }
 
 function toGeometry(mesh: MeshPayload | null): THREE.BufferGeometry | null {
-  if (!mesh) {
+  if (!mesh || mesh.encoding !== "mesh-f32-u32-base64-v1") {
     return null;
   }
 
+  const expectedVerticesBytes = mesh.vertex_count * 3 * Float32Array.BYTES_PER_ELEMENT;
+  const expectedIndicesBytes = mesh.face_count * 3 * Uint32Array.BYTES_PER_ELEMENT;
+  const expectedNormalsBytes = mesh.vertex_count * 3 * Float32Array.BYTES_PER_ELEMENT;
+
+  const verticesBytes = decodeBase64Bytes(mesh.vertices_b64);
+  const indicesBytes = decodeBase64Bytes(mesh.indices_b64);
+  const normalsBytes = decodeBase64Bytes(mesh.normals_b64);
+
+  if (
+    verticesBytes.byteLength !== expectedVerticesBytes ||
+    indicesBytes.byteLength !== expectedIndicesBytes ||
+    normalsBytes.byteLength !== expectedNormalsBytes
+  ) {
+    return null;
+  }
+
+  const vertices = new Float32Array(verticesBytes.buffer.slice(0));
+  const indices = new Uint32Array(indicesBytes.buffer.slice(0));
+  const normals = new Float32Array(normalsBytes.buffer.slice(0));
+
   const geometry = new THREE.BufferGeometry();
-  const vertices = packVec3(mesh.vertices);
-  const indices = packIndices(mesh.indices, mesh.vertices.length);
   geometry.setAttribute("position", new THREE.BufferAttribute(vertices, 3));
   geometry.setIndex(new THREE.BufferAttribute(indices, 1));
-
-  if (mesh.normals.length === mesh.vertices.length) {
-    const normals = packVec3(mesh.normals);
+  if (normals.length === vertices.length) {
     geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
   } else {
     geometry.computeVertexNormals();
@@ -232,14 +327,8 @@ function toGeometry(mesh: MeshPayload | null): THREE.BufferGeometry | null {
 }
 
 function decodeFloat32Base64(base64: string): Float32Array {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  const outBuffer = new ArrayBuffer(bytes.byteLength);
-  new Uint8Array(outBuffer).set(bytes);
-  return new Float32Array(outBuffer);
+  const bytes = decodeBase64Bytes(base64);
+  return new Float32Array(bytes.buffer.slice(0));
 }
 
 function toFieldTexture(field: FieldPayload | null): THREE.Data3DTexture | null {
@@ -262,9 +351,10 @@ function toFieldTexture(field: FieldPayload | null): THREE.Data3DTexture | null 
   texture.internalFormat = "R32F";
   texture.format = THREE.RedFormat;
   texture.type = THREE.FloatType;
-  // Use nearest filtering for broad WebGL2 compatibility with float 3D textures.
-  texture.minFilter = THREE.NearestFilter;
-  texture.magFilter = THREE.NearestFilter;
+  // Use LinearFilter for smooth hardware-interpolated trilinear sampling.
+  // This eliminates voxel-grid artifacts and produces smooth surface rendering.
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
   texture.wrapS = THREE.ClampToEdgeWrapping;
   texture.wrapT = THREE.ClampToEdgeWrapping;
   texture.wrapR = THREE.ClampToEdgeWrapping;
@@ -326,7 +416,8 @@ export function Viewer({
   showAxes,
   showGrid,
   sectionEnabled,
-  sectionLevel
+  sectionLevel,
+  transparentShell = false
 }: ViewerProps) {
   const [orbitEnabled, setOrbitEnabled] = useState(true);
   const orbitRef = useRef<any>(null);
@@ -348,6 +439,7 @@ export function Viewer({
   }, [geometry]);
 
   const fieldTexture = useMemo(() => toFieldTexture(field), [field]);
+
   const fieldBounds = useMemo(() => {
     if (!field) {
       return null;
@@ -410,7 +502,8 @@ export function Viewer({
           <boxGeometry args={fieldBounds.size.toArray() as [number, number, number]} />
           <shaderMaterial
             side={THREE.FrontSide}
-            transparent={false}
+            transparent={transparentShell}
+            depthWrite={!transparentShell}
             glslVersion={THREE.GLSL3}
             vertexShader={FIELD_VERTEX_SHADER}
             fragmentShader={FIELD_FRAGMENT_SHADER}
@@ -423,7 +516,8 @@ export function Viewer({
               uSectionEnabled: { value: sectionEnabled ? 1.0 : 0.0 },
               uSectionLevel: { value: sectionLevel },
               uResolution: { value: field?.resolution ?? 64 },
-              uStepScale: { value: 1.0 }
+              uStepScale: { value: 1.0 },
+              uTransparentShell: { value: transparentShell ? 1.0 : 0.0 }
             }}
           />
         </mesh>
@@ -501,7 +595,7 @@ export function Viewer({
         </mesh>
       ) : null}
 
-      {hasField && !geometry && sectionEnabled && fieldBounds ? (
+      {fieldTexture && !geometry && sectionEnabled && fieldBounds ? (
         <mesh position={[0, sectionLevel, 0]} rotation={[-Math.PI * 0.5, 0, 0]} renderOrder={2}>
           <planeGeometry args={[capSize, capSize]} />
           <shaderMaterial

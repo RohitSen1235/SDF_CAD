@@ -2,10 +2,12 @@ import {
   ComputeBackend,
   CompileDiagnostics,
   ComputePrecision,
+  FieldPayload,
   GridConfig,
   MeshBackend,
   MeshingMode,
   MeshWorkflowParams,
+  PreviewStats,
   PreviewFieldResponse,
   PreviewMeshResponse,
   QualityProfile,
@@ -35,6 +37,34 @@ function asNetworkError(error: unknown): Error {
   return new Error(
     `Cannot reach backend API at ${API_BASE}. Start backend with: cd backend && source .venv/bin/activate && uvicorn app.main:app --reload`
   );
+}
+
+function toWebSocketBase(httpBase: string): string {
+  if (httpBase.startsWith("https://")) {
+    return `wss://${httpBase.slice("https://".length)}`;
+  }
+  if (httpBase.startsWith("http://")) {
+    return `ws://${httpBase.slice("http://".length)}`;
+  }
+  return httpBase;
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result !== "string") {
+        reject(new Error("Failed to read uploaded mesh file"));
+        return;
+      }
+      const marker = "base64,";
+      const idx = result.indexOf(marker);
+      resolve(idx >= 0 ? result.slice(idx + marker.length) : result);
+    };
+    reader.onerror = () => reject(new Error("Failed to read uploaded mesh file"));
+    reader.readAsDataURL(file);
+  });
 }
 
 export async function compileScene(source: string): Promise<CompileSceneResult> {
@@ -182,7 +212,8 @@ function appendMeshWorkflowFormData(
   qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
-  meshingMode: MeshingMode = "uniform"
+  meshingMode: MeshingMode = "uniform",
+  voxelsPerLatticePeriod: number = 6
 ): void {
   body.append("file", file, file.name);
   body.append("shell_thickness", String(params.shellThickness));
@@ -191,6 +222,7 @@ function appendMeshWorkflowFormData(
   body.append("lattice_thickness", String(params.latticeThickness));
   body.append("lattice_phase", String(params.latticePhase));
   body.append("quality_profile", qualityProfile);
+  body.append("voxels_per_lattice_period", String(voxelsPerLatticePeriod));
   body.append("compute_backend", computeBackend);
   body.append("mesh_backend", meshBackend);
   body.append("meshing_mode", meshingMode);
@@ -202,11 +234,12 @@ export async function previewUploadedMesh(
   qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
-  meshingMode: MeshingMode = "uniform"
+  meshingMode: MeshingMode = "uniform",
+  voxelsPerLatticePeriod: number = 6
 ): Promise<PreviewMeshResponse> {
   try {
     const body = new FormData();
-    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode);
+    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
     const response = await fetch(`${API_BASE}/api/v1/mesh/preview`, {
       method: "POST",
       body
@@ -223,6 +256,131 @@ export async function previewUploadedMesh(
   }
 }
 
+export async function previewUploadedMeshField(
+  file: File,
+  params: MeshWorkflowParams,
+  qualityProfile: QualityProfile,
+  computeBackend: ComputeBackend = "auto",
+  voxelsPerLatticePeriod: number = 6
+): Promise<PreviewFieldResponse> {
+  try {
+    const body = new FormData();
+    appendMeshWorkflowFormData(
+      body,
+      file,
+      params,
+      qualityProfile,
+      computeBackend,
+      "auto",
+      "uniform",
+      voxelsPerLatticePeriod
+    );
+    const response = await fetch(`${API_BASE}/api/v1/mesh/field`, {
+      method: "POST",
+      body
+    });
+    return parseJsonOrThrow(response);
+  } catch (error) {
+    if ((error as Error)?.name === "AbortError") {
+      throw error;
+    }
+    if (error instanceof TypeError) {
+      throw asNetworkError(error);
+    }
+    throw error;
+  }
+}
+
+export async function previewUploadedMeshPhased(
+  file: File,
+  params: MeshWorkflowParams,
+  qualityProfile: QualityProfile,
+  computeBackend: ComputeBackend = "auto",
+  meshBackend: MeshBackend = "auto",
+  meshingMode: MeshingMode = "uniform",
+  onField?: (field: FieldPayload, stats?: PreviewStats) => void,
+  voxelsPerLatticePeriod: number = 6
+): Promise<PreviewMeshResponse> {
+  const fileBase64 = await fileToBase64(file);
+  const wsBase = toWebSocketBase(API_BASE);
+  const url = `${wsBase}/api/v1/mesh/preview/ws`;
+  const fallbackToHttp = async (): Promise<PreviewMeshResponse> =>
+    previewUploadedMesh(file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
+
+  return new Promise<PreviewMeshResponse>((resolve, reject) => {
+    let settled = false;
+    let latestField: FieldPayload | null = null;
+    const ws = new WebSocket(url);
+
+    ws.onopen = () => {
+      ws.send(
+        JSON.stringify({
+          file_name: file.name,
+          file_data_base64: fileBase64,
+          shell_thickness: params.shellThickness,
+          lattice_type: params.latticeType,
+          lattice_pitch: params.latticePitch,
+          lattice_thickness: params.latticeThickness,
+          lattice_phase: params.latticePhase,
+          quality_profile: qualityProfile,
+          voxels_per_lattice_period: voxelsPerLatticePeriod,
+          compute_backend: computeBackend,
+          mesh_backend: meshBackend,
+          meshing_mode: meshingMode
+        })
+      );
+    };
+
+    ws.onmessage = (event: MessageEvent<string>) => {
+      let payload: any;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      if (payload.phase === "field" && payload.field) {
+        latestField = payload.field as FieldPayload;
+        if (onField) {
+          onField(latestField, payload.stats as PreviewStats | undefined);
+        }
+        return;
+      }
+
+      if (payload.phase === "mesh" && payload.mesh && payload.stats) {
+        settled = true;
+        resolve({
+          mesh: payload.mesh as PreviewMeshResponse["mesh"],
+          stats: payload.stats as PreviewStats,
+          field: (payload.field as FieldPayload | null | undefined) ?? latestField
+        });
+        return;
+      }
+
+      if (payload.phase === "error") {
+        settled = true;
+        reject(new Error(payload.error ?? "Mesh preview websocket failed"));
+      }
+    };
+
+    ws.onerror = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      fallbackToHttp().then(resolve).catch(reject);
+    };
+
+    ws.onclose = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      fallbackToHttp().then(resolve).catch(reject);
+    };
+  });
+}
+
 export async function exportUploadedMesh(
   file: File,
   params: MeshWorkflowParams,
@@ -230,11 +388,12 @@ export async function exportUploadedMesh(
   qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
-  meshingMode: MeshingMode = "uniform"
+  meshingMode: MeshingMode = "uniform",
+  voxelsPerLatticePeriod: number = 6
 ): Promise<Blob> {
   try {
     const body = new FormData();
-    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode);
+    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
     body.append("format", format);
     const response = await fetch(`${API_BASE}/api/v1/mesh/export`, {
       method: "POST",

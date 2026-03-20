@@ -25,18 +25,22 @@ vi.mock("@react-three/drei", () => ({
   })
 }));
 
+function encodeBuffer(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
 const sampleMesh = {
-  vertices: [
-    [0, 0, 0],
-    [1, 0, 0],
-    [0, 1, 0]
-  ] as [number, number, number][],
-  indices: [[0, 1, 2]] as [number, number, number][],
-  normals: [
-    [0, 0, 1],
-    [0, 0, 1],
-    [0, 0, 1]
-  ] as [number, number, number][]
+  encoding: "mesh-f32-u32-base64-v1" as const,
+  vertex_count: 3,
+  face_count: 1,
+  vertices_b64: encodeBuffer(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]).buffer),
+  indices_b64: encodeBuffer(new Uint32Array([0, 1, 2]).buffer),
+  normals_b64: encodeBuffer(new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]).buffer)
 };
 
 function encodeFieldData(values: Float32Array): string {

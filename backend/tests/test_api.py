@@ -1,8 +1,12 @@
+import base64
+
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 from app import main as main_module
 from app.main import app
+from app.worker import celery_app
 
 client = TestClient(app)
 
@@ -27,6 +31,13 @@ f 3 1 4
 """
 
 
+def _decode_mesh_arrays(mesh_payload: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    vertices = np.frombuffer(base64.b64decode(mesh_payload["vertices_b64"]), dtype=np.float32).reshape(-1, 3)
+    indices = np.frombuffer(base64.b64decode(mesh_payload["indices_b64"]), dtype=np.uint32).reshape(-1, 3)
+    normals = np.frombuffer(base64.b64decode(mesh_payload["normals_b64"]), dtype=np.float32).reshape(-1, 3)
+    return vertices, indices, normals
+
+
 def _mesh_form(lattice_type: str = "gyroid") -> dict[str, str]:
     return {
         "shell_thickness": "0.08",
@@ -36,6 +47,19 @@ def _mesh_form(lattice_type: str = "gyroid") -> dict[str, str]:
         "lattice_phase": "0.0",
         "quality_profile": "interactive",
     }
+
+
+@pytest.fixture(autouse=True)
+def eager_celery() -> None:
+    prev_eager = celery_app.conf.task_always_eager
+    prev_store = celery_app.conf.task_store_eager_result
+    celery_app.conf.task_always_eager = True
+    celery_app.conf.task_store_eager_result = True
+    try:
+        yield
+    finally:
+        celery_app.conf.task_always_eager = prev_eager
+        celery_app.conf.task_store_eager_result = prev_store
 
 
 def test_compile_endpoint_returns_diagnostics() -> None:
@@ -61,7 +85,11 @@ def test_preview_mesh_endpoint_accepts_quality_profile() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["stats"]["tri_count"] > 0
-    assert len(payload["mesh"]["vertices"]) > 0
+    assert payload["mesh"]["encoding"] == "mesh-f32-u32-base64-v1"
+    vertices, indices, normals = _decode_mesh_arrays(payload["mesh"])
+    assert vertices.shape[0] == payload["mesh"]["vertex_count"]
+    assert indices.shape[0] == payload["mesh"]["face_count"]
+    assert normals.shape[0] == payload["mesh"]["vertex_count"]
     assert payload["stats"]["compute_precision"] == "float32"
     assert payload["stats"]["compute_backend"] == "cpu"
 
@@ -190,10 +218,40 @@ def test_mesh_preview_endpoint_obj_upload() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["stats"]["tri_count"] > 0
-    assert len(payload["mesh"]["vertices"]) > 0
+    assert payload["mesh"]["encoding"] == "mesh-f32-u32-base64-v1"
     assert payload["field"]["encoding"] == "f32-base64"
     assert payload["field"]["resolution"] == 48
     assert payload["field"]["data"]
+
+
+def test_mesh_field_endpoint_obj_upload() -> None:
+    response = client.post(
+        "/api/v1/mesh/field",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["field"]["encoding"] == "f32-base64"
+    assert payload["field"]["resolution"] == 48
+    assert payload["field"]["data"]
+    assert payload["stats"]["preview_mode"] == "field"
+    assert payload["stats"]["mesh_ms"] is None
+    assert payload["stats"]["tri_count"] == 0
+
+
+def test_mesh_field_endpoint_does_not_call_mesher(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_mesher(*_args, **_kwargs):
+        raise AssertionError("Mesher should not run for uploaded field preview")
+
+    monkeypatch.setattr(main_module, "build_mesh_with_backend", fail_mesher)
+    response = client.post(
+        "/api/v1/mesh/field",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    assert response.json()["stats"]["preview_mode"] == "field"
 
 
 def test_mesh_preview_preserves_original_outer_vertices() -> None:
@@ -203,7 +261,7 @@ def test_mesh_preview_preserves_original_outer_vertices() -> None:
         files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
     )
     assert response.status_code == 200
-    vertices = response.json()["mesh"]["vertices"]
+    vertices, _, _ = _decode_mesh_arrays(response.json()["mesh"])
 
     def has_vertex(target: list[float]) -> bool:
         for vx, vy, vz in vertices:
@@ -276,3 +334,45 @@ def test_mesh_preview_rejects_oversized_upload(monkeypatch: pytest.MonkeyPatch) 
         files={"file": ("big.obj", b"x" * 129, "text/plain")},
     )
     assert response.status_code == 413
+
+
+def test_preview_mesh_queued_mode_returns_job_and_result() -> None:
+    compiled = client.post("/api/v1/scene/compile", json={"source": SIMPLE_SOURCE}).json()["scene_ir"]
+    submit = client.post(
+        "/api/v1/preview/mesh",
+        json={
+            "scene_ir": compiled,
+            "parameter_values": {"r": 0.7},
+            "quality_profile": "interactive",
+            "execution_mode": "queued",
+        },
+    )
+    assert submit.status_code == 200
+    payload = submit.json()
+    assert payload["job_id"]
+    status = client.get(f"/api/v1/jobs/{payload['job_id']}")
+    assert status.status_code == 200
+    assert status.json()["status"] in {"queued", "running", "succeeded"}
+    result = client.get(f"/api/v1/jobs/{payload['job_id']}/result")
+    assert result.status_code == 200
+    result_payload = result.json()
+    assert result_payload["mesh"]["encoding"] == "mesh-f32-u32-base64-v1"
+
+
+def test_export_queued_mode_returns_streaming_result() -> None:
+    compiled = client.post("/api/v1/scene/compile", json={"source": SIMPLE_SOURCE}).json()["scene_ir"]
+    submit = client.post(
+        "/api/v1/jobs/export",
+        json={
+            "scene_ir": compiled,
+            "parameter_values": {"r": 0.75},
+            "quality_profile": "interactive",
+            "format": "stl",
+        },
+    )
+    assert submit.status_code == 200
+    payload = submit.json()
+    result = client.get(f"/api/v1/jobs/{payload['job_id']}/result")
+    assert result.status_code == 200
+    assert result.headers["content-type"].startswith("model/stl")
+    assert len(result.content) > 84

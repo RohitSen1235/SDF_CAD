@@ -23,6 +23,7 @@ ComputePrecision = Literal["float32", "float16"]
 ComputeBackend = Literal["auto", "cpu", "cuda"]
 MeshBackend = Literal["auto", "cpu", "cuda"]
 MeshingMode = Literal["uniform", "adaptive"]
+ExecutionMode = Literal["auto", "inline", "queued"]
 
 
 class ParameterSpec(BaseModel):
@@ -117,12 +118,16 @@ class PreviewMeshRequest(BaseModel):
     compute_backend: ComputeBackend = "auto"
     mesh_backend: MeshBackend = "auto"
     meshing_mode: MeshingMode = "uniform"
+    execution_mode: ExecutionMode = "auto"
 
 
 class MeshPayload(BaseModel):
-    vertices: list[list[float]]
-    indices: list[list[int]]
-    normals: list[list[float]]
+    encoding: Literal["mesh-f32-u32-base64-v1"] = "mesh-f32-u32-base64-v1"
+    vertex_count: int
+    face_count: int
+    vertices_b64: str
+    indices_b64: str
+    normals_b64: str
 
 
 class FieldPayload(BaseModel):
@@ -141,7 +146,11 @@ class PreviewStats(BaseModel):
     compute_precision: ComputePrecision = "float32"
     compute_backend: Literal["cpu", "cuda"] = "cpu"
     mesh_backend: Literal["cpu", "cuda"] = "cpu"
-    preview_mode: Literal["mesh", "field"] = "mesh"
+    preview_mode: Literal["mesh", "field", "analytic_raymarch"] = "mesh"
+    compile_ms: float | None = None
+    program_bytes: int | None = None
+    gpu_eval_mode: str | None = None
+    fallback_reason: str | None = None
 
 
 class PreviewMeshResponse(BaseModel):
@@ -174,6 +183,21 @@ class ExportMeshRequest(BaseModel):
     compute_backend: ComputeBackend = "auto"
     mesh_backend: MeshBackend = "auto"
     meshing_mode: MeshingMode = "uniform"
+    execution_mode: ExecutionMode = "auto"
+
+
+class JobAcceptedResponse(BaseModel):
+    job_id: str
+    status: Literal["queued", "running", "succeeded", "failed"] = "queued"
+    status_url: str
+    result_url: str
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: Literal["queued", "running", "succeeded", "failed"]
+    task_name: str
+    detail: str | None = None
 
 
 class PreviewWsRequest(BaseModel):
@@ -194,6 +218,57 @@ class PreviewWsResponse(BaseModel):
     error: str | None = None
 
 
+class UploadedMeshPreviewWsRequest(BaseModel):
+    file_name: str
+    file_data_base64: str
+    shell_thickness: float
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"]
+    lattice_pitch: float
+    lattice_thickness: float
+    lattice_phase: float = 0.0
+    quality_profile: QualityProfile = "medium"
+    voxels_per_lattice_period: int = 6
+    compute_backend: ComputeBackend = "auto"
+    mesh_backend: MeshBackend = "auto"
+    meshing_mode: MeshingMode = "uniform"
+
+
+class UploadedMeshPreviewWsResponse(BaseModel):
+    phase: Literal["field", "mesh", "error"]
+    mesh: MeshPayload | None = None
+    field: FieldPayload | None = None
+    stats: PreviewStats | None = None
+    error: str | None = None
+
+
 class ApiError(BaseModel):
     detail: str
     extra: dict[str, Any] | None = None
+
+
+class PreviewProgramRequest(BaseModel):
+    scene_ir: SceneIR
+    parameter_values: dict[str, float] = Field(default_factory=dict)
+    quality_profile: QualityProfile = "high"
+    grid: GridConfig | None = None
+
+
+class SceneProgramPayload(BaseModel):
+    mode: Literal["dsl"]
+    bounds: list[list[float]]
+    glsl_sdf: str
+    quality_profile: QualityProfile
+    max_steps: int
+    hit_epsilon: float
+    normal_epsilon: float
+
+
+class ProgramCapabilities(BaseModel):
+    analytic_supported: bool
+    fallback_reason: str | None = None
+
+
+class PreviewProgramResponse(BaseModel):
+    program: SceneProgramPayload | None = None
+    capabilities: ProgramCapabilities
+    stats: PreviewStats

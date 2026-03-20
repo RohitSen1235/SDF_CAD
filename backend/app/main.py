@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import binascii
 import copy
 import logging
 import time
@@ -8,9 +10,10 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
+from celery.result import AsyncResult
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 from .cache import (
     CompileCacheEntry,
@@ -40,38 +43,58 @@ from .mesh_upload import (
     ParsedMesh,
     build_host_field,
     compose_hollow_lattice_field_with_backend,
+    compute_resolution_for_lattice_pitch,
     parse_mesh_bytes,
     validate_triangle_mesh,
 )
+from .gpu_program import compile_scene_program
+from .gpu_memory import cleanup_gpu_memory
 from .meshing import (
     MeshData,
     MeshingError,
+    _compute_vertex_normals as compute_vertex_normals,
     build_mesh_with_backend,
+    iter_obj_chunks,
+    iter_stl_chunks,
     is_cuda_meshing_available,
-    mesh_to_obj,
-    mesh_to_stl,
 )
 from .models import (
     ComputeBackend,
     ComputePrecision,
     CompileSceneRequest,
     CompileSceneResponse,
+    ExecutionMode,
     ExportMeshRequest,
     FieldPayload,
     GridConfig,
+    JobAcceptedResponse,
+    JobStatusResponse,
     MeshingMode,
     PreviewFieldRequest,
     PreviewFieldResponse,
     PreviewMeshRequest,
     PreviewMeshResponse,
+    PreviewProgramRequest,
+    PreviewProgramResponse,
     PreviewStats,
     PreviewWsRequest,
     PreviewWsResponse,
+    ProgramCapabilities,
     QualityProfile,
     MeshBackend,
+    MeshPayload,
+    UploadedMeshPreviewWsRequest,
+    UploadedMeshPreviewWsResponse,
 )
 
 logger = logging.getLogger(__name__)
+
+try:
+    import redis as _redis  # type: ignore
+
+    REDIS_CLIENT_AVAILABLE = _redis is not None
+except Exception:
+    REDIS_CLIENT_AVAILABLE = False
 
 EVAL_TIMEOUT_SECONDS = 20.0
 QUALITY_TO_RESOLUTION: dict[QualityProfile, int] = {
@@ -86,9 +109,17 @@ MESH_QUALITY_TO_RESOLUTION: dict[QualityProfile, int] = {
     "high": 96,
     "ultra": 128,
 }
+# Hard cap for mesh-upload voxel grids. 1024^3 at float32 = 4 GB.
+# The auto-resolution logic will clamp to this value and warn the caller.
+MESH_UPLOAD_MAX_RESOLUTION = 1024
 MESH_UPLOAD_MAX_BYTES = 200 * 1024 * 1024
+AUTO_QUEUE_RESOLUTION_THRESHOLD = 128
+AUTO_QUEUE_UPLOAD_BYTES_THRESHOLD = 8 * 1024 * 1024
 
 app = FastAPI(title="SDF CAD", version="0.2.0")
+
+if not REDIS_CLIENT_AVAILABLE:
+    logger.info("Redis client not available; execution_mode='auto' will run inline.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -105,14 +136,14 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/v1/scene/compile", response_model=CompileSceneResponse)
-def compile_scene(payload: CompileSceneRequest) -> CompileSceneResponse:
+async def compile_scene(payload: CompileSceneRequest) -> CompileSceneResponse:
     source_hash = hash_source(payload.source)
     cached = scene_compile_cache.get(source_hash)
     if cached is not None:
         return CompileSceneResponse(scene_ir=cached.scene_ir, diagnostics=cached.diagnostics)
 
     try:
-        scene_ir, diagnostics = compile_source_with_diagnostics(payload.source)
+        scene_ir, diagnostics = await asyncio.to_thread(compile_source_with_diagnostics, payload.source)
     except DslError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -126,31 +157,40 @@ def _resolve_grid(grid: GridConfig | None, quality_profile: QualityProfile) -> G
     return GridConfig(resolution=QUALITY_TO_RESOLUTION[quality_profile])
 
 
-def _compute_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
-    normals = np.zeros_like(vertices, dtype=np.float64)
-    if faces.size == 0 or vertices.size == 0:
-        return normals
+def _resolve_mesh_resolution(
+    quality_profile: QualityProfile,
+    lattice_pitch: float,
+    mesh_span: float,
+    voxels_per_lattice_period: int = 6,
+) -> tuple[int, bool]:
+    """Compute the voxel resolution for a mesh upload.
 
-    for i0, i1, i2 in faces:
-        v0 = vertices[int(i0)]
-        v1 = vertices[int(i1)]
-        v2 = vertices[int(i2)]
-        n = np.cross(v1 - v0, v2 - v0)
-        normals[int(i0)] += n
-        normals[int(i1)] += n
-        normals[int(i2)] += n
+    When lattice_pitch and mesh_span are available the resolution is derived
+    from the lattice sampling requirement.  Otherwise the quality-profile
+    fallback is used.
 
-    lengths = np.linalg.norm(normals, axis=1)
-    non_zero = lengths > 1e-12
-    normals[non_zero] = normals[non_zero] / lengths[non_zero, None]
-    normals[~non_zero] = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    return normals
+    Returns:
+        (resolution, was_clamped) — was_clamped is True when the computed
+        resolution exceeded MESH_UPLOAD_MAX_RESOLUTION and was reduced.
+    """
+    needed = compute_resolution_for_lattice_pitch(
+        mesh_span, lattice_pitch, voxels_per_lattice_period
+    )
+    if needed > MESH_UPLOAD_MAX_RESOLUTION:
+        logger.warning(
+            "Computed mesh resolution %d exceeds hard cap %d; clamping. "
+            "Consider increasing lattice_pitch or reducing voxels_per_lattice_period.",
+            needed,
+            MESH_UPLOAD_MAX_RESOLUTION,
+        )
+        return MESH_UPLOAD_MAX_RESOLUTION, True
+    return needed, False
 
 
 def _meshdata_from_parsed(parsed) -> MeshData:
     vertices = np.array(parsed.vertices, dtype=np.float64, copy=True)
     faces = np.array(parsed.faces, dtype=np.int32, copy=True)
-    normals = _compute_vertex_normals(vertices, faces)
+    normals = compute_vertex_normals(vertices, faces)
     return MeshData(vertices=vertices, faces=faces, normals=normals)
 
 
@@ -233,7 +273,7 @@ def _strip_outer_surface(
     used_vertices, remap = np.unique(kept_faces.reshape(-1), return_inverse=True)
     new_vertices = mesh.vertices[used_vertices]
     new_faces = remap.reshape(-1, 3).astype(np.int32)
-    new_normals = _compute_vertex_normals(new_vertices, new_faces)
+    new_normals = compute_vertex_normals(new_vertices, new_faces)
     return MeshData(vertices=new_vertices, faces=new_faces, normals=new_normals)
 
 
@@ -274,6 +314,153 @@ def _encode_field(field: np.ndarray) -> str:
     return base64.b64encode(payload).decode("ascii")
 
 
+def _encode_mesh_payload(mesh: MeshData) -> MeshPayload:
+    vertices = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
+    faces = np.ascontiguousarray(mesh.faces, dtype=np.uint32)
+    normals = np.ascontiguousarray(mesh.normals, dtype=np.float32)
+    return MeshPayload(
+        encoding="mesh-f32-u32-base64-v1",
+        vertex_count=int(vertices.shape[0]),
+        face_count=int(faces.shape[0]),
+        vertices_b64=base64.b64encode(vertices.tobytes()).decode("ascii"),
+        indices_b64=base64.b64encode(faces.tobytes()).decode("ascii"),
+        normals_b64=base64.b64encode(normals.tobytes()).decode("ascii"),
+    )
+
+
+def _should_queue_scene_job(grid: GridConfig, execution_mode: ExecutionMode) -> bool:
+    if execution_mode == "queued":
+        return True
+    if execution_mode == "inline":
+        return False
+    if not REDIS_CLIENT_AVAILABLE:
+        return False
+    return int(grid.resolution) >= AUTO_QUEUE_RESOLUTION_THRESHOLD
+
+
+def _should_queue_upload_job(file_size: int, quality_profile: QualityProfile, execution_mode: ExecutionMode) -> bool:
+    if execution_mode == "queued":
+        return True
+    if execution_mode == "inline":
+        return False
+    if not REDIS_CLIENT_AVAILABLE:
+        return False
+    return file_size >= AUTO_QUEUE_UPLOAD_BYTES_THRESHOLD or quality_profile in {"high", "ultra"}
+
+
+def _celery_state_to_status(state: str) -> Literal["queued", "running", "succeeded", "failed"]:
+    if state == "SUCCESS":
+        return "succeeded"
+    if state == "STARTED":
+        return "running"
+    if state in {"FAILURE", "REVOKED"}:
+        return "failed"
+    return "queued"
+
+
+def _job_response(task_id: str) -> JobAcceptedResponse:
+    return JobAcceptedResponse(
+        job_id=task_id,
+        status="queued",
+        status_url=f"/api/v1/jobs/{task_id}",
+        result_url=f"/api/v1/jobs/{task_id}/result",
+    )
+
+
+def _enqueue_preview_mesh_job(payload: PreviewMeshRequest) -> JobAcceptedResponse:
+    from .worker_tasks import preview_mesh_job
+
+    try:
+        task = preview_mesh_job.delay(payload.model_dump(mode="json"))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}") from exc
+    return _job_response(task.id)
+
+
+def _enqueue_export_mesh_job(payload: ExportMeshRequest) -> JobAcceptedResponse:
+    from .worker_tasks import export_mesh_job
+
+    try:
+        task = export_mesh_job.delay(payload.model_dump(mode="json"))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}") from exc
+    return _job_response(task.id)
+
+
+def _enqueue_uploaded_preview_job(
+    *,
+    file_bytes: bytes,
+    extension: str,
+    shell_thickness: float,
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"],
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+    quality_profile: QualityProfile,
+    compute_backend: ComputeBackend,
+    mesh_backend: MeshBackend,
+    meshing_mode: MeshingMode,
+) -> JobAcceptedResponse:
+    from .worker_tasks import preview_uploaded_mesh_job
+
+    payload = {
+        "file_data_b64": base64.b64encode(file_bytes).decode("ascii"),
+        "extension": extension,
+        "shell_thickness": shell_thickness,
+        "lattice_type": lattice_type,
+        "lattice_pitch": lattice_pitch,
+        "lattice_thickness": lattice_thickness,
+        "lattice_phase": lattice_phase,
+        "quality_profile": quality_profile,
+        "compute_backend": compute_backend,
+        "mesh_backend": mesh_backend,
+        "meshing_mode": meshing_mode,
+    }
+    try:
+        task = preview_uploaded_mesh_job.delay(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}") from exc
+    return _job_response(task.id)
+
+
+def _enqueue_uploaded_export_job(
+    *,
+    file_bytes: bytes,
+    extension: str,
+    shell_thickness: float,
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"],
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+    quality_profile: QualityProfile,
+    compute_backend: ComputeBackend,
+    mesh_backend: MeshBackend,
+    meshing_mode: MeshingMode,
+    format: Literal["stl", "obj"],
+) -> JobAcceptedResponse:
+    from .worker_tasks import export_uploaded_mesh_job
+
+    payload = {
+        "file_data_b64": base64.b64encode(file_bytes).decode("ascii"),
+        "extension": extension,
+        "shell_thickness": shell_thickness,
+        "lattice_type": lattice_type,
+        "lattice_pitch": lattice_pitch,
+        "lattice_thickness": lattice_thickness,
+        "lattice_phase": lattice_phase,
+        "quality_profile": quality_profile,
+        "compute_backend": compute_backend,
+        "mesh_backend": mesh_backend,
+        "meshing_mode": meshing_mode,
+        "format": format,
+    }
+    try:
+        task = export_uploaded_mesh_job.delay(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}") from exc
+    return _job_response(task.id)
+
+
 def _run_preview(
     scene_ir,
     param_values: dict[str, float],
@@ -283,6 +470,27 @@ def _run_preview(
     mesh_backend: MeshBackend = "auto",
     meshing_mode: MeshingMode = "uniform",
 ) -> PreviewMeshResponse:
+    mesh, stats, mesh_payload = _run_preview_meshdata(
+        scene_ir,
+        param_values,
+        grid,
+        compute_precision=compute_precision,
+        compute_backend=compute_backend,
+        mesh_backend=mesh_backend,
+        meshing_mode=meshing_mode,
+    )
+    return PreviewMeshResponse(mesh=mesh_payload, stats=stats)
+
+
+def _run_preview_meshdata(
+    scene_ir,
+    param_values: dict[str, float],
+    grid: GridConfig,
+    compute_precision: ComputePrecision = "float32",
+    compute_backend: ComputeBackend = "auto",
+    mesh_backend: MeshBackend = "auto",
+    meshing_mode: MeshingMode = "uniform",
+) -> tuple[MeshData, PreviewStats, MeshPayload]:
     ensure_scene_valid(scene_ir)
     merged_params = merge_parameter_values(scene_ir, param_values)
 
@@ -308,13 +516,14 @@ def _run_preview(
     if cached_mesh is not None:
         cached_stats = copy.deepcopy(cached_mesh.stats)
         cached_stats["cache_hit"] = True
-        return PreviewMeshResponse(
-            mesh={
-                "vertices": cached_mesh.vertices,
-                "indices": cached_mesh.indices,
-                "normals": cached_mesh.normals,
-            },
-            stats=cached_stats,
+        return (
+            MeshData(
+                vertices=np.array(cached_mesh.vertices, dtype=np.float64, copy=True),
+                faces=np.array(cached_mesh.faces, dtype=np.int32, copy=True),
+                normals=np.array(cached_mesh.normals, dtype=np.float64, copy=True),
+            ),
+            PreviewStats.model_validate(cached_stats),
+            cached_mesh.mesh,
         )
 
     eval_start = time.perf_counter()
@@ -348,9 +557,6 @@ def _run_preview(
     )
     mesh_ms = (time.perf_counter() - mesh_start) * 1000.0
 
-    vertices = mesh.vertices.tolist()
-    indices = mesh.faces.tolist()
-    normals = mesh.normals.tolist()
     stats = PreviewStats(
         eval_ms=eval_ms,
         mesh_ms=mesh_ms,
@@ -362,20 +568,19 @@ def _run_preview(
         preview_mode="mesh",
     )
 
+    mesh_payload = _encode_mesh_payload(mesh)
     mesh_preview_cache.set(
         cache_key,
         MeshCacheEntry(
-            vertices=vertices,
-            indices=indices,
-            normals=normals,
+            mesh=mesh_payload,
+            vertices=np.array(mesh.vertices, dtype=np.float64, copy=True),
+            faces=np.array(mesh.faces, dtype=np.int32, copy=True),
+            normals=np.array(mesh.normals, dtype=np.float64, copy=True),
             stats=stats.model_dump(),
         ),
     )
 
-    return PreviewMeshResponse(
-        mesh={"vertices": vertices, "indices": indices, "normals": normals},
-        stats=stats,
-    )
+    return mesh, stats, mesh_payload
 
 
 def _run_field_preview(
@@ -429,6 +634,22 @@ def _run_field_preview(
     return PreviewFieldResponse(field=payload, stats=stats)
 
 
+def _stream_file_chunks(path: Path, chunk_size: int = 1024 * 1024, delete_after: bool = False):
+    try:
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+    finally:
+        if delete_after:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 async def _read_uploaded_mesh(file: UploadFile) -> tuple[bytes, str]:
     extension = Path(file.filename or "").suffix.lower()
     if extension not in {".stl", ".obj"}:
@@ -449,12 +670,12 @@ def _resolve_uploaded_host_field(
     *,
     file_bytes: bytes,
     extension: str,
-    quality_profile: QualityProfile,
+    resolution: int,
 ) -> tuple[ParsedMesh, list[list[float]], np.ndarray]:
     host_key = hash_uploaded_mesh_host_request(
         file_bytes=file_bytes,
         extension=extension,
-        quality_profile=quality_profile,
+        quality_profile=f"res_{resolution}",  # use resolution as cache key discriminator
     )
     cached = uploaded_host_field_cache.get(host_key)
     if cached is not None:
@@ -467,7 +688,6 @@ def _resolve_uploaded_host_field(
 
     parsed = parse_mesh_bytes(file_bytes, extension)
     validate_triangle_mesh(parsed)
-    resolution = MESH_QUALITY_TO_RESOLUTION[quality_profile]
     host = build_host_field(parsed, resolution=resolution)
 
     uploaded_host_field_cache.set(
@@ -482,6 +702,24 @@ def _resolve_uploaded_host_field(
     return parsed, host.bounds, host.host_sdf
 
 
+def _compute_mesh_upload_resolution(
+    file_bytes: bytes,
+    extension: str,
+    lattice_pitch: float,
+    quality_profile: QualityProfile,
+    voxels_per_lattice_period: int,
+) -> int:
+    """Parse the mesh to get its span, then compute the required voxel resolution."""
+    parsed = parse_mesh_bytes(file_bytes, extension)
+    validate_triangle_mesh(parsed)
+    extents = np.ptp(parsed.vertices, axis=0)
+    mesh_span = float(np.max(extents))
+    resolution, _ = _resolve_mesh_resolution(
+        quality_profile, lattice_pitch, mesh_span, voxels_per_lattice_period
+    )
+    return resolution
+
+
 def _run_uploaded_mesh_preview(
     *,
     file_bytes: bytes,
@@ -492,11 +730,12 @@ def _run_uploaded_mesh_preview(
     lattice_thickness: float,
     lattice_phase: float,
     quality_profile: QualityProfile,
+    voxels_per_lattice_period: int = 6,
     compute_backend: ComputeBackend = "auto",
     mesh_backend: MeshBackend = "auto",
     meshing_mode: MeshingMode = "uniform",
 ) -> PreviewMeshResponse:
-    cache_key = hash_uploaded_mesh_request(
+    _, stats, field_payload, mesh_payload = _run_uploaded_mesh_preview_meshdata(
         file_bytes=file_bytes,
         extension=extension,
         shell_thickness=shell_thickness,
@@ -505,6 +744,90 @@ def _run_uploaded_mesh_preview(
         lattice_thickness=lattice_thickness,
         lattice_phase=lattice_phase,
         quality_profile=quality_profile,
+        voxels_per_lattice_period=voxels_per_lattice_period,
+        compute_backend=compute_backend,
+        mesh_backend=mesh_backend,
+        meshing_mode=meshing_mode,
+    )
+    return PreviewMeshResponse(mesh=mesh_payload, stats=stats, field=field_payload)
+
+
+def _run_uploaded_mesh_field_preview(
+    *,
+    file_bytes: bytes,
+    extension: str,
+    shell_thickness: float,
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"],
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+    quality_profile: QualityProfile,
+    voxels_per_lattice_period: int = 6,
+    compute_backend: ComputeBackend = "auto",
+) -> PreviewFieldResponse:
+    eval_start = time.perf_counter()
+    resolution = _compute_mesh_upload_resolution(
+        file_bytes, extension, lattice_pitch, quality_profile, voxels_per_lattice_period
+    )
+    _, bounds, host_sdf = _resolve_uploaded_host_field(
+        file_bytes=file_bytes,
+        extension=extension,
+        resolution=resolution,
+    )
+    field, eval_backend_used = compose_hollow_lattice_field_with_backend(
+        host_sdf,
+        bounds,
+        shell_thickness=shell_thickness,
+        lattice_type=lattice_type,
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+        compute_backend=compute_backend,
+    )
+    eval_ms = (time.perf_counter() - eval_start) * 1000.0
+    field_payload = FieldPayload(
+        encoding="f32-base64",
+        resolution=int(field.shape[0]),
+        bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
+        data=_encode_field(field),
+    )
+    stats = PreviewStats(
+        eval_ms=eval_ms,
+        mesh_ms=None,
+        tri_count=0,
+        voxel_count=int(field.size),
+        cache_hit=False,
+        compute_backend=eval_backend_used,
+        mesh_backend="cpu",
+        preview_mode="field",
+    )
+    return PreviewFieldResponse(field=field_payload, stats=stats)
+
+
+def _run_uploaded_mesh_preview_meshdata(
+    *,
+    file_bytes: bytes,
+    extension: str,
+    shell_thickness: float,
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"],
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+    quality_profile: QualityProfile,
+    voxels_per_lattice_period: int = 6,
+    compute_backend: ComputeBackend = "auto",
+    mesh_backend: MeshBackend = "auto",
+    meshing_mode: MeshingMode = "uniform",
+) -> tuple[MeshData, PreviewStats, FieldPayload, MeshPayload]:
+    cache_key = hash_uploaded_mesh_request(
+        file_bytes=file_bytes,
+        extension=extension,
+        shell_thickness=shell_thickness,
+        lattice_type=lattice_type,
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+        quality_profile=f"{quality_profile}_vpp{voxels_per_lattice_period}",
         compute_backend=compute_backend,
         mesh_backend=mesh_backend,
         meshing_mode=meshing_mode,
@@ -534,22 +857,29 @@ def _run_uploaded_mesh_preview(
                 bounds=[[float(axis[0]), float(axis[1])] for axis in cached_mesh.field_bounds],
                 data=cached_mesh.field_data,
             )
-        return PreviewMeshResponse(
-            mesh={
-                "vertices": cached_mesh.vertices,
-                "indices": cached_mesh.indices,
-                "normals": cached_mesh.normals,
-            },
-            stats=cached_stats,
-            field=cached_field,
+        if cached_field is None:
+            raise HTTPException(status_code=500, detail="Cached mesh entry is missing field payload")
+        return (
+            MeshData(
+                vertices=np.array(cached_mesh.vertices, dtype=np.float64, copy=True),
+                faces=np.array(cached_mesh.faces, dtype=np.int32, copy=True),
+                normals=np.array(cached_mesh.normals, dtype=np.float64, copy=True),
+            ),
+            PreviewStats.model_validate(cached_stats),
+            cached_field,
+            cached_mesh.mesh,
         )
 
     eval_start = time.perf_counter()
     host_start = time.perf_counter()
+    # Compute resolution from lattice pitch and mesh geometry.
+    resolution = _compute_mesh_upload_resolution(
+        file_bytes, extension, lattice_pitch, quality_profile, voxels_per_lattice_period
+    )
     parsed, bounds, host_sdf = _resolve_uploaded_host_field(
         file_bytes=file_bytes,
         extension=extension,
-        quality_profile=quality_profile,
+        resolution=resolution,
     )
     host_ms = (time.perf_counter() - host_start) * 1000.0
     compose_start = time.perf_counter()
@@ -591,9 +921,6 @@ def _run_uploaded_mesh_preview(
         mesh_ms,
     )
 
-    vertices = mesh.vertices.tolist()
-    indices = mesh.faces.tolist()
-    normals = mesh.normals.tolist()
     field_payload = FieldPayload(
         encoding="f32-base64",
         resolution=int(field.shape[0]),
@@ -610,94 +937,220 @@ def _run_uploaded_mesh_preview(
         preview_mode="mesh",
     )
 
+    mesh_payload = _encode_mesh_payload(mesh)
     uploaded_mesh_preview_cache.set(
         cache_key,
         UploadedMeshCacheEntry(
-            vertices=vertices,
-            indices=indices,
-            normals=normals,
+            mesh=mesh_payload,
+            vertices=np.array(mesh.vertices, dtype=np.float64, copy=True),
+            faces=np.array(mesh.faces, dtype=np.int32, copy=True),
+            normals=np.array(mesh.normals, dtype=np.float64, copy=True),
             stats=stats.model_dump(),
             field_resolution=int(field_payload.resolution),
             field_bounds=[[float(axis[0]), float(axis[1])] for axis in field_payload.bounds],
             field_data=field_payload.data,
         ),
     )
-    return PreviewMeshResponse(
-        mesh={"vertices": vertices, "indices": indices, "normals": normals},
-        stats=stats,
-        field=field_payload,
-    )
+    return mesh, stats, field_payload, mesh_payload
 
 
-@app.post("/api/v1/preview/mesh", response_model=PreviewMeshResponse)
-def preview_mesh(payload: PreviewMeshRequest) -> PreviewMeshResponse:
+@app.post("/api/v1/preview/mesh", response_model=PreviewMeshResponse | JobAcceptedResponse)
+async def preview_mesh(payload: PreviewMeshRequest) -> PreviewMeshResponse | JobAcceptedResponse:
     grid = _resolve_grid(payload.grid, payload.quality_profile)
+    if _should_queue_scene_job(grid, payload.execution_mode):
+        try:
+            return _enqueue_preview_mesh_job(payload)
+        except HTTPException as exc:
+            if payload.execution_mode == "queued" or exc.status_code != 503:
+                raise
+            logger.warning("Queue unavailable for preview_mesh auto mode; falling back inline: %s", exc.detail)
     try:
-        return _run_preview(
+        result = await asyncio.to_thread(
+            _run_preview,
             payload.scene_ir,
             payload.parameter_values,
             grid,
-            compute_precision=payload.compute_precision,
-            compute_backend=payload.compute_backend,
-            mesh_backend=payload.mesh_backend,
-            meshing_mode=payload.meshing_mode,
+            payload.compute_precision,
+            payload.compute_backend,
+            payload.mesh_backend,
+            payload.meshing_mode,
         )
+        return result
     except (DslError, EvaluationError, MeshingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        cleanup_gpu_memory(reason="preview_mesh_inline")
 
 
 @app.post("/api/v1/preview/field", response_model=PreviewFieldResponse)
-def preview_field(payload: PreviewFieldRequest) -> PreviewFieldResponse:
+async def preview_field(payload: PreviewFieldRequest) -> PreviewFieldResponse:
     grid = _resolve_grid(payload.grid, payload.quality_profile)
     try:
-        return _run_field_preview(
+        return await asyncio.to_thread(
+            _run_field_preview,
             payload.scene_ir,
             payload.parameter_values,
             grid,
-            compute_precision=payload.compute_precision,
-            compute_backend=payload.compute_backend,
+            payload.compute_precision,
+            payload.compute_backend,
+        )
+    except (DslError, EvaluationError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        cleanup_gpu_memory(reason="preview_field_inline")
+
+
+@app.post("/api/v1/preview/program", response_model=PreviewProgramResponse)
+async def preview_program(payload: PreviewProgramRequest) -> PreviewProgramResponse:
+    grid = _resolve_grid(payload.grid, payload.quality_profile)
+    try:
+        ensure_scene_valid(payload.scene_ir)
+        merged_params = merge_parameter_values(payload.scene_ir, payload.parameter_values)
+        program, fallback_reason, compile_ms = await asyncio.to_thread(
+            compile_scene_program,
+            payload.scene_ir,
+            merged_params,
+            grid,
+            payload.quality_profile,
+        )
+        if program is None:
+            return PreviewProgramResponse(
+                program=None,
+                capabilities=ProgramCapabilities(analytic_supported=False, fallback_reason=fallback_reason),
+                stats=PreviewStats(
+                    eval_ms=0.0,
+                    mesh_ms=None,
+                    tri_count=0,
+                    voxel_count=None,
+                    cache_hit=False,
+                    preview_mode="analytic_raymarch",
+                    compile_ms=compile_ms,
+                    program_bytes=0,
+                    gpu_eval_mode="webgl2",
+                    fallback_reason=fallback_reason,
+                ),
+            )
+
+        program_bytes = len(program.glsl_sdf.encode("utf-8"))
+        return PreviewProgramResponse(
+            program=program,
+            capabilities=ProgramCapabilities(analytic_supported=True, fallback_reason=None),
+            stats=PreviewStats(
+                eval_ms=0.0,
+                mesh_ms=None,
+                tri_count=0,
+                voxel_count=None,
+                cache_hit=False,
+                preview_mode="analytic_raymarch",
+                compile_ms=compile_ms,
+                program_bytes=program_bytes,
+                gpu_eval_mode="webgl2",
+                fallback_reason=None,
+            ),
         )
     except (DslError, EvaluationError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/v1/export")
-def export_mesh(payload: ExportMeshRequest) -> Response:
+@app.post("/api/v1/export", response_model=None)
+async def export_mesh(payload: ExportMeshRequest) -> Response | JobAcceptedResponse:
     grid = _resolve_grid(payload.grid, payload.quality_profile)
+    if _should_queue_scene_job(grid, payload.execution_mode):
+        try:
+            return _enqueue_export_mesh_job(payload)
+        except HTTPException as exc:
+            if payload.execution_mode == "queued" or exc.status_code != 503:
+                raise
+            logger.warning("Queue unavailable for export_mesh auto mode; falling back inline: %s", exc.detail)
 
     try:
-        preview = _run_preview(
+        mesh, _, _ = await asyncio.to_thread(
+            _run_preview_meshdata,
             payload.scene_ir,
             payload.parameter_values,
             grid,
-            compute_precision=payload.compute_precision,
-            compute_backend=payload.compute_backend,
-            mesh_backend=payload.mesh_backend,
-            meshing_mode=payload.meshing_mode,
+            payload.compute_precision,
+            payload.compute_backend,
+            payload.mesh_backend,
+            payload.meshing_mode,
         )
     except (DslError, EvaluationError, MeshingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    mesh = MeshData(
-        vertices=np.array(preview.mesh.vertices, dtype=np.float64),
-        faces=np.array(preview.mesh.indices, dtype=np.int32),
-        normals=np.array(preview.mesh.normals, dtype=np.float64),
-    )
+    finally:
+        cleanup_gpu_memory(reason="export_mesh_inline")
 
     if payload.format == "stl":
-        content = mesh_to_stl(mesh)
         media_type = "model/stl"
         filename = "model.stl"
+        body = iter_stl_chunks(mesh)
     else:
-        content = mesh_to_obj(mesh)
         media_type = "text/plain"
         filename = "model.obj"
+        body = iter_obj_chunks(mesh)
 
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return Response(content=content, media_type=media_type, headers=headers)
+    return StreamingResponse(body, media_type=media_type, headers=headers)
 
 
-@app.post("/api/v1/mesh/preview", response_model=PreviewMeshResponse)
+@app.post("/api/v1/jobs/preview-mesh", response_model=JobAcceptedResponse)
+async def submit_preview_mesh_job(payload: PreviewMeshRequest) -> JobAcceptedResponse:
+    return _enqueue_preview_mesh_job(payload)
+
+
+@app.post("/api/v1/jobs/export", response_model=JobAcceptedResponse)
+async def submit_export_job(payload: ExportMeshRequest) -> JobAcceptedResponse:
+    return _enqueue_export_mesh_job(payload)
+
+
+@app.get("/api/v1/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str) -> JobStatusResponse:
+    from .worker import celery_app
+
+    result = AsyncResult(job_id, app=celery_app)
+    status = _celery_state_to_status(result.state)
+    task_name = str(getattr(result, "name", "") or "unknown")
+    detail = None
+    if status == "failed" and result.result is not None:
+        detail = str(result.result)
+    return JobStatusResponse(job_id=job_id, status=status, task_name=task_name, detail=detail)
+
+
+@app.get("/api/v1/jobs/{job_id}/result")
+async def get_job_result(job_id: str) -> Response:
+    from .worker import celery_app
+
+    result = AsyncResult(job_id, app=celery_app)
+    status = _celery_state_to_status(result.state)
+    if status in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail="Job is not completed yet")
+    if status == "failed":
+        raise HTTPException(status_code=400, detail=str(result.result))
+    payload = result.result
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=500, detail="Unexpected job result payload")
+
+    kind = str(payload.get("kind", ""))
+    if kind in {"preview_mesh", "preview_uploaded_mesh"}:
+        return Response(
+            content=PreviewMeshResponse.model_validate(payload["payload"]).model_dump_json(),
+            media_type="application/json",
+        )
+    if kind in {"export_mesh", "export_uploaded_mesh"}:
+        file_path = Path(str(payload.get("file_path", "")))
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="Export artifact no longer available")
+        media_type = str(payload.get("media_type", "application/octet-stream"))
+        filename = str(payload.get("filename", "artifact.bin"))
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return StreamingResponse(
+            _stream_file_chunks(file_path, delete_after=True),
+            media_type=media_type,
+            headers=headers,
+        )
+    raise HTTPException(status_code=500, detail="Unsupported job result kind")
+
+
+@app.post("/api/v1/mesh/preview", response_model=PreviewMeshResponse | JobAcceptedResponse)
 async def preview_uploaded_mesh(
     file: UploadFile = File(...),
     shell_thickness: float = Form(...),
@@ -706,13 +1159,38 @@ async def preview_uploaded_mesh(
     lattice_thickness: float = Form(...),
     lattice_phase: float = Form(0.0),
     quality_profile: QualityProfile = Form("medium"),
+    voxels_per_lattice_period: int = Form(6),
     compute_backend: ComputeBackend = Form("auto"),
     mesh_backend: MeshBackend = Form("auto"),
     meshing_mode: MeshingMode = Form("uniform"),
-) -> PreviewMeshResponse:
+    execution_mode: ExecutionMode = Form("auto"),
+) -> PreviewMeshResponse | JobAcceptedResponse:
     file_bytes, extension = await _read_uploaded_mesh(file)
+    if _should_queue_upload_job(len(file_bytes), quality_profile, execution_mode):
+        try:
+            return _enqueue_uploaded_preview_job(
+                file_bytes=file_bytes,
+                extension=extension,
+                shell_thickness=shell_thickness,
+                lattice_type=lattice_type,
+                lattice_pitch=lattice_pitch,
+                lattice_thickness=lattice_thickness,
+                lattice_phase=lattice_phase,
+                quality_profile=quality_profile,
+                compute_backend=compute_backend,
+                mesh_backend=mesh_backend,
+                meshing_mode=meshing_mode,
+            )
+        except HTTPException as exc:
+            if execution_mode == "queued" or exc.status_code != 503:
+                raise
+            logger.warning(
+                "Queue unavailable for preview_uploaded_mesh auto mode; falling back inline: %s",
+                exc.detail,
+            )
     try:
-        return _run_uploaded_mesh_preview(
+        result = await asyncio.to_thread(
+            _run_uploaded_mesh_preview,
             file_bytes=file_bytes,
             extension=extension,
             shell_thickness=shell_thickness,
@@ -721,15 +1199,53 @@ async def preview_uploaded_mesh(
             lattice_thickness=lattice_thickness,
             lattice_phase=lattice_phase,
             quality_profile=quality_profile,
+            voxels_per_lattice_period=voxels_per_lattice_period,
             compute_backend=compute_backend,
             mesh_backend=mesh_backend,
             meshing_mode=meshing_mode,
         )
+        return result
     except (MeshUploadError, MeshingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        cleanup_gpu_memory(reason="preview_uploaded_mesh_inline")
 
 
-@app.post("/api/v1/mesh/export")
+@app.post("/api/v1/mesh/field", response_model=PreviewFieldResponse)
+async def preview_uploaded_mesh_field(
+    file: UploadFile = File(...),
+    shell_thickness: float = Form(...),
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"] = Form(...),
+    lattice_pitch: float = Form(...),
+    lattice_thickness: float = Form(...),
+    lattice_phase: float = Form(0.0),
+    quality_profile: QualityProfile = Form("medium"),
+    voxels_per_lattice_period: int = Form(6),
+    compute_backend: ComputeBackend = Form("auto"),
+) -> PreviewFieldResponse:
+    file_bytes, extension = await _read_uploaded_mesh(file)
+    try:
+        result = await asyncio.to_thread(
+            _run_uploaded_mesh_field_preview,
+            file_bytes=file_bytes,
+            extension=extension,
+            shell_thickness=shell_thickness,
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+            quality_profile=quality_profile,
+            voxels_per_lattice_period=voxels_per_lattice_period,
+            compute_backend=compute_backend,
+        )
+        return result
+    except (MeshUploadError, MeshingError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        cleanup_gpu_memory(reason="preview_uploaded_mesh_field_inline")
+
+
+@app.post("/api/v1/mesh/export", response_model=None)
 async def export_uploaded_mesh(
     file: UploadFile = File(...),
     shell_thickness: float = Form(...),
@@ -738,14 +1254,40 @@ async def export_uploaded_mesh(
     lattice_thickness: float = Form(...),
     lattice_phase: float = Form(0.0),
     quality_profile: QualityProfile = Form("high"),
+    voxels_per_lattice_period: int = Form(6),
     compute_backend: ComputeBackend = Form("auto"),
     mesh_backend: MeshBackend = Form("auto"),
     meshing_mode: MeshingMode = Form("uniform"),
     format: Literal["stl", "obj"] = Form("stl"),
-) -> Response:
+    execution_mode: ExecutionMode = Form("auto"),
+) -> Response | JobAcceptedResponse:
     file_bytes, extension = await _read_uploaded_mesh(file)
+    if _should_queue_upload_job(len(file_bytes), quality_profile, execution_mode):
+        try:
+            return _enqueue_uploaded_export_job(
+                file_bytes=file_bytes,
+                extension=extension,
+                shell_thickness=shell_thickness,
+                lattice_type=lattice_type,
+                lattice_pitch=lattice_pitch,
+                lattice_thickness=lattice_thickness,
+                lattice_phase=lattice_phase,
+                quality_profile=quality_profile,
+                compute_backend=compute_backend,
+                mesh_backend=mesh_backend,
+                meshing_mode=meshing_mode,
+                format=format,
+            )
+        except HTTPException as exc:
+            if execution_mode == "queued" or exc.status_code != 503:
+                raise
+            logger.warning(
+                "Queue unavailable for export_uploaded_mesh auto mode; falling back inline: %s",
+                exc.detail,
+            )
     try:
-        preview = _run_uploaded_mesh_preview(
+        mesh, _, _, _ = await asyncio.to_thread(
+            _run_uploaded_mesh_preview_meshdata,
             file_bytes=file_bytes,
             extension=extension,
             shell_thickness=shell_thickness,
@@ -754,29 +1296,242 @@ async def export_uploaded_mesh(
             lattice_thickness=lattice_thickness,
             lattice_phase=lattice_phase,
             quality_profile=quality_profile,
+            voxels_per_lattice_period=voxels_per_lattice_period,
             compute_backend=compute_backend,
             mesh_backend=mesh_backend,
             meshing_mode=meshing_mode,
         )
     except (MeshUploadError, MeshingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    mesh = MeshData(
-        vertices=np.array(preview.mesh.vertices, dtype=np.float64),
-        faces=np.array(preview.mesh.indices, dtype=np.int32),
-        normals=np.array(preview.mesh.normals, dtype=np.float64),
-    )
+    finally:
+        cleanup_gpu_memory(reason="export_uploaded_mesh_inline")
 
     if format == "stl":
-        content = mesh_to_stl(mesh)
         media_type = "model/stl"
         filename = "mesh-lattice.stl"
+        body = iter_stl_chunks(mesh)
     else:
-        content = mesh_to_obj(mesh)
         media_type = "text/plain"
         filename = "mesh-lattice.obj"
+        body = iter_obj_chunks(mesh)
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return Response(content=content, media_type=media_type, headers=headers)
+    return StreamingResponse(body, media_type=media_type, headers=headers)
+
+
+@app.websocket("/api/v1/mesh/preview/ws")
+async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
+    await websocket.accept()
+    try:
+        raw_payload = await websocket.receive_json()
+        try:
+            payload = UploadedMeshPreviewWsRequest.model_validate(raw_payload)
+            extension = Path(payload.file_name or "").suffix.lower()
+            if extension not in {".stl", ".obj"}:
+                raise MeshUploadError("Only .stl and .obj uploads are supported")
+            try:
+                file_bytes = base64.b64decode(payload.file_data_base64, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise MeshUploadError("Uploaded mesh payload is not valid base64") from exc
+            if not file_bytes:
+                raise MeshUploadError("Uploaded mesh file is empty")
+            if len(file_bytes) > MESH_UPLOAD_MAX_BYTES:
+                raise MeshUploadError(
+                    f"Uploaded file exceeds the {MESH_UPLOAD_MAX_BYTES // (1024 * 1024)} MB limit"
+                )
+
+            voxels_per_lattice_period: int = getattr(payload, "voxels_per_lattice_period", 6)
+            cache_key = hash_uploaded_mesh_request(
+                file_bytes=file_bytes,
+                extension=extension,
+                shell_thickness=payload.shell_thickness,
+                lattice_type=payload.lattice_type,
+                lattice_pitch=payload.lattice_pitch,
+                lattice_thickness=payload.lattice_thickness,
+                lattice_phase=payload.lattice_phase,
+                quality_profile=f"{payload.quality_profile}_vpp{voxels_per_lattice_period}",
+                compute_backend=payload.compute_backend,
+                mesh_backend=payload.mesh_backend,
+                meshing_mode=payload.meshing_mode,
+            )
+            cached_mesh = uploaded_mesh_preview_cache.get(cache_key)
+            if (
+                cached_mesh is not None
+                and payload.mesh_backend != "cpu"
+                and str(cached_mesh.stats.get("mesh_backend", "cpu")) == "cpu"
+                and is_cuda_meshing_available()
+            ):
+                cached_mesh = None
+
+            if cached_mesh is not None:
+                cached_stats = copy.deepcopy(cached_mesh.stats)
+                cached_stats["cache_hit"] = True
+                if (
+                    cached_mesh.field_resolution is not None
+                    and cached_mesh.field_bounds is not None
+                    and cached_mesh.field_data is not None
+                ):
+                    cached_field = FieldPayload(
+                        encoding="f32-base64",
+                        resolution=int(cached_mesh.field_resolution),
+                        bounds=[[float(axis[0]), float(axis[1])] for axis in cached_mesh.field_bounds],
+                        data=cached_mesh.field_data,
+                    )
+                    await websocket.send_json(
+                        UploadedMeshPreviewWsResponse(
+                            phase="field",
+                            field=cached_field,
+                            stats=PreviewStats(
+                                eval_ms=float(cached_stats.get("eval_ms", 0.0)),
+                                mesh_ms=None,
+                                tri_count=0,
+                                voxel_count=int(cached_field.resolution**3),
+                                cache_hit=True,
+                                compute_backend=str(cached_stats.get("compute_backend", "cpu")),
+                                mesh_backend="cpu",
+                                preview_mode="field",
+                            ),
+                        ).model_dump()
+                    )
+                await websocket.send_json(
+                    UploadedMeshPreviewWsResponse(
+                        phase="mesh",
+                        mesh=cached_mesh.mesh,
+                        stats=PreviewStats.model_validate(cached_stats),
+                    ).model_dump()
+                )
+                return
+
+            # Phase 1: field evaluation — offloaded to thread pool to avoid
+            # blocking the event loop (which would starve the websocket
+            # keepalive ping and cause an AssertionError).
+            def _compute_field_phase():
+                try:
+                    eval_start = time.perf_counter()
+                    host_start = time.perf_counter()
+                    ws_resolution = _compute_mesh_upload_resolution(
+                        file_bytes,
+                        extension,
+                        payload.lattice_pitch,
+                        payload.quality_profile,
+                        voxels_per_lattice_period,
+                    )
+                    parsed, bounds, host_sdf = _resolve_uploaded_host_field(
+                        file_bytes=file_bytes,
+                        extension=extension,
+                        resolution=ws_resolution,
+                    )
+                    host_ms = (time.perf_counter() - host_start) * 1000.0
+                    compose_start = time.perf_counter()
+                    field, eval_backend_used = compose_hollow_lattice_field_with_backend(
+                        host_sdf,
+                        bounds,
+                        shell_thickness=payload.shell_thickness,
+                        lattice_type=payload.lattice_type,
+                        lattice_pitch=payload.lattice_pitch,
+                        lattice_thickness=payload.lattice_thickness,
+                        lattice_phase=payload.lattice_phase,
+                        compute_backend=payload.compute_backend,
+                    )
+                    compose_ms = (time.perf_counter() - compose_start) * 1000.0
+                    eval_ms = (time.perf_counter() - eval_start) * 1000.0
+                    field_payload = FieldPayload(
+                        encoding="f32-base64",
+                        resolution=int(field.shape[0]),
+                        bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
+                        data=_encode_field(field),
+                    )
+                    logger.debug(
+                        "mesh_upload field_phase host_ms=%.2f compose_ms=%.2f eval_ms=%.2f",
+                        host_ms, compose_ms, eval_ms,
+                    )
+                    return parsed, bounds, host_sdf, field, eval_backend_used, eval_ms, field_payload
+                finally:
+                    cleanup_gpu_memory(reason="uploaded_mesh_ws_field_phase")
+
+            parsed, bounds, host_sdf, field, eval_backend_used, eval_ms, field_payload = (
+                await asyncio.to_thread(_compute_field_phase)
+            )
+
+            field_stats = PreviewStats(
+                eval_ms=eval_ms,
+                mesh_ms=None,
+                tri_count=0,
+                voxel_count=int(field.size),
+                cache_hit=False,
+                compute_backend=eval_backend_used,
+                mesh_backend="cpu",
+                preview_mode="field",
+            )
+            await websocket.send_json(
+                UploadedMeshPreviewWsResponse(
+                    phase="field",
+                    field=field_payload,
+                    stats=field_stats,
+                ).model_dump()
+            )
+
+            # Phase 2: meshing — also offloaded to thread pool.
+            def _compute_mesh_phase():
+                try:
+                    mesh_start = time.perf_counter()
+                    generated, mesh_backend_used = build_mesh_with_backend(
+                        field,
+                        bounds,
+                        backend=payload.mesh_backend,
+                        meshing_mode=payload.meshing_mode,
+                    )
+                    interior = _strip_outer_surface(generated, host_sdf, bounds)
+                    outer = _meshdata_from_parsed(parsed)
+                    mesh = _merge_meshes(outer, interior)
+                    mesh_ms = (time.perf_counter() - mesh_start) * 1000.0
+                    mesh_payload = _encode_mesh_payload(mesh)
+                    tri_count = int(mesh.faces.shape[0])
+                    logger.debug("mesh_upload mesh_phase mesh_ms=%.2f tri_count=%d", mesh_ms, tri_count)
+                    return mesh_payload, mesh, mesh_ms, mesh_backend_used, tri_count
+                finally:
+                    cleanup_gpu_memory(reason="uploaded_mesh_ws_mesh_phase")
+
+            mesh_payload, mesh_np, mesh_ms, mesh_backend_used, tri_count = (
+                await asyncio.to_thread(_compute_mesh_phase)
+            )
+
+            stats = PreviewStats(
+                eval_ms=eval_ms,
+                mesh_ms=mesh_ms,
+                tri_count=tri_count,
+                cache_hit=False,
+                compute_backend=eval_backend_used,
+                mesh_backend=mesh_backend_used,
+                preview_mode="mesh",
+            )
+            uploaded_mesh_preview_cache.set(
+                cache_key,
+                UploadedMeshCacheEntry(
+                    mesh=mesh_payload,
+                    vertices=np.array(mesh_np.vertices, dtype=np.float64, copy=True),
+                    faces=np.array(mesh_np.faces, dtype=np.int32, copy=True),
+                    normals=np.array(mesh_np.normals, dtype=np.float64, copy=True),
+                    stats=stats.model_dump(),
+                    field_resolution=int(field_payload.resolution),
+                    field_bounds=[[float(axis[0]), float(axis[1])] for axis in field_payload.bounds],
+                    field_data=field_payload.data,
+                ),
+            )
+            await websocket.send_json(
+                UploadedMeshPreviewWsResponse(
+                    phase="mesh",
+                    mesh=mesh_payload,
+                    stats=stats,
+                ).model_dump()
+            )
+            return
+        except Exception as exc:
+            await websocket.send_json(
+                UploadedMeshPreviewWsResponse(phase="error", error=str(exc)).model_dump()
+            )
+            return
+    except WebSocketDisconnect:
+        return
 
 
 @app.websocket("/api/v1/preview")
@@ -797,7 +1552,8 @@ async def preview_ws(websocket: WebSocket) -> None:
                 coarse_grid = GridConfig(bounds=bounds, resolution=coarse_res)
                 fine_grid = GridConfig(bounds=bounds, resolution=fine_res)
 
-                coarse_preview = _run_preview(
+                coarse_preview = await asyncio.to_thread(
+                    _run_preview,
                     payload.scene_ir,
                     payload.parameter_values,
                     coarse_grid,
@@ -806,6 +1562,7 @@ async def preview_ws(websocket: WebSocket) -> None:
                     mesh_backend=payload.mesh_backend,
                     meshing_mode=payload.meshing_mode,
                 )
+                cleanup_gpu_memory(reason="preview_ws_coarse")
                 await websocket.send_json(
                     PreviewWsResponse(
                         phase="coarse", mesh=coarse_preview.mesh, stats=coarse_preview.stats
@@ -813,7 +1570,8 @@ async def preview_ws(websocket: WebSocket) -> None:
                 )
 
                 if fine_res != coarse_res:
-                    fine_preview = _run_preview(
+                    fine_preview = await asyncio.to_thread(
+                        _run_preview,
                         payload.scene_ir,
                         payload.parameter_values,
                         fine_grid,
@@ -822,6 +1580,7 @@ async def preview_ws(websocket: WebSocket) -> None:
                         mesh_backend=payload.mesh_backend,
                         meshing_mode=payload.meshing_mode,
                     )
+                    cleanup_gpu_memory(reason="preview_ws_fine")
                     await websocket.send_json(
                         PreviewWsResponse(
                             phase="fine", mesh=fine_preview.mesh, stats=fine_preview.stats

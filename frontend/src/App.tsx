@@ -7,8 +7,10 @@ import {
   exportUploadedMesh,
   previewField,
   previewMesh,
-  previewUploadedMesh
+  previewUploadedMesh,
+  previewUploadedMeshField
 } from "./lib/api";
+import { parseLocalMeshPreview } from "./lib/localMeshPreview";
 import {
   CompileDiagnostics,
   ComputeBackend,
@@ -153,6 +155,22 @@ function resolutionForQuality(profile: QualityProfile): number {
   return 256;
 }
 
+/**
+ * Compute the voxel resolution required to faithfully sample a lattice.
+ * Mirrors the backend logic in compute_resolution_for_lattice_pitch().
+ */
+function computeRequiredResolution(latticePitch: number, voxelsPerPeriod: number): number {
+  // We don't know the mesh span yet (it's only known after parsing on the backend),
+  // so we show a placeholder estimate based on a 100-unit model for display purposes.
+  // The backend will compute the exact value from the actual mesh geometry.
+  return Math.max(24, Math.ceil((100 * 1.24 / latticePitch) * voxelsPerPeriod));
+}
+
+function estimatedMemoryMB(resolution: number): number {
+  // float32 = 4 bytes per voxel, cubic grid
+  return Math.round((resolution ** 3 * 4) / (1024 * 1024));
+}
+
 export default function App() {
   const [workflow, setWorkflow] = useState<WorkflowMode>("dsl");
 
@@ -170,6 +188,8 @@ export default function App() {
   const [meshLatticePhase, setMeshLatticePhase] = useState(0.0);
   const [meshPreviewQuality, setMeshPreviewQuality] = useState<QualityProfile>("medium");
   const [meshExportQuality, setMeshExportQuality] = useState<QualityProfile>("high");
+  const [voxelsPerLatticePeriod, setVoxelsPerLatticePeriod] = useState(6);
+  const [meshCommitted, setMeshCommitted] = useState(false);
 
   const [field, setField] = useState<FieldPayload | null>(null);
   const [mesh, setMesh] = useState<MeshPayload | null>(null);
@@ -189,6 +209,7 @@ export default function App() {
   const [meshingMode, setMeshingMode] = useState<MeshingMode>("uniform");
   const [sectionEnabled, setSectionEnabled] = useState(false);
   const [sectionLevel, setSectionLevel] = useState(0);
+  const [sectionYBounds, setSectionYBounds] = useState<[number, number]>([-2, 2]);
   const [isSignatureHelpOpen, setIsSignatureHelpOpen] = useState(false);
   const [savedExpressions, setSavedExpressions] = useState<SavedFieldExpression[]>(() => loadSavedExpressions());
   const [expressionName, setExpressionName] = useState("");
@@ -210,6 +231,15 @@ export default function App() {
     }),
     [meshShellThickness, meshLatticeType, meshLatticePitch, meshLatticeThickness, meshLatticePhase]
   );
+
+  // Estimated resolution and memory for the current lattice pitch setting.
+  // This is a display-only estimate based on a 100-unit model; the backend
+  // computes the exact value from the actual mesh geometry.
+  const estimatedResolution = useMemo(
+    () => Math.min(1024, computeRequiredResolution(meshLatticePitch, voxelsPerLatticePeriod)),
+    [meshLatticePitch, voxelsPerLatticePeriod]
+  );
+  const estimatedMemory = useMemo(() => estimatedMemoryMB(estimatedResolution), [estimatedResolution]);
 
   const abortActivePreview = useCallback(() => {
     previewControllersRef.current.field?.abort();
@@ -264,6 +294,9 @@ export default function App() {
         const gridBounds = inferPreviewBounds(nextDiagnostics);
         const resolution = resolutionForQuality(quality);
         const grid = gridBounds ? { bounds: gridBounds, resolution } : undefined;
+
+        // Step 1: Evaluate the SDF field grid and display it as a ray-marched
+        // volume while the mesh is being generated.
         let fieldSucceeded = false;
         let lastError: Error | null = null;
 
@@ -296,6 +329,8 @@ export default function App() {
           }
         }
 
+        // Step 2: Generate the triangle mesh. Once ready it replaces the
+        // field volume as the final display.
         try {
           const meshController = new AbortController();
           previewControllersRef.current.mesh = meshController;
@@ -313,7 +348,7 @@ export default function App() {
           if (previewRunIdRef.current !== runId) {
             return;
           }
-          // Mesh is the final display mode for generated previews.
+          // Mesh is the final display — clear field volume.
           setField(null);
           setMesh(meshResponse.mesh);
           setStats(meshResponse.stats);
@@ -354,6 +389,33 @@ export default function App() {
       abortActivePreview();
     };
   }, [abortActivePreview]);
+
+  // Update section Y bounds whenever the active field or DSL diagnostics change.
+  // For the Mesh Workflow the field payload carries the actual part bounds;
+  // for the DSL workflow we fall back to the compiler-inferred bounds.
+  useEffect(() => {
+    let yMin: number | null = null;
+    let yMax: number | null = null;
+
+    if (field?.bounds) {
+      // field.bounds = [[xmin,xmax],[ymin,ymax],[zmin,zmax]]
+      yMin = field.bounds[1][0];
+      yMax = field.bounds[1][1];
+    } else if (diagnostics?.inferred_bounds) {
+      yMin = diagnostics.inferred_bounds[1][0];
+      yMax = diagnostics.inferred_bounds[1][1];
+    }
+
+    if (yMin !== null && yMax !== null && yMax > yMin) {
+      // Add a small margin so the slider can reach just past the surface.
+      const margin = (yMax - yMin) * 0.05;
+      const newMin = yMin - margin;
+      const newMax = yMax + margin;
+      setSectionYBounds([newMin, newMax]);
+      // Clamp the current section level to the new bounds.
+      setSectionLevel((prev) => Math.min(Math.max(prev, newMin), newMax));
+    }
+  }, [field, diagnostics]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -445,19 +507,51 @@ export default function App() {
 
     setIsPreviewing(true);
     setError(null);
+    setMeshCommitted(false);
     try {
-      const response = await previewUploadedMesh(
+      const response = await previewUploadedMeshField(
         meshFile,
         meshWorkflowParams,
         meshPreviewQuality,
         computeBackend,
+        voxelsPerLatticePeriod
+      );
+      setField(response.field);
+      setMesh(null);
+      setStats(response.stats);
+      setError(null);
+    } catch (previewError) {
+      setError((previewError as Error).message);
+    } finally {
+      setIsPreviewing(false);
+    }
+  };
+
+  const onCommitMesh = async () => {
+    if (!meshFile) {
+      setError("Upload an STL or OBJ file first.");
+      return;
+    }
+
+    setIsPreviewing(true);
+    setError(null);
+    try {
+      const response = await previewUploadedMesh(
+        meshFile,
+        meshWorkflowParams,
+        meshExportQuality,
+        computeBackend,
         meshBackend,
-        meshingMode
+        meshingMode,
+        voxelsPerLatticePeriod
       );
       setField(response.field ?? null);
       setMesh(response.mesh);
       setStats(response.stats);
+      setMeshCommitted(true);
+      setError(null);
     } catch (previewError) {
+      setMeshCommitted(false);
       setError((previewError as Error).message);
     } finally {
       setIsPreviewing(false);
@@ -469,6 +563,10 @@ export default function App() {
       setError("Upload an STL or OBJ file before exporting.");
       return;
     }
+    if (!meshCommitted) {
+      setError("Commit the design first to compute the export-ready mesh.");
+      return;
+    }
 
     try {
       const blob = await exportUploadedMesh(
@@ -478,7 +576,8 @@ export default function App() {
         meshExportQuality,
         computeBackend,
         meshBackend,
-        meshingMode
+        meshingMode,
+        voxelsPerLatticePeriod
       );
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
@@ -489,6 +588,27 @@ export default function App() {
       setError((exportError as Error).message);
     }
   };
+
+  useEffect(() => {
+    if (workflow !== "mesh") {
+      return;
+    }
+    setMeshCommitted(false);
+  }, [
+    workflow,
+    meshFile,
+    meshShellThickness,
+    meshLatticeType,
+    meshLatticePitch,
+    meshLatticeThickness,
+    meshLatticePhase,
+    meshPreviewQuality,
+    meshExportQuality,
+    computeBackend,
+    meshBackend,
+    meshingMode,
+    voxelsPerLatticePeriod
+  ]);
 
   const onSaveExpression = () => {
     const name = expressionName.trim();
@@ -690,7 +810,26 @@ export default function App() {
                     type="file"
                     accept=".stl,.obj"
                     aria-label="Mesh file upload"
-                    onChange={(event) => setMeshFile(event.target.files?.[0] ?? null)}
+                    onChange={(event) => {
+                      const selected = event.target.files?.[0] ?? null;
+                      setMeshFile(selected);
+                      setField(null);
+                      setStats(null);
+                      setMeshCommitted(false);
+                      setError(null);
+                      if (!selected) {
+                        setMesh(null);
+                        return;
+                      }
+                      void parseLocalMeshPreview(selected)
+                        .then((payload) => {
+                          setMesh(payload);
+                        })
+                        .catch((parseError) => {
+                          setMesh(null);
+                          setError((parseError as Error).message);
+                        });
+                    }}
                   />
                 </label>
                 <p className="muted">{meshFile ? `Selected: ${meshFile.name}` : "No file selected."}</p>
@@ -721,7 +860,7 @@ export default function App() {
                 </label>
 
                 <label className="slider-row">
-                  <span>Lattice pitch</span>
+                  <span>Lattice pitch (world units)</span>
                   <input
                     type="number"
                     step={0.01}
@@ -754,6 +893,30 @@ export default function App() {
                     onChange={(event) => setMeshLatticePhase(Number(event.target.value))}
                   />
                 </label>
+
+                <label className="slider-row">
+                  <span>Sampling quality (voxels/period)</span>
+                  <select
+                    aria-label="Voxels per lattice period"
+                    value={voxelsPerLatticePeriod}
+                    onChange={(event) => setVoxelsPerLatticePeriod(Number(event.target.value))}
+                  >
+                    <option value={4}>4 — Draft (fast)</option>
+                    <option value={6}>6 — Standard (default)</option>
+                    <option value={8}>8 — Fine (slow)</option>
+                  </select>
+                </label>
+
+                <div className="resolution-info">
+                  <p className="muted">
+                    Est. resolution for 100-unit model: <strong>{estimatedResolution}³</strong>
+                    {estimatedResolution >= 1024 ? " (clamped to 1024³ max)" : ""}
+                  </p>
+                  <p className="muted">
+                    Est. SDF grid memory: <strong>{estimatedMemory} MB</strong>
+                    {estimatedMemory > 1000 ? " ⚠️ Large — may be slow" : ""}
+                  </p>
+                </div>
 
                 <label className="slider-row">
                   <span>Preview quality</span>
@@ -824,7 +987,10 @@ export default function App() {
                 <p className="muted">Tip: `adaptive` is currently slower on CPU; use `uniform` for fastest previews.</p>
 
                 <button type="button" onClick={() => void onGenerateMesh()}>
-                  Generate Mesh Preview
+                  Preview Field
+                </button>
+                <button type="button" onClick={() => void onCommitMesh()}>
+                  Commit Design & Compute Mesh
                 </button>
               </div>
             </>
@@ -896,10 +1062,16 @@ export default function App() {
                 </select>
               </label>
             ) : null}
-            <button onClick={() => void (workflow === "dsl" ? onExportDsl("stl") : onExportUploaded("stl"))}>
+            <button
+              onClick={() => void (workflow === "dsl" ? onExportDsl("stl") : onExportUploaded("stl"))}
+              disabled={workflow === "mesh" && !meshCommitted}
+            >
               Export STL
             </button>
-            <button onClick={() => void (workflow === "dsl" ? onExportDsl("obj") : onExportUploaded("obj"))}>
+            <button
+              onClick={() => void (workflow === "dsl" ? onExportDsl("obj") : onExportUploaded("obj"))}
+              disabled={workflow === "mesh" && !meshCommitted}
+            >
               Export OBJ
             </button>
           </div>
@@ -909,9 +1081,9 @@ export default function App() {
               <span>Section Y: {sectionLevel.toFixed(2)}</span>
               <input
                 type="range"
-                min={-2}
-                max={2}
-                step={0.01}
+                min={sectionYBounds[0]}
+                max={sectionYBounds[1]}
+                step={(sectionYBounds[1] - sectionYBounds[0]) / 200}
                 value={sectionLevel}
                 onChange={(event) => setSectionLevel(Number(event.target.value))}
               />
@@ -929,6 +1101,7 @@ export default function App() {
               showGrid={showGrid}
               sectionEnabled={sectionEnabled}
               sectionLevel={sectionLevel}
+              transparentShell={workflow === "mesh"}
             />
           </div>
 
