@@ -227,6 +227,7 @@ class UploadedMeshPreviewWsRequest(BaseModel):
     lattice_thickness: float
     lattice_phase: float = 0.0
     quality_profile: QualityProfile = "medium"
+    voxels_per_lattice_period: int = 6
     compute_backend: ComputeBackend = "auto"
     mesh_backend: MeshBackend = "auto"
     meshing_mode: MeshingMode = "uniform"
@@ -262,32 +263,12 @@ class SceneProgramPayload(BaseModel):
     normal_epsilon: float
 
 
-class MeshProgramPayload(BaseModel):
-    mode: Literal["mesh_lattice"]
-    bounds: list[list[float]]
-    quality_profile: QualityProfile
-    triangles_encoding: Literal["f32-base64"] = "f32-base64"
-    triangles_data: str
-    triangle_count: int
-    bvh_encoding: Literal["f32-base64"] = "f32-base64"
-    bvh_data: str
-    bvh_node_count: int
-    shell_thickness: float
-    lattice_type: Literal["gyroid", "schwarz_p", "diamond"]
-    lattice_pitch: float
-    lattice_thickness: float
-    lattice_phase: float
-    max_steps: int
-    hit_epsilon: float
-    normal_epsilon: float
-
-
 class ProgramCapabilities(BaseModel):
     analytic_supported: bool
     fallback_reason: str | None = None
 
 
 class PreviewProgramResponse(BaseModel):
-    program: SceneProgramPayload | MeshProgramPayload | None = None
+    program: SceneProgramPayload | None = None
     capabilities: ProgramCapabilities
     stats: PreviewStats

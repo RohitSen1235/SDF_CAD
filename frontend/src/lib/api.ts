@@ -9,7 +9,6 @@ import {
   MeshWorkflowParams,
   PreviewStats,
   PreviewFieldResponse,
-  PreviewProgramResponse,
   PreviewMeshResponse,
   QualityProfile,
   SceneIR
@@ -165,37 +164,6 @@ export async function previewField(
   }
 }
 
-export async function previewProgram(
-  sceneIr: SceneIR,
-  parameterValues: Record<string, number>,
-  qualityProfile: QualityProfile,
-  signal?: AbortSignal,
-  grid?: GridConfig
-): Promise<PreviewProgramResponse> {
-  try {
-    const response = await fetch(`${API_BASE}/api/v1/preview/program`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal,
-      body: JSON.stringify({
-        scene_ir: sceneIr,
-        parameter_values: parameterValues,
-        quality_profile: qualityProfile,
-        grid
-      })
-    });
-    return parseJsonOrThrow(response);
-  } catch (error) {
-    if ((error as Error)?.name === "AbortError") {
-      throw error;
-    }
-    if (error instanceof TypeError) {
-      throw asNetworkError(error);
-    }
-    throw error;
-  }
-}
-
 export async function exportMesh(
   sceneIr: SceneIR,
   parameterValues: Record<string, number>,
@@ -244,7 +212,8 @@ function appendMeshWorkflowFormData(
   qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
-  meshingMode: MeshingMode = "uniform"
+  meshingMode: MeshingMode = "uniform",
+  voxelsPerLatticePeriod: number = 6
 ): void {
   body.append("file", file, file.name);
   body.append("shell_thickness", String(params.shellThickness));
@@ -253,6 +222,7 @@ function appendMeshWorkflowFormData(
   body.append("lattice_thickness", String(params.latticeThickness));
   body.append("lattice_phase", String(params.latticePhase));
   body.append("quality_profile", qualityProfile);
+  body.append("voxels_per_lattice_period", String(voxelsPerLatticePeriod));
   body.append("compute_backend", computeBackend);
   body.append("mesh_backend", meshBackend);
   body.append("meshing_mode", meshingMode);
@@ -264,11 +234,12 @@ export async function previewUploadedMesh(
   qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
-  meshingMode: MeshingMode = "uniform"
+  meshingMode: MeshingMode = "uniform",
+  voxelsPerLatticePeriod: number = 6
 ): Promise<PreviewMeshResponse> {
   try {
     const body = new FormData();
-    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode);
+    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
     const response = await fetch(`${API_BASE}/api/v1/mesh/preview`, {
       method: "POST",
       body
@@ -285,21 +256,26 @@ export async function previewUploadedMesh(
   }
 }
 
-export async function previewUploadedMeshProgram(
+export async function previewUploadedMeshField(
   file: File,
   params: MeshWorkflowParams,
-  qualityProfile: QualityProfile
-): Promise<PreviewProgramResponse> {
+  qualityProfile: QualityProfile,
+  computeBackend: ComputeBackend = "auto",
+  voxelsPerLatticePeriod: number = 6
+): Promise<PreviewFieldResponse> {
   try {
     const body = new FormData();
-    body.append("file", file, file.name);
-    body.append("shell_thickness", String(params.shellThickness));
-    body.append("lattice_type", params.latticeType);
-    body.append("lattice_pitch", String(params.latticePitch));
-    body.append("lattice_thickness", String(params.latticeThickness));
-    body.append("lattice_phase", String(params.latticePhase));
-    body.append("quality_profile", qualityProfile);
-    const response = await fetch(`${API_BASE}/api/v1/mesh/program`, {
+    appendMeshWorkflowFormData(
+      body,
+      file,
+      params,
+      qualityProfile,
+      computeBackend,
+      "auto",
+      "uniform",
+      voxelsPerLatticePeriod
+    );
+    const response = await fetch(`${API_BASE}/api/v1/mesh/field`, {
       method: "POST",
       body
     });
@@ -322,13 +298,14 @@ export async function previewUploadedMeshPhased(
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
   meshingMode: MeshingMode = "uniform",
-  onField?: (field: FieldPayload, stats?: PreviewStats) => void
+  onField?: (field: FieldPayload, stats?: PreviewStats) => void,
+  voxelsPerLatticePeriod: number = 6
 ): Promise<PreviewMeshResponse> {
   const fileBase64 = await fileToBase64(file);
   const wsBase = toWebSocketBase(API_BASE);
   const url = `${wsBase}/api/v1/mesh/preview/ws`;
   const fallbackToHttp = async (): Promise<PreviewMeshResponse> =>
-    previewUploadedMesh(file, params, qualityProfile, computeBackend, meshBackend, meshingMode);
+    previewUploadedMesh(file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
 
   return new Promise<PreviewMeshResponse>((resolve, reject) => {
     let settled = false;
@@ -346,6 +323,7 @@ export async function previewUploadedMeshPhased(
           lattice_thickness: params.latticeThickness,
           lattice_phase: params.latticePhase,
           quality_profile: qualityProfile,
+          voxels_per_lattice_period: voxelsPerLatticePeriod,
           compute_backend: computeBackend,
           mesh_backend: meshBackend,
           meshing_mode: meshingMode
@@ -410,11 +388,12 @@ export async function exportUploadedMesh(
   qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
-  meshingMode: MeshingMode = "uniform"
+  meshingMode: MeshingMode = "uniform",
+  voxelsPerLatticePeriod: number = 6
 ): Promise<Blob> {
   try {
     const body = new FormData();
-    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode);
+    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
     body.append("format", format);
     const response = await fetch(`${API_BASE}/api/v1/mesh/export`, {
       method: "POST",

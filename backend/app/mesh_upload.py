@@ -98,6 +98,33 @@ def validate_triangle_mesh(mesh: ParsedMesh) -> None:
         )
 
 
+def compute_resolution_for_lattice_pitch(
+    mesh_span: float,
+    lattice_pitch: float,
+    voxels_per_period: int = 6,
+) -> int:
+    """Compute the voxel grid resolution needed to faithfully sample a lattice.
+
+    Uses the same 12% padding factor as _build_bounds() so the result is
+    consistent with the actual padded bounding box.
+
+    Args:
+        mesh_span: Largest dimension of the mesh bounding box in world units.
+        lattice_pitch: Desired lattice cell size in world units.
+        voxels_per_period: Number of voxels per lattice period (6 = safe default,
+            4 = minimum, 8 = high quality).
+
+    Returns:
+        Required voxel grid resolution (cubic).
+    """
+    if lattice_pitch <= 0:
+        raise MeshUploadError("lattice_pitch must be > 0")
+    if voxels_per_period < 2:
+        raise MeshUploadError("voxels_per_period must be >= 2")
+    padded_span = mesh_span * 1.24  # matches _build_bounds() 12% padding each side
+    return max(24, int(math.ceil((padded_span / lattice_pitch) * voxels_per_period)))
+
+
 def build_host_field(
     mesh: ParsedMesh,
     resolution: int,

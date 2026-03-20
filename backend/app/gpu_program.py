@@ -3,13 +3,11 @@ from __future__ import annotations
 import base64
 import math
 import time
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
-from .mesh_upload import ParsedMesh
-from .models import GridConfig, MeshProgramPayload, QualityProfile, SceneIR, SceneNode, SceneProgramPayload
+from .models import GridConfig, QualityProfile, SceneIR, SceneNode, SceneProgramPayload
 
 
 QUALITY_TO_RAYMARCH = {
@@ -505,140 +503,3 @@ def compile_scene_program(
     return payload, None, compile_ms
 
 
-@dataclass
-class _BvhNode:
-    bmin: np.ndarray
-    bmax: np.ndarray
-    left: int
-    right: int
-    start: int
-    count: int
-
-
-def _triangle_bounds(tris: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    mins = np.min(tris, axis=1)
-    maxs = np.max(tris, axis=1)
-    centroids = np.mean(tris, axis=1)
-    return mins, maxs, centroids
-
-
-def _build_flat_bvh(tris: np.ndarray, leaf_size: int = 8) -> tuple[list[_BvhNode], np.ndarray]:
-    mins, maxs, centroids = _triangle_bounds(tris)
-    indices = np.arange(tris.shape[0], dtype=np.int32)
-    nodes: list[_BvhNode] = []
-    leaf_map: dict[int, np.ndarray] = {}
-
-    def recurse(idxs: np.ndarray) -> int:
-        node_index = len(nodes)
-        bmin = np.min(mins[idxs], axis=0)
-        bmax = np.max(maxs[idxs], axis=0)
-        nodes.append(_BvhNode(bmin=bmin, bmax=bmax, left=-1, right=-1, start=-1, count=0))
-        if idxs.shape[0] <= leaf_size:
-            nodes[node_index].start = 0
-            nodes[node_index].count = int(idxs.shape[0])
-            leaf_map[node_index] = idxs.copy()
-            return node_index
-
-        c = centroids[idxs]
-        ext = np.max(c, axis=0) - np.min(c, axis=0)
-        axis = int(np.argmax(ext))
-        order = idxs[np.argsort(c[:, axis])]
-        mid = max(1, order.shape[0] // 2)
-        left = recurse(order[:mid])
-        right = recurse(order[mid:])
-        nodes[node_index].left = left
-        nodes[node_index].right = right
-        return node_index
-
-    recurse(indices)
-    # Reorder triangles so each leaf can reference contiguous ranges.
-    reordered: list[int] = []
-
-    def linearize(node_idx: int) -> None:
-        node = nodes[node_idx]
-        if node.count > 0:
-            leaf_indices = leaf_map[node_idx]
-            node.start = len(reordered)
-            reordered.extend(leaf_indices.tolist())
-            return
-        linearize(node.left)
-        linearize(node.right)
-
-    linearize(0)
-    if not reordered:
-        reordered = indices.tolist()
-    remap = np.asarray(reordered, dtype=np.int32)
-    return nodes, remap
-
-
-def build_mesh_program(
-    parsed: ParsedMesh,
-    quality_profile: QualityProfile,
-    shell_thickness: float,
-    lattice_type: str,
-    lattice_pitch: float,
-    lattice_thickness: float,
-    lattice_phase: float,
-) -> tuple[MeshProgramPayload | None, str | None, float]:
-    compile_start = time.perf_counter()
-    if parsed.faces.size == 0 or parsed.vertices.size == 0:
-        return None, "uploaded mesh has no triangles", 0.0
-    tris = parsed.vertices[parsed.faces].astype(np.float32, copy=False)
-    if tris.shape[0] > 200000:
-        compile_ms = (time.perf_counter() - compile_start) * 1000.0
-        return None, "uploaded mesh is too large for analytic preview", compile_ms
-
-    nodes, remap = _build_flat_bvh(tris)
-    tris = tris[remap]
-
-    tri_normals = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
-    tri_norm_len = np.linalg.norm(tri_normals, axis=1, keepdims=True)
-    tri_normals = tri_normals / np.maximum(tri_norm_len, 1e-12)
-
-    vertex_normals = np.zeros_like(tris, dtype=np.float32)
-    vertex_normals[:] = tri_normals[:, None, :]
-
-    tri_payload = np.concatenate(
-        [tris.reshape(-1, 9), vertex_normals.reshape(-1, 9)],
-        axis=1,
-    ).astype(np.float32, copy=False)
-
-    bvh_payload = np.zeros((len(nodes), 12), dtype=np.float32)
-    for idx, node in enumerate(nodes):
-        bvh_payload[idx, 0:3] = node.bmin
-        bvh_payload[idx, 4:7] = node.bmax
-        bvh_payload[idx, 8] = float(node.left)
-        bvh_payload[idx, 9] = float(node.right)
-        bvh_payload[idx, 10] = float(node.start)
-        bvh_payload[idx, 11] = float(node.count)
-
-    tri_min = np.min(tris.reshape(-1, 3), axis=0)
-    tri_max = np.max(tris.reshape(-1, 3), axis=0)
-    span = np.max(tri_max - tri_min)
-    pad = max(1e-3, float(span) * 0.12)
-    bounds = [
-        [float(tri_min[0] - pad), float(tri_max[0] + pad)],
-        [float(tri_min[1] - pad), float(tri_max[1] + pad)],
-        [float(tri_min[2] - pad), float(tri_max[2] + pad)],
-    ]
-
-    budget = _quality_budget(quality_profile)
-    payload = MeshProgramPayload(
-        mode="mesh_lattice",
-        bounds=bounds,
-        quality_profile=quality_profile,
-        triangles_data=_encode_f32(tri_payload),
-        triangle_count=int(tri_payload.shape[0]),
-        bvh_data=_encode_f32(bvh_payload),
-        bvh_node_count=int(bvh_payload.shape[0]),
-        shell_thickness=float(shell_thickness),
-        lattice_type=lattice_type.lower(),
-        lattice_pitch=float(lattice_pitch),
-        lattice_thickness=float(lattice_thickness),
-        lattice_phase=float(lattice_phase),
-        max_steps=int(budget["max_steps"]),
-        hit_epsilon=float(budget["hit_eps"]),
-        normal_epsilon=float(budget["normal_eps"]),
-    )
-    compile_ms = (time.perf_counter() - compile_start) * 1000.0
-    return payload, None, compile_ms

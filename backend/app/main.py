@@ -43,10 +43,11 @@ from .mesh_upload import (
     ParsedMesh,
     build_host_field,
     compose_hollow_lattice_field_with_backend,
+    compute_resolution_for_lattice_pitch,
     parse_mesh_bytes,
     validate_triangle_mesh,
 )
-from .gpu_program import build_mesh_program, compile_scene_program
+from .gpu_program import compile_scene_program
 from .gpu_memory import cleanup_gpu_memory
 from .meshing import (
     MeshData,
@@ -73,15 +74,15 @@ from .models import (
     PreviewFieldResponse,
     PreviewMeshRequest,
     PreviewMeshResponse,
+    PreviewProgramRequest,
+    PreviewProgramResponse,
     PreviewStats,
     PreviewWsRequest,
     PreviewWsResponse,
+    ProgramCapabilities,
     QualityProfile,
     MeshBackend,
     MeshPayload,
-    PreviewProgramRequest,
-    PreviewProgramResponse,
-    ProgramCapabilities,
     UploadedMeshPreviewWsRequest,
     UploadedMeshPreviewWsResponse,
 )
@@ -108,6 +109,9 @@ MESH_QUALITY_TO_RESOLUTION: dict[QualityProfile, int] = {
     "high": 96,
     "ultra": 128,
 }
+# Hard cap for mesh-upload voxel grids. 1024^3 at float32 = 4 GB.
+# The auto-resolution logic will clamp to this value and warn the caller.
+MESH_UPLOAD_MAX_RESOLUTION = 1024
 MESH_UPLOAD_MAX_BYTES = 200 * 1024 * 1024
 AUTO_QUEUE_RESOLUTION_THRESHOLD = 128
 AUTO_QUEUE_UPLOAD_BYTES_THRESHOLD = 8 * 1024 * 1024
@@ -151,6 +155,36 @@ def _resolve_grid(grid: GridConfig | None, quality_profile: QualityProfile) -> G
     if grid is not None:
         return grid
     return GridConfig(resolution=QUALITY_TO_RESOLUTION[quality_profile])
+
+
+def _resolve_mesh_resolution(
+    quality_profile: QualityProfile,
+    lattice_pitch: float,
+    mesh_span: float,
+    voxels_per_lattice_period: int = 6,
+) -> tuple[int, bool]:
+    """Compute the voxel resolution for a mesh upload.
+
+    When lattice_pitch and mesh_span are available the resolution is derived
+    from the lattice sampling requirement.  Otherwise the quality-profile
+    fallback is used.
+
+    Returns:
+        (resolution, was_clamped) — was_clamped is True when the computed
+        resolution exceeded MESH_UPLOAD_MAX_RESOLUTION and was reduced.
+    """
+    needed = compute_resolution_for_lattice_pitch(
+        mesh_span, lattice_pitch, voxels_per_lattice_period
+    )
+    if needed > MESH_UPLOAD_MAX_RESOLUTION:
+        logger.warning(
+            "Computed mesh resolution %d exceeds hard cap %d; clamping. "
+            "Consider increasing lattice_pitch or reducing voxels_per_lattice_period.",
+            needed,
+            MESH_UPLOAD_MAX_RESOLUTION,
+        )
+        return MESH_UPLOAD_MAX_RESOLUTION, True
+    return needed, False
 
 
 def _meshdata_from_parsed(parsed) -> MeshData:
@@ -636,12 +670,12 @@ def _resolve_uploaded_host_field(
     *,
     file_bytes: bytes,
     extension: str,
-    quality_profile: QualityProfile,
+    resolution: int,
 ) -> tuple[ParsedMesh, list[list[float]], np.ndarray]:
     host_key = hash_uploaded_mesh_host_request(
         file_bytes=file_bytes,
         extension=extension,
-        quality_profile=quality_profile,
+        quality_profile=f"res_{resolution}",  # use resolution as cache key discriminator
     )
     cached = uploaded_host_field_cache.get(host_key)
     if cached is not None:
@@ -654,7 +688,6 @@ def _resolve_uploaded_host_field(
 
     parsed = parse_mesh_bytes(file_bytes, extension)
     validate_triangle_mesh(parsed)
-    resolution = MESH_QUALITY_TO_RESOLUTION[quality_profile]
     host = build_host_field(parsed, resolution=resolution)
 
     uploaded_host_field_cache.set(
@@ -669,6 +702,24 @@ def _resolve_uploaded_host_field(
     return parsed, host.bounds, host.host_sdf
 
 
+def _compute_mesh_upload_resolution(
+    file_bytes: bytes,
+    extension: str,
+    lattice_pitch: float,
+    quality_profile: QualityProfile,
+    voxels_per_lattice_period: int,
+) -> int:
+    """Parse the mesh to get its span, then compute the required voxel resolution."""
+    parsed = parse_mesh_bytes(file_bytes, extension)
+    validate_triangle_mesh(parsed)
+    extents = np.ptp(parsed.vertices, axis=0)
+    mesh_span = float(np.max(extents))
+    resolution, _ = _resolve_mesh_resolution(
+        quality_profile, lattice_pitch, mesh_span, voxels_per_lattice_period
+    )
+    return resolution
+
+
 def _run_uploaded_mesh_preview(
     *,
     file_bytes: bytes,
@@ -679,6 +730,7 @@ def _run_uploaded_mesh_preview(
     lattice_thickness: float,
     lattice_phase: float,
     quality_profile: QualityProfile,
+    voxels_per_lattice_period: int = 6,
     compute_backend: ComputeBackend = "auto",
     mesh_backend: MeshBackend = "auto",
     meshing_mode: MeshingMode = "uniform",
@@ -692,11 +744,64 @@ def _run_uploaded_mesh_preview(
         lattice_thickness=lattice_thickness,
         lattice_phase=lattice_phase,
         quality_profile=quality_profile,
+        voxels_per_lattice_period=voxels_per_lattice_period,
         compute_backend=compute_backend,
         mesh_backend=mesh_backend,
         meshing_mode=meshing_mode,
     )
     return PreviewMeshResponse(mesh=mesh_payload, stats=stats, field=field_payload)
+
+
+def _run_uploaded_mesh_field_preview(
+    *,
+    file_bytes: bytes,
+    extension: str,
+    shell_thickness: float,
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"],
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+    quality_profile: QualityProfile,
+    voxels_per_lattice_period: int = 6,
+    compute_backend: ComputeBackend = "auto",
+) -> PreviewFieldResponse:
+    eval_start = time.perf_counter()
+    resolution = _compute_mesh_upload_resolution(
+        file_bytes, extension, lattice_pitch, quality_profile, voxels_per_lattice_period
+    )
+    _, bounds, host_sdf = _resolve_uploaded_host_field(
+        file_bytes=file_bytes,
+        extension=extension,
+        resolution=resolution,
+    )
+    field, eval_backend_used = compose_hollow_lattice_field_with_backend(
+        host_sdf,
+        bounds,
+        shell_thickness=shell_thickness,
+        lattice_type=lattice_type,
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+        compute_backend=compute_backend,
+    )
+    eval_ms = (time.perf_counter() - eval_start) * 1000.0
+    field_payload = FieldPayload(
+        encoding="f32-base64",
+        resolution=int(field.shape[0]),
+        bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
+        data=_encode_field(field),
+    )
+    stats = PreviewStats(
+        eval_ms=eval_ms,
+        mesh_ms=None,
+        tri_count=0,
+        voxel_count=int(field.size),
+        cache_hit=False,
+        compute_backend=eval_backend_used,
+        mesh_backend="cpu",
+        preview_mode="field",
+    )
+    return PreviewFieldResponse(field=field_payload, stats=stats)
 
 
 def _run_uploaded_mesh_preview_meshdata(
@@ -709,6 +814,7 @@ def _run_uploaded_mesh_preview_meshdata(
     lattice_thickness: float,
     lattice_phase: float,
     quality_profile: QualityProfile,
+    voxels_per_lattice_period: int = 6,
     compute_backend: ComputeBackend = "auto",
     mesh_backend: MeshBackend = "auto",
     meshing_mode: MeshingMode = "uniform",
@@ -721,7 +827,7 @@ def _run_uploaded_mesh_preview_meshdata(
         lattice_pitch=lattice_pitch,
         lattice_thickness=lattice_thickness,
         lattice_phase=lattice_phase,
-        quality_profile=quality_profile,
+        quality_profile=f"{quality_profile}_vpp{voxels_per_lattice_period}",
         compute_backend=compute_backend,
         mesh_backend=mesh_backend,
         meshing_mode=meshing_mode,
@@ -766,10 +872,14 @@ def _run_uploaded_mesh_preview_meshdata(
 
     eval_start = time.perf_counter()
     host_start = time.perf_counter()
+    # Compute resolution from lattice pitch and mesh geometry.
+    resolution = _compute_mesh_upload_resolution(
+        file_bytes, extension, lattice_pitch, quality_profile, voxels_per_lattice_period
+    )
     parsed, bounds, host_sdf = _resolve_uploaded_host_field(
         file_bytes=file_bytes,
         extension=extension,
-        quality_profile=quality_profile,
+        resolution=resolution,
     )
     host_ms = (time.perf_counter() - host_start) * 1000.0
     compose_start = time.perf_counter()
@@ -1049,6 +1159,7 @@ async def preview_uploaded_mesh(
     lattice_thickness: float = Form(...),
     lattice_phase: float = Form(0.0),
     quality_profile: QualityProfile = Form("medium"),
+    voxels_per_lattice_period: int = Form(6),
     compute_backend: ComputeBackend = Form("auto"),
     mesh_backend: MeshBackend = Form("auto"),
     meshing_mode: MeshingMode = Form("uniform"),
@@ -1088,6 +1199,7 @@ async def preview_uploaded_mesh(
             lattice_thickness=lattice_thickness,
             lattice_phase=lattice_phase,
             quality_profile=quality_profile,
+            voxels_per_lattice_period=voxels_per_lattice_period,
             compute_backend=compute_backend,
             mesh_backend=mesh_backend,
             meshing_mode=meshing_mode,
@@ -1099,8 +1211,8 @@ async def preview_uploaded_mesh(
         cleanup_gpu_memory(reason="preview_uploaded_mesh_inline")
 
 
-@app.post("/api/v1/mesh/program", response_model=PreviewProgramResponse)
-async def preview_uploaded_mesh_program(
+@app.post("/api/v1/mesh/field", response_model=PreviewFieldResponse)
+async def preview_uploaded_mesh_field(
     file: UploadFile = File(...),
     shell_thickness: float = Form(...),
     lattice_type: Literal["gyroid", "schwarz_p", "diamond"] = Form(...),
@@ -1108,60 +1220,29 @@ async def preview_uploaded_mesh_program(
     lattice_thickness: float = Form(...),
     lattice_phase: float = Form(0.0),
     quality_profile: QualityProfile = Form("medium"),
-) -> PreviewProgramResponse:
+    voxels_per_lattice_period: int = Form(6),
+    compute_backend: ComputeBackend = Form("auto"),
+) -> PreviewFieldResponse:
     file_bytes, extension = await _read_uploaded_mesh(file)
     try:
-        parsed = parse_mesh_bytes(file_bytes, extension)
-        validate_triangle_mesh(parsed)
-        program, fallback_reason, compile_ms = build_mesh_program(
-            parsed,
-            quality_profile=quality_profile,
+        result = await asyncio.to_thread(
+            _run_uploaded_mesh_field_preview,
+            file_bytes=file_bytes,
+            extension=extension,
             shell_thickness=shell_thickness,
             lattice_type=lattice_type,
             lattice_pitch=lattice_pitch,
             lattice_thickness=lattice_thickness,
             lattice_phase=lattice_phase,
+            quality_profile=quality_profile,
+            voxels_per_lattice_period=voxels_per_lattice_period,
+            compute_backend=compute_backend,
         )
-        if program is None:
-            return PreviewProgramResponse(
-                program=None,
-                capabilities=ProgramCapabilities(analytic_supported=False, fallback_reason=fallback_reason),
-                stats=PreviewStats(
-                    eval_ms=0.0,
-                    mesh_ms=None,
-                    tri_count=0,
-                    voxel_count=None,
-                    cache_hit=False,
-                    preview_mode="analytic_raymarch",
-                    compile_ms=compile_ms,
-                    program_bytes=0,
-                    gpu_eval_mode="webgl2",
-                    fallback_reason=fallback_reason,
-                ),
-            )
-
-        program_bytes = (
-            len(program.triangles_data.encode("ascii"))
-            + len(program.bvh_data.encode("ascii"))
-        )
-        return PreviewProgramResponse(
-            program=program,
-            capabilities=ProgramCapabilities(analytic_supported=True, fallback_reason=None),
-            stats=PreviewStats(
-                eval_ms=0.0,
-                mesh_ms=None,
-                tri_count=int(program.triangle_count),
-                voxel_count=None,
-                cache_hit=False,
-                preview_mode="analytic_raymarch",
-                compile_ms=compile_ms,
-                program_bytes=program_bytes,
-                gpu_eval_mode="webgl2",
-                fallback_reason=None,
-            ),
-        )
-    except MeshUploadError as exc:
+        return result
+    except (MeshUploadError, MeshingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        cleanup_gpu_memory(reason="preview_uploaded_mesh_field_inline")
 
 
 @app.post("/api/v1/mesh/export", response_model=None)
@@ -1173,6 +1254,7 @@ async def export_uploaded_mesh(
     lattice_thickness: float = Form(...),
     lattice_phase: float = Form(0.0),
     quality_profile: QualityProfile = Form("high"),
+    voxels_per_lattice_period: int = Form(6),
     compute_backend: ComputeBackend = Form("auto"),
     mesh_backend: MeshBackend = Form("auto"),
     meshing_mode: MeshingMode = Form("uniform"),
@@ -1214,6 +1296,7 @@ async def export_uploaded_mesh(
             lattice_thickness=lattice_thickness,
             lattice_phase=lattice_phase,
             quality_profile=quality_profile,
+            voxels_per_lattice_period=voxels_per_lattice_period,
             compute_backend=compute_backend,
             mesh_backend=mesh_backend,
             meshing_mode=meshing_mode,
@@ -1256,6 +1339,7 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                     f"Uploaded file exceeds the {MESH_UPLOAD_MAX_BYTES // (1024 * 1024)} MB limit"
                 )
 
+            voxels_per_lattice_period: int = getattr(payload, "voxels_per_lattice_period", 6)
             cache_key = hash_uploaded_mesh_request(
                 file_bytes=file_bytes,
                 extension=extension,
@@ -1264,7 +1348,7 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                 lattice_pitch=payload.lattice_pitch,
                 lattice_thickness=payload.lattice_thickness,
                 lattice_phase=payload.lattice_phase,
-                quality_profile=payload.quality_profile,
+                quality_profile=f"{payload.quality_profile}_vpp{voxels_per_lattice_period}",
                 compute_backend=payload.compute_backend,
                 mesh_backend=payload.mesh_backend,
                 meshing_mode=payload.meshing_mode,
@@ -1324,10 +1408,17 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                 try:
                     eval_start = time.perf_counter()
                     host_start = time.perf_counter()
+                    ws_resolution = _compute_mesh_upload_resolution(
+                        file_bytes,
+                        extension,
+                        payload.lattice_pitch,
+                        payload.quality_profile,
+                        voxels_per_lattice_period,
+                    )
                     parsed, bounds, host_sdf = _resolve_uploaded_host_field(
                         file_bytes=file_bytes,
                         extension=extension,
-                        quality_profile=payload.quality_profile,
+                        resolution=ws_resolution,
                     )
                     host_ms = (time.perf_counter() - host_start) * 1000.0
                     compose_start = time.perf_counter()

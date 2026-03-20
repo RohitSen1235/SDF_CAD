@@ -224,6 +224,36 @@ def test_mesh_preview_endpoint_obj_upload() -> None:
     assert payload["field"]["data"]
 
 
+def test_mesh_field_endpoint_obj_upload() -> None:
+    response = client.post(
+        "/api/v1/mesh/field",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["field"]["encoding"] == "f32-base64"
+    assert payload["field"]["resolution"] == 48
+    assert payload["field"]["data"]
+    assert payload["stats"]["preview_mode"] == "field"
+    assert payload["stats"]["mesh_ms"] is None
+    assert payload["stats"]["tri_count"] == 0
+
+
+def test_mesh_field_endpoint_does_not_call_mesher(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_mesher(*_args, **_kwargs):
+        raise AssertionError("Mesher should not run for uploaded field preview")
+
+    monkeypatch.setattr(main_module, "build_mesh_with_backend", fail_mesher)
+    response = client.post(
+        "/api/v1/mesh/field",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    assert response.json()["stats"]["preview_mode"] == "field"
+
+
 def test_mesh_preview_preserves_original_outer_vertices() -> None:
     response = client.post(
         "/api/v1/mesh/preview",

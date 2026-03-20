@@ -4,13 +4,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
 import * as THREE from "three";
 
-import { FieldPayload, MeshPayload, MeshProgramPayload, SceneProgramPayload } from "../types";
+import { FieldPayload, MeshPayload } from "../types";
 
 export interface ViewerProps {
   mesh: MeshPayload | null;
   field: FieldPayload | null;
-  analyticSceneProgram?: SceneProgramPayload | null;
-  analyticMeshProgram?: MeshProgramPayload | null;
   wireframe: boolean;
   transformMode: "translate" | "rotate" | "scale";
   fitSignal: number;
@@ -18,6 +16,9 @@ export interface ViewerProps {
   showGrid: boolean;
   sectionEnabled: boolean;
   sectionLevel: number;
+  /** When true the field renderer uses a ghost outer shell so the interior
+   *  TPMS lattice is visible through it. Used by the Mesh workflow. */
+  transparentShell?: boolean;
 }
 
 const FIELD_VERTEX_SHADER = `
@@ -29,6 +30,13 @@ const FIELD_VERTEX_SHADER = `
   }
 `;
 
+// Smooth ray-marched field renderer.
+// Uses hardware LinearFilter on the 3D texture for smooth trilinear sampling,
+// and a wider normal-estimation epsilon to avoid voxel-grid bumpiness.
+//
+// When uTransparentShell > 0.5 (mesh workflow), the shader performs multi-hit
+// compositing: the outer shell is rendered as a ghost (low alpha) so the
+// interior TPMS lattice struts are visible through it.
 const FIELD_FRAGMENT_SHADER = `
   precision highp float;
   precision highp sampler3D;
@@ -41,6 +49,9 @@ const FIELD_FRAGMENT_SHADER = `
   uniform float uSectionLevel;
   uniform float uResolution;
   uniform float uStepScale;
+  // When > 0.5: render outer shell as semi-transparent ghost so interior
+  // lattice is visible. Used by the Mesh workflow field preview.
+  uniform float uTransparentShell;
 
   in vec3 vWorldPos;
   out vec4 outColor;
@@ -55,37 +66,15 @@ const FIELD_FRAGMENT_SHADER = `
     return vec2(tNear, tFar);
   }
 
-  // Manual trilinear interpolation — avoids NearestFilter voxel-grid artifacts
-  // on hardware that does not support linear filtering for R32F 3D textures.
+  // Hardware-interpolated field sample — relies on LinearFilter set on the texture.
+  // The GPU sampler performs trilinear interpolation natively, giving smooth results.
   float sampleField(vec3 worldPos) {
-    vec3 uvw = (worldPos - uBoundsMin) / (uBoundsMax - uBoundsMin);
-    uvw = clamp(uvw, 0.0, 1.0);
-    float n = uResolution;
-    // Convert to texel-space [0, n-1] and split into integer + fractional parts.
-    vec3 tc = uvw * (n - 1.0);
-    vec3 ti = floor(tc);
-    vec3 tf = tc - ti;
-    // Normalise back to [0,1] UV for texelFetch-equivalent via texture().
-    float inv = 1.0 / n;
-    vec3 uv0 = (ti + 0.5) * inv;
-    vec3 uv1 = (ti + 1.5) * inv;
-    float c000 = texture(uField, vec3(uv0.x, uv0.y, uv0.z)).r;
-    float c100 = texture(uField, vec3(uv1.x, uv0.y, uv0.z)).r;
-    float c010 = texture(uField, vec3(uv0.x, uv1.y, uv0.z)).r;
-    float c110 = texture(uField, vec3(uv1.x, uv1.y, uv0.z)).r;
-    float c001 = texture(uField, vec3(uv0.x, uv0.y, uv1.z)).r;
-    float c101 = texture(uField, vec3(uv1.x, uv0.y, uv1.z)).r;
-    float c011 = texture(uField, vec3(uv0.x, uv1.y, uv1.z)).r;
-    float c111 = texture(uField, vec3(uv1.x, uv1.y, uv1.z)).r;
-    float c00 = mix(c000, c100, tf.x);
-    float c10 = mix(c010, c110, tf.x);
-    float c01 = mix(c001, c101, tf.x);
-    float c11 = mix(c011, c111, tf.x);
-    float c0  = mix(c00, c10, tf.y);
-    float c1  = mix(c01, c11, tf.y);
-    return mix(c0, c1, tf.z);
+    vec3 uvw = clamp((worldPos - uBoundsMin) / (uBoundsMax - uBoundsMin), 0.0, 1.0);
+    return texture(uField, uvw).r;
   }
 
+  // Normal estimation with a wide epsilon (2x voxel size) to smooth out
+  // quantization noise from the discrete SDF grid.
   vec3 estimateNormal(vec3 worldPos, float eps) {
     vec3 ex = vec3(eps, 0.0, 0.0);
     vec3 ey = vec3(0.0, eps, 0.0);
@@ -94,6 +83,15 @@ const FIELD_FRAGMENT_SHADER = `
     float dy = sampleField(worldPos + ey) - sampleField(worldPos - ey);
     float dz = sampleField(worldPos + ez) - sampleField(worldPos - ez);
     return normalize(vec3(dx, dy, dz));
+  }
+
+  vec3 shade(vec3 p, float voxel) {
+    float normalEps = max(voxel * 2.0, 1e-3);
+    vec3 normal = estimateNormal(p, normalEps);
+    vec3 lightDir = normalize(vec3(0.55, 0.75, 0.4));
+    float diff = max(dot(normal, lightDir), 0.0);
+    float hemi = 0.4 + 0.6 * (normal.y * 0.5 + 0.5);
+    return uColor * (0.28 + 0.72 * diff) * hemi;
   }
 
   void main() {
@@ -111,38 +109,124 @@ const FIELD_FRAGMENT_SHADER = `
       discard;
     }
 
-    const int MAX_STEPS = 1536;
     vec3 extent = (uBoundsMax - uBoundsMin);
     float voxel = min(min(extent.x, extent.y), extent.z) / max(uResolution, 2.0);
     float minStep = max(voxel * 0.25, 1e-4);
     float maxStep = max(voxel * 1.25, minStep);
     float hitEps = max(voxel * 0.8, 1e-4);
 
+    // ── Opaque mode (DSL workflow) ────────────────────────────────────────────
+    if (uTransparentShell < 0.5) {
+      const int MAX_STEPS = 1536;
+      float t = tStart;
+      float prev = sampleField(ro + rd * tStart);
+      bool hitSurface = false;
+      vec3 pHit = vec3(0.0);
+
+      for (int i = 0; i < MAX_STEPS; i++) {
+        if (t > tEnd) break;
+        vec3 p = ro + rd * t;
+        float s = sampleField(p);
+
+        if (abs(s) <= hitEps) {
+          pHit = p;
+          hitSurface = true;
+          break;
+        }
+
+        bool crossed = (prev > 0.0 && s <= 0.0) || (prev < 0.0 && s >= 0.0);
+        if (crossed) {
+          float a = prev / (prev - s + 1e-6);
+          float prevT = max(t - minStep, tStart);
+          pHit = mix(ro + rd * prevT, p, clamp(a, 0.0, 1.0));
+          hitSurface = true;
+          break;
+        }
+
+        float stepSize = clamp(abs(s) * 0.55, minStep, maxStep) * uStepScale;
+        prev = s;
+        t += stepSize;
+      }
+
+      if (!hitSurface) { discard; }
+      if (uSectionEnabled > 0.5 && pHit.y > uSectionLevel) { discard; }
+
+      // Use 2x voxel size for normal epsilon — wider neighbourhood averages out
+      // grid quantization and produces smooth, non-bumpy shading.
+      outColor = vec4(shade(pHit, voxel), 1.0);
+      return;
+    }
+
+    // ── Transparent-shell mode (Mesh workflow) ────────────────────────────────
+    // Multi-hit compositing: collect up to 2 surface crossings.
+    // Hit 0 = outer shell → ghost alpha (0.18).
+    // Hit 1 = interior lattice strut → full alpha (1.0).
+    // This lets the user see the TPMS lattice through the translucent skin.
+    const int MAX_STEPS_T = 1536;
+    const float SHELL_ALPHA = 0.18;
+    // After the first hit we step past the surface by a small skip (relative to
+    // voxel size) to avoid re-detecting the same crossing immediately.
+    float SKIP_DIST = voxel * 3.0;
+
+    vec4 accum = vec4(0.0);   // accumulated RGBA (pre-multiplied alpha)
     float t = tStart;
     float prev = sampleField(ro + rd * tStart);
-    bool hitSurface = false;
-    vec3 pHit = vec3(0.0);
+    int hitCount = 0;
 
-    for (int i = 0; i < MAX_STEPS; i++) {
-      if (t > tEnd) {
-        break;
-      }
+    for (int i = 0; i < MAX_STEPS_T; i++) {
+      if (t > tEnd) break;
+      if (accum.a >= 0.99) break;   // fully opaque — early exit
+
       vec3 p = ro + rd * t;
       float s = sampleField(p);
 
-      if (abs(s) <= hitEps) {
-        pHit = p;
-        hitSurface = true;
-        break;
-      }
+      bool onSurface = abs(s) <= hitEps;
+      bool crossed   = (prev > 0.0 && s <= 0.0) || (prev < 0.0 && s >= 0.0);
 
-      bool crossed = (prev > 0.0 && s <= 0.0) || (prev < 0.0 && s >= 0.0);
-      if (crossed) {
-        float a = prev / (prev - s + 1e-6);
-        float prevT = max(t - minStep, tStart);
-        pHit = mix(ro + rd * prevT, p, clamp(a, 0.0, 1.0));
-        hitSurface = true;
-        break;
+      if (onSurface || crossed) {
+        vec3 pHit;
+        if (onSurface) {
+          pHit = p;
+        } else {
+          float a = prev / (prev - s + 1e-6);
+          float prevT = max(t - minStep, tStart);
+          pHit = mix(ro + rd * prevT, p, clamp(a, 0.0, 1.0));
+        }
+
+        // Section plane clipping — discard the whole ray if the first visible
+        // hit is above the section level.
+        if (uSectionEnabled > 0.5 && pHit.y > uSectionLevel) {
+          // Skip past this surface and keep looking below the cut plane.
+          t += SKIP_DIST + minStep;
+          prev = sampleField(ro + rd * t);
+          hitCount++;
+          if (hitCount >= 2) break;
+          continue;
+        }
+
+        vec3 litColor = shade(pHit, voxel);
+
+        float hitAlpha;
+        if (hitCount == 0) {
+          // Outer shell — ghost/transparent
+          hitAlpha = SHELL_ALPHA;
+        } else {
+          // Interior lattice — fully opaque
+          hitAlpha = 1.0;
+        }
+
+        // Alpha-over compositing (front-to-back)
+        float remaining = 1.0 - accum.a;
+        accum.rgb += litColor * hitAlpha * remaining;
+        accum.a   += hitAlpha * remaining;
+
+        hitCount++;
+        if (hitCount >= 2) break;
+
+        // Skip past this surface to find the next one.
+        t += SKIP_DIST;
+        prev = sampleField(ro + rd * t);
+        continue;
       }
 
       float stepSize = clamp(abs(s) * 0.55, minStep, maxStep) * uStepScale;
@@ -150,319 +234,8 @@ const FIELD_FRAGMENT_SHADER = `
       t += stepSize;
     }
 
-    if (!hitSurface) {
-      discard;
-    }
-
-    if (uSectionEnabled > 0.5 && pHit.y > uSectionLevel) {
-      discard;
-    }
-
-    float eps = max(voxel * 0.9, 1e-4);
-    vec3 normal = estimateNormal(pHit, eps);
-    vec3 lightDir = normalize(vec3(0.55, 0.75, 0.4));
-    float diff = max(dot(normal, lightDir), 0.0);
-    float hemi = 0.4 + 0.6 * (normal.y * 0.5 + 0.5);
-    vec3 lit = uColor * (0.28 + 0.72 * diff) * hemi;
-
-    outColor = vec4(lit, 1.0);
-  }
-`;
-
-const ANALYTIC_DSL_FRAGMENT_TEMPLATE = `
-  precision highp float;
-
-  uniform vec3 uBoundsMin;
-  uniform vec3 uBoundsMax;
-  uniform vec3 uColor;
-  uniform float uSectionEnabled;
-  uniform float uSectionLevel;
-  uniform float uMaxSteps;
-  uniform float uHitEps;
-  uniform float uNormalEps;
-
-  in vec3 vWorldPos;
-  out vec4 outColor;
-
-  vec2 intersectAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax) {
-    vec3 t0 = (bmin - ro) / rd;
-    vec3 t1 = (bmax - ro) / rd;
-    vec3 tsmaller = min(t0, t1);
-    vec3 tbigger = max(t0, t1);
-    float tNear = max(max(tsmaller.x, tsmaller.y), tsmaller.z);
-    float tFar = min(min(tbigger.x, tbigger.y), tbigger.z);
-    return vec2(tNear, tFar);
-  }
-
-  __SDF_SCENE__
-
-  vec3 estimateNormal(vec3 p) {
-    vec2 e = vec2(1.0, -1.0) * uNormalEps;
-    return normalize(
-      e.xyy * sdfScene(p + e.xyy) +
-      e.yyx * sdfScene(p + e.yyx) +
-      e.yxy * sdfScene(p + e.yxy) +
-      e.xxx * sdfScene(p + e.xxx)
-    );
-  }
-
-  void main() {
-    vec3 ro = cameraPosition;
-    vec3 rd = normalize(vWorldPos - cameraPosition);
-    vec2 hit = intersectAABB(ro, rd, uBoundsMin, uBoundsMax);
-    if (hit.x > hit.y) discard;
-
-    float t = max(hit.x, 0.0);
-    float tEnd = hit.y;
-    bool hitSurface = false;
-    vec3 pHit = vec3(0.0);
-    float maxSteps = max(uMaxSteps, 8.0);
-
-    for (int i = 0; i < 640; i++) {
-      if (float(i) >= maxSteps || t > tEnd) break;
-      vec3 p = ro + rd * t;
-      float d = sdfScene(p);
-      if (abs(d) <= uHitEps) {
-        hitSurface = true;
-        pHit = p;
-        break;
-      }
-      float stepSize = clamp(abs(d) * 0.9, uHitEps * 0.6, 0.2);
-      t += stepSize;
-    }
-
-    if (!hitSurface) discard;
-    if (uSectionEnabled > 0.5 && pHit.y > uSectionLevel) discard;
-
-    vec3 n = estimateNormal(pHit);
-    vec3 lightDir = normalize(vec3(0.55, 0.75, 0.4));
-    float diff = max(dot(n, lightDir), 0.0);
-    float hemi = 0.4 + 0.6 * (n.y * 0.5 + 0.5);
-    vec3 lit = uColor * (0.28 + 0.72 * diff) * hemi;
-    outColor = vec4(lit, 1.0);
-  }
-`;
-
-const ANALYTIC_MESH_FRAGMENT_SHADER = `
-  precision highp float;
-  precision highp sampler2D;
-
-  uniform vec3 uBoundsMin;
-  uniform vec3 uBoundsMax;
-  uniform vec3 uColor;
-  uniform float uSectionEnabled;
-  uniform float uSectionLevel;
-  uniform float uMaxSteps;
-  uniform float uHitEps;
-  uniform float uNormalEps;
-  uniform sampler2D uTriTex;
-  uniform vec2 uTriTexSize;
-  uniform sampler2D uBvhTex;
-  uniform vec2 uBvhTexSize;
-  uniform float uTriangleCount;
-  uniform float uShellThickness;
-  uniform float uLatticePitch;
-  uniform float uLatticeThickness;
-  uniform float uLatticePhase;
-  uniform float uLatticeType;
-
-  in vec3 vWorldPos;
-  out vec4 outColor;
-
-  vec2 intersectAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax) {
-    vec3 t0 = (bmin - ro) / rd;
-    vec3 t1 = (bmax - ro) / rd;
-    vec3 tsmaller = min(t0, t1);
-    vec3 tbigger = max(t0, t1);
-    float tNear = max(max(tsmaller.x, tsmaller.y), tsmaller.z);
-    float tFar = min(min(tbigger.x, tbigger.y), tbigger.z);
-    return vec2(tNear, tFar);
-  }
-
-  float readScalar(sampler2D tex, vec2 texSize, int scalarIndex) {
-    int texelIndex = scalarIndex / 4;
-    int chan = scalarIndex - texelIndex * 4;
-    int width = int(texSize.x);
-    int x = texelIndex - (texelIndex / width) * width;
-    int y = texelIndex / width;
-    vec4 t = texelFetch(tex, ivec2(x, y), 0);
-    if (chan == 0) return t.x;
-    if (chan == 1) return t.y;
-    if (chan == 2) return t.z;
-    return t.w;
-  }
-
-  vec3 readVec3(sampler2D tex, vec2 texSize, int startIndex) {
-    return vec3(
-      readScalar(tex, texSize, startIndex),
-      readScalar(tex, texSize, startIndex + 1),
-      readScalar(tex, texSize, startIndex + 2)
-    );
-  }
-
-  float sdBoxDistance(vec3 p, vec3 bmin, vec3 bmax) {
-    vec3 c = 0.5 * (bmin + bmax);
-    vec3 h = 0.5 * (bmax - bmin);
-    vec3 q = abs(p - c) - h;
-    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
-  }
-
-  vec3 closestPointTriangle(vec3 p, vec3 a, vec3 b, vec3 c) {
-    vec3 ab = b - a;
-    vec3 ac = c - a;
-    vec3 ap = p - a;
-    float d1 = dot(ab, ap);
-    float d2 = dot(ac, ap);
-    if (d1 <= 0.0 && d2 <= 0.0) return a;
-    vec3 bp = p - b;
-    float d3 = dot(ab, bp);
-    float d4 = dot(ac, bp);
-    if (d3 >= 0.0 && d4 <= d3) return b;
-    float vc = d1 * d4 - d3 * d2;
-    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
-      float v = d1 / (d1 - d3);
-      return a + v * ab;
-    }
-    vec3 cp = p - c;
-    float d5 = dot(ab, cp);
-    float d6 = dot(ac, cp);
-    if (d6 >= 0.0 && d5 <= d6) return c;
-    float vb = d5 * d2 - d1 * d6;
-    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
-      float w = d2 / (d2 - d6);
-      return a + w * ac;
-    }
-    float va = d3 * d6 - d5 * d4;
-    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {
-      float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-      return b + w * (c - b);
-    }
-    float denom = 1.0 / (va + vb + vc);
-    float v = vb * denom;
-    float w = vc * denom;
-    return a + ab * v + ac * w;
-  }
-
-  float sdfHostMesh(vec3 p) {
-    float best = 1e9;
-    float signOut = 1.0;
-    int stack[64];
-    int sp = 0;
-    stack[sp++] = 0;
-
-    for (int iter = 0; iter < 1024; iter++) {
-      if (sp <= 0) break;
-      int ni = stack[--sp];
-      int base = ni * 12;
-      vec3 bmin = readVec3(uBvhTex, uBvhTexSize, base + 0);
-      vec3 bmax = readVec3(uBvhTex, uBvhTexSize, base + 4);
-      float boxDist = sdBoxDistance(p, bmin, bmax);
-      if (boxDist > best) continue;
-      int left = int(readScalar(uBvhTex, uBvhTexSize, base + 8));
-      int right = int(readScalar(uBvhTex, uBvhTexSize, base + 9));
-      int start = int(readScalar(uBvhTex, uBvhTexSize, base + 10));
-      int count = int(readScalar(uBvhTex, uBvhTexSize, base + 11));
-      if (count > 0) {
-        for (int i = 0; i < 64; i++) {
-          if (i >= count) break;
-          int triIndex = start + i;
-          if (float(triIndex) >= uTriangleCount) break;
-          int triBase = triIndex * 18;
-          vec3 a = readVec3(uTriTex, uTriTexSize, triBase + 0);
-          vec3 b = readVec3(uTriTex, uTriTexSize, triBase + 3);
-          vec3 c = readVec3(uTriTex, uTriTexSize, triBase + 6);
-          vec3 na = readVec3(uTriTex, uTriTexSize, triBase + 9);
-          vec3 nb = readVec3(uTriTex, uTriTexSize, triBase + 12);
-          vec3 nc = readVec3(uTriTex, uTriTexSize, triBase + 15);
-          vec3 cp = closestPointTriangle(p, a, b, c);
-          float d = length(p - cp);
-          if (d < best) {
-            best = d;
-            vec3 pn = normalize(na + nb + nc);
-            signOut = dot(p - cp, pn) < 0.0 ? -1.0 : 1.0;
-          }
-        }
-      } else {
-        if (left >= 0 && sp < 63) stack[sp++] = left;
-        if (right >= 0 && sp < 63) stack[sp++] = right;
-      }
-    }
-    return best * signOut;
-  }
-
-  float latticeField(vec3 p) {
-    float scale = 6.28318530718 / max(abs(uLatticePitch), 1e-6);
-    float u = p.x * scale + uLatticePhase;
-    float v = p.y * scale + uLatticePhase;
-    float w = p.z * scale + uLatticePhase;
-    float base;
-    if (uLatticeType < 0.5) {
-      base = sin(u) * cos(v) + sin(v) * cos(w) + sin(w) * cos(u);
-    } else if (uLatticeType < 1.5) {
-      base = cos(u) + cos(v) + cos(w);
-    } else {
-      base =
-        sin(u) * sin(v) * sin(w)
-        + sin(u) * cos(v) * cos(w)
-        + cos(u) * sin(v) * cos(w)
-        + cos(u) * cos(v) * sin(w);
-    }
-    return abs(base) - abs(uLatticeThickness);
-  }
-
-  float sdfScene(vec3 p) {
-    float host = sdfHostMesh(p);
-    float shell = max(host, -host - abs(uShellThickness));
-    float cavity = host + abs(uShellThickness);
-    float lattice = latticeField(p);
-    float clipped = max(lattice, cavity);
-    return min(shell, clipped);
-  }
-
-  vec3 estimateNormal(vec3 p) {
-    vec2 e = vec2(1.0, -1.0) * uNormalEps;
-    return normalize(
-      e.xyy * sdfScene(p + e.xyy) +
-      e.yyx * sdfScene(p + e.yyx) +
-      e.yxy * sdfScene(p + e.yxy) +
-      e.xxx * sdfScene(p + e.xxx)
-    );
-  }
-
-  void main() {
-    vec3 ro = cameraPosition;
-    vec3 rd = normalize(vWorldPos - cameraPosition);
-    vec2 hit = intersectAABB(ro, rd, uBoundsMin, uBoundsMax);
-    if (hit.x > hit.y) discard;
-
-    float t = max(hit.x, 0.0);
-    float tEnd = hit.y;
-    bool hitSurface = false;
-    vec3 pHit = vec3(0.0);
-    float maxSteps = max(uMaxSteps, 8.0);
-
-    for (int i = 0; i < 640; i++) {
-      if (float(i) >= maxSteps || t > tEnd) break;
-      vec3 p = ro + rd * t;
-      float d = sdfScene(p);
-      if (abs(d) <= uHitEps) {
-        hitSurface = true;
-        pHit = p;
-        break;
-      }
-      float stepSize = clamp(abs(d) * 0.9, uHitEps * 0.6, 0.2);
-      t += stepSize;
-    }
-
-    if (!hitSurface) discard;
-    if (uSectionEnabled > 0.5 && pHit.y > uSectionLevel) discard;
-
-    vec3 n = estimateNormal(pHit);
-    vec3 lightDir = normalize(vec3(0.55, 0.75, 0.4));
-    float diff = max(dot(n, lightDir), 0.0);
-    float hemi = 0.4 + 0.6 * (n.y * 0.5 + 0.5);
-    vec3 lit = uColor * (0.28 + 0.72 * diff) * hemi;
-    outColor = vec4(lit, 1.0);
+    if (accum.a < 0.01) { discard; }
+    outColor = accum;
   }
 `;
 
@@ -558,24 +331,6 @@ function decodeFloat32Base64(base64: string): Float32Array {
   return new Float32Array(bytes.buffer.slice(0));
 }
 
-function toPackedFloatTexture(values: Float32Array): { texture: THREE.DataTexture; width: number; height: number } {
-  const texelCount = Math.max(1, Math.ceil(values.length / 4));
-  const width = Math.min(1024, texelCount);
-  const height = Math.max(1, Math.ceil(texelCount / width));
-  const out = new Float32Array(width * height * 4);
-  out.set(values);
-  const texture = new THREE.DataTexture(out, width, height, THREE.RGBAFormat, THREE.FloatType);
-  texture.internalFormat = "RGBA32F";
-  texture.minFilter = THREE.NearestFilter;
-  texture.magFilter = THREE.NearestFilter;
-  texture.wrapS = THREE.ClampToEdgeWrapping;
-  texture.wrapT = THREE.ClampToEdgeWrapping;
-  texture.generateMipmaps = false;
-  texture.unpackAlignment = 1;
-  texture.needsUpdate = true;
-  return { texture, width, height };
-}
-
 function toFieldTexture(field: FieldPayload | null): THREE.Data3DTexture | null {
   if (!field || field.encoding !== "f32-base64") {
     return null;
@@ -596,9 +351,10 @@ function toFieldTexture(field: FieldPayload | null): THREE.Data3DTexture | null 
   texture.internalFormat = "R32F";
   texture.format = THREE.RedFormat;
   texture.type = THREE.FloatType;
-  // Use nearest filtering for broad WebGL2 compatibility with float 3D textures.
-  texture.minFilter = THREE.NearestFilter;
-  texture.magFilter = THREE.NearestFilter;
+  // Use LinearFilter for smooth hardware-interpolated trilinear sampling.
+  // This eliminates voxel-grid artifacts and produces smooth surface rendering.
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
   texture.wrapS = THREE.ClampToEdgeWrapping;
   texture.wrapT = THREE.ClampToEdgeWrapping;
   texture.wrapR = THREE.ClampToEdgeWrapping;
@@ -654,15 +410,14 @@ function FitCamera({
 export function Viewer({
   mesh,
   field,
-  analyticSceneProgram,
-  analyticMeshProgram,
   wireframe,
   transformMode,
   fitSignal,
   showAxes,
   showGrid,
   sectionEnabled,
-  sectionLevel
+  sectionLevel,
+  transparentShell = false
 }: ViewerProps) {
   const [orbitEnabled, setOrbitEnabled] = useState(true);
   const orbitRef = useRef<any>(null);
@@ -684,57 +439,8 @@ export function Viewer({
   }, [geometry]);
 
   const fieldTexture = useMemo(() => toFieldTexture(field), [field]);
-  const analyticDslFragment = useMemo(() => {
-    if (!analyticSceneProgram?.glsl_sdf) {
-      return null;
-    }
-    return ANALYTIC_DSL_FRAGMENT_TEMPLATE.replace("__SDF_SCENE__", analyticSceneProgram.glsl_sdf);
-  }, [analyticSceneProgram]);
-  const analyticTri = useMemo(() => {
-    if (!analyticMeshProgram) {
-      return null;
-    }
-    const values = decodeFloat32Base64(analyticMeshProgram.triangles_data);
-    return toPackedFloatTexture(values);
-  }, [analyticMeshProgram]);
-  const analyticBvh = useMemo(() => {
-    if (!analyticMeshProgram) {
-      return null;
-    }
-    const values = decodeFloat32Base64(analyticMeshProgram.bvh_data);
-    return toPackedFloatTexture(values);
-  }, [analyticMeshProgram]);
+
   const fieldBounds = useMemo(() => {
-    if (analyticSceneProgram) {
-      const min = new THREE.Vector3(
-        analyticSceneProgram.bounds[0][0],
-        analyticSceneProgram.bounds[1][0],
-        analyticSceneProgram.bounds[2][0]
-      );
-      const max = new THREE.Vector3(
-        analyticSceneProgram.bounds[0][1],
-        analyticSceneProgram.bounds[1][1],
-        analyticSceneProgram.bounds[2][1]
-      );
-      const center = min.clone().add(max).multiplyScalar(0.5);
-      const size = max.clone().sub(min);
-      return { min, max, center, size };
-    }
-    if (analyticMeshProgram) {
-      const min = new THREE.Vector3(
-        analyticMeshProgram.bounds[0][0],
-        analyticMeshProgram.bounds[1][0],
-        analyticMeshProgram.bounds[2][0]
-      );
-      const max = new THREE.Vector3(
-        analyticMeshProgram.bounds[0][1],
-        analyticMeshProgram.bounds[1][1],
-        analyticMeshProgram.bounds[2][1]
-      );
-      const center = min.clone().add(max).multiplyScalar(0.5);
-      const size = max.clone().sub(min);
-      return { min, max, center, size };
-    }
     if (!field) {
       return null;
     }
@@ -743,9 +449,9 @@ export function Viewer({
     const center = min.clone().add(max).multiplyScalar(0.5);
     const size = max.clone().sub(min);
     return { min, max, center, size };
-  }, [field, analyticSceneProgram, analyticMeshProgram]);
+  }, [field]);
 
-  const hasField = (fieldTexture !== null || analyticDslFragment !== null || analyticMeshProgram !== null) && fieldBounds !== null;
+  const hasField = fieldTexture !== null && fieldBounds !== null;
 
   const targetBox = useMemo(() => {
     if (fieldBounds) {
@@ -773,22 +479,6 @@ export function Viewer({
     };
   }, [fieldTexture]);
 
-  useEffect(() => {
-    return () => {
-      if (analyticTri?.texture) {
-        analyticTri.texture.dispose();
-      }
-    };
-  }, [analyticTri]);
-
-  useEffect(() => {
-    return () => {
-      if (analyticBvh?.texture) {
-        analyticBvh.texture.dispose();
-      }
-    };
-  }, [analyticBvh]);
-
   return (
     <Canvas
       camera={{ position: [3.5, 2.5, 3.5], fov: 45 }}
@@ -810,81 +500,26 @@ export function Viewer({
       {hasField && fieldBounds && !geometry ? (
         <mesh ref={meshRef} position={fieldBounds.center.toArray() as [number, number, number]} renderOrder={3}>
           <boxGeometry args={fieldBounds.size.toArray() as [number, number, number]} />
-          {analyticMeshProgram && analyticTri && analyticBvh ? (
-            <shaderMaterial
-              side={THREE.FrontSide}
-              transparent={false}
-              glslVersion={THREE.GLSL3}
-              vertexShader={FIELD_VERTEX_SHADER}
-              fragmentShader={ANALYTIC_MESH_FRAGMENT_SHADER}
-              toneMapped={false}
-              uniforms={{
-                uBoundsMin: { value: fieldBounds.min },
-                uBoundsMax: { value: fieldBounds.max },
-                uColor: { value: new THREE.Color("#8be9fd") },
-                uSectionEnabled: { value: sectionEnabled ? 1.0 : 0.0 },
-                uSectionLevel: { value: sectionLevel },
-                uMaxSteps: { value: analyticMeshProgram.max_steps },
-                uHitEps: { value: analyticMeshProgram.hit_epsilon },
-                uNormalEps: { value: analyticMeshProgram.normal_epsilon },
-                uTriTex: { value: analyticTri.texture },
-                uTriTexSize: { value: new THREE.Vector2(analyticTri.width, analyticTri.height) },
-                uBvhTex: { value: analyticBvh.texture },
-                uBvhTexSize: { value: new THREE.Vector2(analyticBvh.width, analyticBvh.height) },
-                uTriangleCount: { value: analyticMeshProgram.triangle_count },
-                uShellThickness: { value: analyticMeshProgram.shell_thickness },
-                uLatticePitch: { value: analyticMeshProgram.lattice_pitch },
-                uLatticeThickness: { value: analyticMeshProgram.lattice_thickness },
-                uLatticePhase: { value: analyticMeshProgram.lattice_phase },
-                uLatticeType: {
-                  value:
-                    analyticMeshProgram.lattice_type === "gyroid"
-                      ? 0.0
-                      : analyticMeshProgram.lattice_type === "schwarz_p"
-                        ? 1.0
-                        : 2.0
-                }
-              }}
-            />
-          ) : analyticDslFragment && analyticSceneProgram ? (
-            <shaderMaterial
-              side={THREE.FrontSide}
-              transparent={false}
-              glslVersion={THREE.GLSL3}
-              vertexShader={FIELD_VERTEX_SHADER}
-              fragmentShader={analyticDslFragment}
-              toneMapped={false}
-              uniforms={{
-                uBoundsMin: { value: fieldBounds.min },
-                uBoundsMax: { value: fieldBounds.max },
-                uColor: { value: new THREE.Color("#8be9fd") },
-                uSectionEnabled: { value: sectionEnabled ? 1.0 : 0.0 },
-                uSectionLevel: { value: sectionLevel },
-                uMaxSteps: { value: analyticSceneProgram.max_steps },
-                uHitEps: { value: analyticSceneProgram.hit_epsilon },
-                uNormalEps: { value: analyticSceneProgram.normal_epsilon }
-              }}
-            />
-          ) : (
-            <shaderMaterial
-              side={THREE.FrontSide}
-              transparent={false}
-              glslVersion={THREE.GLSL3}
-              vertexShader={FIELD_VERTEX_SHADER}
-              fragmentShader={FIELD_FRAGMENT_SHADER}
-              toneMapped={false}
-              uniforms={{
-                uField: { value: fieldTexture },
-                uBoundsMin: { value: fieldBounds.min },
-                uBoundsMax: { value: fieldBounds.max },
-                uColor: { value: new THREE.Color("#8be9fd") },
-                uSectionEnabled: { value: sectionEnabled ? 1.0 : 0.0 },
-                uSectionLevel: { value: sectionLevel },
-                uResolution: { value: field?.resolution ?? 64 },
-                uStepScale: { value: 1.0 }
-              }}
-            />
-          )}
+          <shaderMaterial
+            side={THREE.FrontSide}
+            transparent={transparentShell}
+            depthWrite={!transparentShell}
+            glslVersion={THREE.GLSL3}
+            vertexShader={FIELD_VERTEX_SHADER}
+            fragmentShader={FIELD_FRAGMENT_SHADER}
+            toneMapped={false}
+            uniforms={{
+              uField: { value: fieldTexture },
+              uBoundsMin: { value: fieldBounds.min },
+              uBoundsMax: { value: fieldBounds.max },
+              uColor: { value: new THREE.Color("#8be9fd") },
+              uSectionEnabled: { value: sectionEnabled ? 1.0 : 0.0 },
+              uSectionLevel: { value: sectionLevel },
+              uResolution: { value: field?.resolution ?? 64 },
+              uStepScale: { value: 1.0 },
+              uTransparentShell: { value: transparentShell ? 1.0 : 0.0 }
+            }}
+          />
         </mesh>
       ) : null}
 
@@ -960,7 +595,7 @@ export function Viewer({
         </mesh>
       ) : null}
 
-      {fieldTexture && !analyticSceneProgram && !analyticMeshProgram && !geometry && sectionEnabled && fieldBounds ? (
+      {fieldTexture && !geometry && sectionEnabled && fieldBounds ? (
         <mesh position={[0, sectionLevel, 0]} rotation={[-Math.PI * 0.5, 0, 0]} renderOrder={2}>
           <planeGeometry args={[capSize, capSize]} />
           <shaderMaterial

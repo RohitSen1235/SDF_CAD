@@ -107,28 +107,8 @@ export interface SceneProgramPayload {
   normal_epsilon: number;
 }
 
-export interface MeshProgramPayload {
-  mode: "mesh_lattice";
-  bounds: [[number, number], [number, number], [number, number]];
-  quality_profile: QualityProfile;
-  triangles_encoding: "f32-base64";
-  triangles_data: string;
-  triangle_count: number;
-  bvh_encoding: "f32-base64";
-  bvh_data: string;
-  bvh_node_count: number;
-  shell_thickness: number;
-  lattice_type: "gyroid" | "schwarz_p" | "diamond";
-  lattice_pitch: number;
-  lattice_thickness: number;
-  lattice_phase: number;
-  max_steps: number;
-  hit_epsilon: number;
-  normal_epsilon: number;
-}
-
 export interface PreviewProgramResponse {
-  program: SceneProgramPayload | MeshProgramPayload | null;
+  program: SceneProgramPayload | null;
   capabilities: {
     analytic_supported: boolean;
     fallback_reason?: string | null;
