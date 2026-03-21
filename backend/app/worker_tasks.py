@@ -8,7 +8,7 @@ from typing import Any
 
 import base64
 
-from .gpu_memory import cleanup_gpu_memory
+from .gpu_memory import cleanup_runtime_memory
 from .meshing import iter_obj_chunks, iter_stl_chunks
 from .models import ExportMeshRequest, PreviewMeshRequest
 from .worker import celery_app
@@ -35,7 +35,7 @@ def preview_mesh_job(payload: dict[str, Any]) -> dict[str, Any]:
         )
         return {"kind": "preview_mesh", "payload": preview.model_dump(mode="json")}
     finally:
-        cleanup_gpu_memory(reason="preview_mesh_job")
+        cleanup_runtime_memory(reason="preview_mesh_job")
 
 
 @celery_app.task(name="jobs.export_mesh")
@@ -53,6 +53,8 @@ def export_mesh_job(payload: dict[str, Any]) -> dict[str, Any]:
             compute_backend=req.compute_backend,
             mesh_backend=req.mesh_backend,
             meshing_mode=req.meshing_mode,
+            encode_mesh_payload=False,
+            cache_result=False,
         )
         suffix = ".stl" if req.format == "stl" else ".obj"
         fd, tmp_path = tempfile.mkstemp(prefix="sdfcad-job-", suffix=suffix, dir=str(JOB_EXPORT_DIR))
@@ -74,7 +76,7 @@ def export_mesh_job(payload: dict[str, Any]) -> dict[str, Any]:
             "filename": filename,
         }
     finally:
-        cleanup_gpu_memory(reason="export_mesh_job")
+        cleanup_runtime_memory(reason="export_mesh_job")
 
 
 @celery_app.task(name="jobs.preview_uploaded_mesh")
@@ -94,10 +96,11 @@ def preview_uploaded_mesh_job(payload: dict[str, Any]) -> dict[str, Any]:
             compute_backend=str(payload.get("compute_backend", "auto")),
             mesh_backend=str(payload.get("mesh_backend", "auto")),
             meshing_mode=str(payload.get("meshing_mode", "uniform")),
+            field_storage_mode=str(payload.get("field_storage_mode", "auto")),
         )
         return {"kind": "preview_uploaded_mesh", "payload": preview.model_dump(mode="json")}
     finally:
-        cleanup_gpu_memory(reason="preview_uploaded_mesh_job")
+        cleanup_runtime_memory(reason="preview_uploaded_mesh_job")
 
 
 @celery_app.task(name="jobs.export_uploaded_mesh")
@@ -117,6 +120,9 @@ def export_uploaded_mesh_job(payload: dict[str, Any]) -> dict[str, Any]:
             compute_backend=str(payload.get("compute_backend", "auto")),
             mesh_backend=str(payload.get("mesh_backend", "auto")),
             meshing_mode=str(payload.get("meshing_mode", "uniform")),
+            field_storage_mode=str(payload.get("field_storage_mode", "auto")),
+            encode_response_payloads=False,
+            cache_result=False,
         )
         export_format = str(payload.get("format", "stl")).lower()
         suffix = ".stl" if export_format == "stl" else ".obj"
@@ -139,7 +145,7 @@ def export_uploaded_mesh_job(payload: dict[str, Any]) -> dict[str, Any]:
             "filename": filename,
         }
     finally:
-        cleanup_gpu_memory(reason="export_uploaded_mesh_job")
+        cleanup_runtime_memory(reason="export_uploaded_mesh_job")
 
 
 def _purge_old_job_files(max_age_seconds: int = 6 * 3600) -> None:

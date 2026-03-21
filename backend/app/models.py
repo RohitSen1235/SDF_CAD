@@ -24,6 +24,7 @@ ComputeBackend = Literal["auto", "cpu", "cuda"]
 MeshBackend = Literal["auto", "cpu", "cuda"]
 MeshingMode = Literal["uniform", "adaptive"]
 ExecutionMode = Literal["auto", "inline", "queued"]
+UploadedFieldStorageMode = Literal["auto", "dense", "octree_sparse"]
 
 
 class ParameterSpec(BaseModel):
@@ -231,6 +232,7 @@ class UploadedMeshPreviewWsRequest(BaseModel):
     compute_backend: ComputeBackend = "auto"
     mesh_backend: MeshBackend = "auto"
     meshing_mode: MeshingMode = "uniform"
+    field_storage_mode: UploadedFieldStorageMode = "auto"
 
 
 class UploadedMeshPreviewWsResponse(BaseModel):

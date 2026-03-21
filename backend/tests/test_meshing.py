@@ -103,3 +103,31 @@ def test_active_blocks_route_to_sparse_block_mesher(monkeypatch) -> None:
     assert called["sparse"] is True
     assert mesh is fake_mesh
     assert backend == "cpu"
+
+
+def test_iter_stl_chunks_matches_non_streaming_stl_payload() -> None:
+    mesh = meshing.MeshData(
+        vertices=np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        ),
+        faces=np.array(
+            [
+                [0, 1, 2],
+                [0, 1, 3],
+                [0, 2, 3],
+                [1, 2, 3],
+            ],
+            dtype=np.int32,
+        ),
+        normals=np.zeros((4, 3), dtype=np.float64),
+    )
+
+    streamed = b"".join(meshing.iter_stl_chunks(mesh, chunk_size=64))
+    classic = meshing.mesh_to_stl(mesh)
+    assert streamed == classic

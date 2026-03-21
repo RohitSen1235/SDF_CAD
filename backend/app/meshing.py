@@ -320,6 +320,11 @@ def _cuda_kernels() -> tuple["cp.RawKernel", "cp.RawKernel"]:  # type: ignore[na
     return count_kernel, gen_kernel
 
 
+def clear_meshing_caches() -> None:
+    _cuda_luts.cache_clear()
+    _cuda_kernels.cache_clear()
+
+
 class MeshingError(ValueError):
     pass
 
@@ -858,6 +863,40 @@ def iter_obj_chunks(mesh: MeshData, chunk_size: int = 1024 * 1024):
 
 
 def iter_stl_chunks(mesh: MeshData, chunk_size: int = 1024 * 1024):
-    payload = mesh_to_stl(mesh)
-    for start in range(0, len(payload), chunk_size):
-        yield payload[start : start + chunk_size]
+    header = b"SDF_CAD" + b" " * (80 - len("SDF_CAD"))
+    yield header
+    yield np.uint32(len(mesh.faces)).tobytes()
+
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    if faces.size == 0:
+        return
+
+    stl_dtype = np.dtype(
+        [
+            ("normal", "<f4", 3),
+            ("v0", "<f4", 3),
+            ("v1", "<f4", 3),
+            ("v2", "<f4", 3),
+            ("attr", "<u2"),
+        ],
+    )
+
+    tris_per_chunk = max(1, int(chunk_size // 50))
+    for start in range(0, faces.shape[0], tris_per_chunk):
+        stop = min(faces.shape[0], start + tris_per_chunk)
+        batch_faces = faces[start:stop]
+        tri_verts = vertices[batch_faces]
+        face_normals = np.cross(tri_verts[:, 1] - tri_verts[:, 0], tri_verts[:, 2] - tri_verts[:, 0])
+        lengths = np.linalg.norm(face_normals, axis=1)
+        valid = lengths > 1e-12
+        face_normals[valid] = face_normals[valid] / lengths[valid, None]
+        face_normals[~valid] = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        triangles = np.zeros(batch_faces.shape[0], dtype=stl_dtype)
+        triangles["normal"] = face_normals.astype(np.float32, copy=False)
+        triangles["v0"] = tri_verts[:, 0].astype(np.float32, copy=False)
+        triangles["v1"] = tri_verts[:, 1].astype(np.float32, copy=False)
+        triangles["v2"] = tri_verts[:, 2].astype(np.float32, copy=False)
+        triangles["attr"] = np.uint16(0)
+        yield triangles.tobytes()

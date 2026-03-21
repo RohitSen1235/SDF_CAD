@@ -7,6 +7,9 @@ from typing import Any, Literal
 
 import numpy as np
 from scipy import ndimage
+from scipy.spatial import cKDTree
+
+from .sparse_field import OctreeField, SparseBrickField, detect_zero_crossing_blocks
 try:
     from numba import njit, prange
 
@@ -40,8 +43,15 @@ class HostFieldData:
     mesh: ParsedMesh
     bounds: list[list[float]]
     host_sdf: np.ndarray
+    field_storage_mode: Literal["dense", "octree_sparse"] = "dense"
     block_size: int | None = None
     active_blocks: list[tuple[int, int, int]] | None = None
+    sparse_background_value: float | None = None
+    sparse_bricks: dict[tuple[int, int, int], np.ndarray] | None = None
+    octree_node_min: np.ndarray | None = None
+    octree_node_max: np.ndarray | None = None
+    octree_node_depth: np.ndarray | None = None
+    octree_node_kind: np.ndarray | None = None
 
 
 def parse_mesh_bytes(data: bytes, extension: str) -> ParsedMesh:
@@ -130,6 +140,7 @@ def compute_resolution_for_lattice_pitch(
 def build_host_field(
     mesh: ParsedMesh,
     resolution: int,
+    field_storage_mode: Literal["auto", "dense", "octree_sparse"] = "auto",
 ) -> HostFieldData:
     if resolution < 24:
         raise MeshUploadError("resolution is too low for mesh workflow")
@@ -137,12 +148,221 @@ def build_host_field(
     bounds = _build_bounds(mesh)
     occupancy = _voxelize_and_fill(mesh, bounds, resolution)
 
+    if field_storage_mode == "dense":
+        host_sdf = _build_host_sdf_dense(occupancy, bounds, resolution)
+        return HostFieldData(
+            mesh=mesh,
+            bounds=bounds,
+            host_sdf=host_sdf,
+            field_storage_mode="dense",
+            block_size=None,
+            active_blocks=None,
+        )
+
+    host_sdf, block_size, active_blocks, sparse_background_value = _build_host_sdf_octree_sparse(
+        occupancy,
+        bounds,
+        resolution,
+    )
+
+    use_sparse = bool(block_size and active_blocks)
+    if field_storage_mode == "octree_sparse" and not use_sparse:
+        # Graceful fallback when sparse classification is not beneficial.
+        use_sparse = False
+
+    if use_sparse:
+        sparse = SparseBrickField.from_dense(
+            host_sdf,
+            bounds,
+            block_size=block_size or 16,
+            active_blocks=active_blocks,
+            background_value=sparse_background_value,
+        )
+        octree = OctreeField.from_sparse_bricks(sparse)
+        return HostFieldData(
+            mesh=mesh,
+            bounds=bounds,
+            host_sdf=host_sdf,
+            field_storage_mode="octree_sparse",
+            block_size=int(sparse.block_size),
+            active_blocks=sparse.active_blocks(),
+            sparse_background_value=float(sparse.background_value),
+            sparse_bricks={
+                key: np.array(value, copy=True) for key, value in sparse.bricks.items()
+            },
+            octree_node_min=np.array(octree.node_min, copy=True),
+            octree_node_max=np.array(octree.node_max, copy=True),
+            octree_node_depth=np.array(octree.node_depth, copy=True),
+            octree_node_kind=np.array(octree.node_kind, copy=True),
+        )
+
+    return HostFieldData(
+        mesh=mesh,
+        bounds=bounds,
+        host_sdf=host_sdf,
+        field_storage_mode="dense",
+        block_size=block_size,
+        active_blocks=active_blocks,
+        sparse_background_value=sparse_background_value,
+    )
+
+
+def _build_host_sdf_dense(
+    occupancy: np.ndarray,
+    bounds: list[list[float]],
+    resolution: int,
+) -> np.ndarray:
     spacing = _bounds_spacing(bounds, resolution)
     outside = np.logical_not(occupancy)
     dist_out = ndimage.distance_transform_edt(outside, sampling=spacing)
     dist_in = ndimage.distance_transform_edt(occupancy, sampling=spacing)
-    host_sdf = dist_out - dist_in
-    return HostFieldData(mesh=mesh, bounds=bounds, host_sdf=host_sdf, block_size=None, active_blocks=None)
+    return dist_out - dist_in
+
+
+def _octree_collect_surface_blocks(
+    surface_mask: np.ndarray,
+    block_size: int,
+) -> set[tuple[int, int, int]]:
+    resolution = int(surface_mask.shape[0])
+    if resolution <= 0:
+        return set()
+
+    leaves: set[tuple[int, int, int]] = set()
+
+    def recurse(i0: int, i1: int, j0: int, j1: int, k0: int, k1: int) -> None:
+        if i0 >= i1 or j0 >= j1 or k0 >= k1:
+            return
+        if not np.any(surface_mask[i0:i1, j0:j1, k0:k1]):
+            return
+
+        if (i1 - i0) <= block_size and (j1 - j0) <= block_size and (k1 - k0) <= block_size:
+            leaves.add((i0 // block_size, j0 // block_size, k0 // block_size))
+            return
+
+        im = (i0 + i1) // 2
+        jm = (j0 + j1) // 2
+        km = (k0 + k1) // 2
+        i_ranges = ((i0, im), (im, i1)) if im > i0 else ((i0, i1),)
+        j_ranges = ((j0, jm), (jm, j1)) if jm > j0 else ((j0, j1),)
+        k_ranges = ((k0, km), (km, k1)) if km > k0 else ((k0, k1),)
+
+        for ia, ib in i_ranges:
+            for ja, jb in j_ranges:
+                for ka, kb in k_ranges:
+                    recurse(ia, ib, ja, jb, ka, kb)
+
+    recurse(0, resolution, 0, resolution, 0, resolution)
+    return leaves
+
+
+def _build_host_sdf_octree_sparse(
+    occupancy: np.ndarray,
+    bounds: list[list[float]],
+    resolution: int,
+) -> tuple[np.ndarray, int | None, list[tuple[int, int, int]] | None, float | None]:
+    # For smaller grids, full EDT is typically faster and simpler.
+    if resolution <= 96:
+        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None
+
+    spacing = _bounds_spacing(bounds, resolution)
+    max_spacing = float(max(spacing))
+    eroded = ndimage.binary_erosion(occupancy, iterations=1)
+    surface = np.logical_xor(occupancy, eroded)
+    if not np.any(surface):
+        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None
+
+    block_size = max(8, min(32, resolution // 6))
+    band_voxels = max(12, resolution // 6)
+    band_distance = float(band_voxels) * max_spacing
+
+    surface_blocks = _octree_collect_surface_blocks(surface, block_size=block_size)
+    if not surface_blocks:
+        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None
+
+    blocks_per_axis = int(math.ceil(resolution / float(block_size)))
+    halo_blocks = max(1, int(math.ceil(float(band_voxels) / float(block_size))))
+    active_blocks: set[tuple[int, int, int]] = set()
+    for bx, by, bz in surface_blocks:
+        for dx in range(-halo_blocks, halo_blocks + 1):
+            for dy in range(-halo_blocks, halo_blocks + 1):
+                for dz in range(-halo_blocks, halo_blocks + 1):
+                    nbx = bx + dx
+                    nby = by + dy
+                    nbz = bz + dz
+                    if 0 <= nbx < blocks_per_axis and 0 <= nby < blocks_per_axis and 0 <= nbz < blocks_per_axis:
+                        active_blocks.add((nbx, nby, nbz))
+
+    near_mask = np.zeros_like(occupancy, dtype=bool)
+    for bx, by, bz in active_blocks:
+        i0 = bx * block_size
+        j0 = by * block_size
+        k0 = bz * block_size
+        i1 = min(resolution, i0 + block_size)
+        j1 = min(resolution, j0 + block_size)
+        k1 = min(resolution, k0 + block_size)
+        near_mask[i0:i1, j0:j1, k0:k1] = True
+
+    near_ratio = float(np.count_nonzero(near_mask)) / float(near_mask.size)
+    if near_ratio >= 0.65:
+        # Sparse path helps only when most of the domain is pruned.
+        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None
+
+    surface_idx = np.argwhere(surface)
+    query_idx = np.argwhere(near_mask)
+    if surface_idx.size == 0 or query_idx.size == 0:
+        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None
+
+    origin = np.asarray([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
+    spacing_vec = np.asarray(spacing, dtype=np.float64)
+    surface_pts = origin + surface_idx.astype(np.float64) * spacing_vec
+    query_pts = origin + query_idx.astype(np.float64) * spacing_vec
+
+    try:
+        tree = cKDTree(surface_pts)
+        query_dist, _ = tree.query(query_pts, workers=-1)
+    except Exception:
+        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None
+
+    sign = np.where(occupancy, -1.0, 1.0).astype(np.float32, copy=False)
+    far_value = np.float32(max(band_distance + 2.0 * max_spacing, max_spacing))
+    host_sdf = sign * far_value
+
+    signed_query = query_dist.astype(np.float32, copy=False) * sign[query_idx[:, 0], query_idx[:, 1], query_idx[:, 2]]
+    host_sdf[query_idx[:, 0], query_idx[:, 1], query_idx[:, 2]] = signed_query
+    active_blocks_sorted = sorted(active_blocks)
+    return host_sdf, block_size, active_blocks_sorted, float(far_value)
+
+
+def compose_hollow_lattice_field_sparse_with_backend(
+    host_sdf: np.ndarray,
+    bounds: list[list[float]],
+    shell_thickness: float,
+    lattice_type: str,
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+    block_size: int | None,
+    active_blocks: list[tuple[int, int, int]] | None,
+    compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
+) -> tuple[np.ndarray, Literal["cpu", "cuda"], list[tuple[int, int, int]] | None]:
+    field, backend = compose_hollow_lattice_field_with_backend(
+        host_sdf,
+        bounds,
+        shell_thickness=shell_thickness,
+        lattice_type=lattice_type,
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+        compute_backend=compute_backend,
+    )
+    updated_blocks: list[tuple[int, int, int]] | None = None
+    if block_size is not None:
+        updated_blocks = detect_zero_crossing_blocks(
+            field,
+            block_size=block_size,
+            candidate_blocks=active_blocks,
+        )
+    return field, backend, updated_blocks
 
 
 def compose_hollow_lattice_field(
