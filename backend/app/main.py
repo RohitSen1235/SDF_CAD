@@ -513,6 +513,8 @@ def _run_preview(
         mesh_backend=mesh_backend,
         meshing_mode=meshing_mode,
     )
+    if mesh_payload is None:
+        raise RuntimeError("preview mesh payload was not generated")
     return PreviewMeshResponse(mesh=mesh_payload, stats=stats)
 
 
@@ -524,7 +526,9 @@ def _run_preview_meshdata(
     compute_backend: ComputeBackend = "auto",
     mesh_backend: MeshBackend = "auto",
     meshing_mode: MeshingMode = "uniform",
-) -> tuple[MeshData, PreviewStats, MeshPayload]:
+    encode_mesh_payload: bool = True,
+    cache_result: bool = True,
+) -> tuple[MeshData, PreviewStats, MeshPayload | None]:
     ensure_scene_valid(scene_ir)
     merged_params = merge_parameter_values(scene_ir, param_values)
 
@@ -557,7 +561,7 @@ def _run_preview_meshdata(
                 normals=np.array(cached_mesh.normals, dtype=np.float64, copy=True),
             ),
             PreviewStats.model_validate(cached_stats),
-            cached_mesh.mesh,
+            cached_mesh.mesh if encode_mesh_payload else None,
         )
 
     eval_start = time.perf_counter()
@@ -602,17 +606,18 @@ def _run_preview_meshdata(
         preview_mode="mesh",
     )
 
-    mesh_payload = _encode_mesh_payload(mesh)
-    mesh_preview_cache.set(
-        cache_key,
-        MeshCacheEntry(
-            mesh=mesh_payload,
-            vertices=np.array(mesh.vertices, dtype=np.float64, copy=True),
-            faces=np.array(mesh.faces, dtype=np.int32, copy=True),
-            normals=np.array(mesh.normals, dtype=np.float64, copy=True),
-            stats=stats.model_dump(),
-        ),
-    )
+    mesh_payload = _encode_mesh_payload(mesh) if encode_mesh_payload else None
+    if cache_result and mesh_payload is not None:
+        mesh_preview_cache.set(
+            cache_key,
+            MeshCacheEntry(
+                mesh=mesh_payload,
+                vertices=np.array(mesh.vertices, dtype=np.float64, copy=True),
+                faces=np.array(mesh.faces, dtype=np.int32, copy=True),
+                normals=np.array(mesh.normals, dtype=np.float64, copy=True),
+                stats=stats.model_dump(),
+            ),
+        )
 
     return mesh, stats, mesh_payload
 
@@ -806,6 +811,8 @@ def _run_uploaded_mesh_preview(
         mesh_backend=mesh_backend,
         meshing_mode=meshing_mode,
     )
+    if mesh_payload is None or field_payload is None:
+        raise RuntimeError("uploaded preview payload was not generated")
     return PreviewMeshResponse(mesh=mesh_payload, stats=stats, field=field_payload)
 
 
@@ -904,7 +911,9 @@ def _run_uploaded_mesh_preview_meshdata(
     compute_backend: ComputeBackend = "auto",
     mesh_backend: MeshBackend = "auto",
     meshing_mode: MeshingMode = "uniform",
-) -> tuple[MeshData, PreviewStats, FieldPayload, MeshPayload]:
+    encode_response_payloads: bool = True,
+    cache_result: bool = True,
+) -> tuple[MeshData, PreviewStats, FieldPayload | None, MeshPayload | None]:
     cache_key = hash_uploaded_mesh_request(
         file_bytes=file_bytes,
         extension=extension,
@@ -931,20 +940,21 @@ def _run_uploaded_mesh_preview_meshdata(
     if cached_mesh is not None:
         cached_stats = copy.deepcopy(cached_mesh.stats)
         cached_stats["cache_hit"] = True
-        cached_field = None
-        if (
-            cached_mesh.field_resolution is not None
-            and cached_mesh.field_bounds is not None
-            and cached_mesh.field_data is not None
-        ):
-            cached_field = FieldPayload(
-                encoding="f32-base64",
-                resolution=int(cached_mesh.field_resolution),
-                bounds=[[float(axis[0]), float(axis[1])] for axis in cached_mesh.field_bounds],
-                data=cached_mesh.field_data,
-            )
-        if cached_field is None:
-            raise HTTPException(status_code=500, detail="Cached mesh entry is missing field payload")
+        cached_field: FieldPayload | None = None
+        if encode_response_payloads:
+            if (
+                cached_mesh.field_resolution is not None
+                and cached_mesh.field_bounds is not None
+                and cached_mesh.field_data is not None
+            ):
+                cached_field = FieldPayload(
+                    encoding="f32-base64",
+                    resolution=int(cached_mesh.field_resolution),
+                    bounds=[[float(axis[0]), float(axis[1])] for axis in cached_mesh.field_bounds],
+                    data=cached_mesh.field_data,
+                )
+            if cached_field is None:
+                raise HTTPException(status_code=500, detail="Cached mesh entry is missing field payload")
         return (
             MeshData(
                 vertices=np.array(cached_mesh.vertices, dtype=np.float64, copy=True),
@@ -953,7 +963,7 @@ def _run_uploaded_mesh_preview_meshdata(
             ),
             PreviewStats.model_validate(cached_stats),
             cached_field,
-            cached_mesh.mesh,
+            cached_mesh.mesh if encode_response_payloads else None,
         )
 
     eval_start = time.perf_counter()
@@ -1009,12 +1019,14 @@ def _run_uploaded_mesh_preview_meshdata(
         mesh_ms,
     )
 
-    field_payload = FieldPayload(
-        encoding="f32-base64",
-        resolution=int(field.shape[0]),
-        bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
-        data=_encode_field(field),
-    )
+    field_payload: FieldPayload | None = None
+    if encode_response_payloads:
+        field_payload = FieldPayload(
+            encoding="f32-base64",
+            resolution=int(field.shape[0]),
+            bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
+            data=_encode_field(field),
+        )
     stats = PreviewStats(
         eval_ms=eval_ms,
         mesh_ms=mesh_ms,
@@ -1025,20 +1037,21 @@ def _run_uploaded_mesh_preview_meshdata(
         preview_mode="mesh",
     )
 
-    mesh_payload = _encode_mesh_payload(mesh)
-    uploaded_mesh_preview_cache.set(
-        cache_key,
-        UploadedMeshCacheEntry(
-            mesh=mesh_payload,
-            vertices=np.array(mesh.vertices, dtype=np.float64, copy=True),
-            faces=np.array(mesh.faces, dtype=np.int32, copy=True),
-            normals=np.array(mesh.normals, dtype=np.float64, copy=True),
-            stats=stats.model_dump(),
-            field_resolution=int(field_payload.resolution),
-            field_bounds=[[float(axis[0]), float(axis[1])] for axis in field_payload.bounds],
-            field_data=field_payload.data,
-        ),
-    )
+    mesh_payload = _encode_mesh_payload(mesh) if encode_response_payloads else None
+    if cache_result and mesh_payload is not None and field_payload is not None:
+        uploaded_mesh_preview_cache.set(
+            cache_key,
+            UploadedMeshCacheEntry(
+                mesh=mesh_payload,
+                vertices=np.array(mesh.vertices, dtype=np.float64, copy=True),
+                faces=np.array(mesh.faces, dtype=np.int32, copy=True),
+                normals=np.array(mesh.normals, dtype=np.float64, copy=True),
+                stats=stats.model_dump(),
+                field_resolution=int(field_payload.resolution),
+                field_bounds=[[float(axis[0]), float(axis[1])] for axis in field_payload.bounds],
+                field_data=field_payload.data,
+            ),
+        )
     return mesh, stats, field_payload, mesh_payload
 
 
@@ -1088,6 +1101,8 @@ async def preview_mesh_binary(payload: PreviewMeshRequest) -> Response:
             payload.compute_backend,
             payload.mesh_backend,
             payload.meshing_mode,
+            False,
+            False,
         )
         headers = {
             "X-SDF-Stats": _stats_header_value(stats),
@@ -1220,6 +1235,8 @@ async def export_mesh(payload: ExportMeshRequest) -> Response | JobAcceptedRespo
             payload.compute_backend,
             payload.mesh_backend,
             payload.meshing_mode,
+            False,
+            False,
         )
     except (DslError, EvaluationError, MeshingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1394,6 +1411,8 @@ async def preview_uploaded_mesh_binary(
             compute_backend=compute_backend,
             mesh_backend=mesh_backend,
             meshing_mode=meshing_mode,
+            encode_response_payloads=False,
+            cache_result=False,
         )
         headers = {
             "X-SDF-Stats": _stats_header_value(stats),
@@ -1539,6 +1558,8 @@ async def export_uploaded_mesh(
             compute_backend=compute_backend,
             mesh_backend=mesh_backend,
             meshing_mode=meshing_mode,
+            encode_response_payloads=False,
+            cache_result=False,
         )
     except (MeshUploadError, MeshingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

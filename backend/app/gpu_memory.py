@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 from typing import Any
 
@@ -43,3 +44,19 @@ def with_gpu_cleanup(fn: Any, reason: str):
         return fn()
     finally:
         cleanup_gpu_memory(reason=reason)
+
+
+def cleanup_runtime_memory(reason: str = "runtime_cleanup") -> None:
+    """Best-effort release of process-local memory caches and GPU pools."""
+    cleanup_gpu_memory(reason=reason)
+    try:
+        from .cache import clear_all_caches
+        from .evaluator import clear_evaluator_caches
+        from .meshing import clear_meshing_caches
+
+        clear_all_caches()
+        clear_evaluator_caches()
+        clear_meshing_caches()
+    except Exception:
+        pass
+    gc.collect()

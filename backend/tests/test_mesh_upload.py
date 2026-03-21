@@ -164,3 +164,41 @@ def test_build_host_field_defaults_to_dense_host_sdf_metadata() -> None:
     assert host.host_sdf.shape == (48, 48, 48)
     assert host.block_size is None
     assert host.active_blocks is None
+
+
+def test_octree_sparse_host_sdf_returns_active_blocks_for_large_sparse_volume() -> None:
+    resolution = 128
+    occupancy = np.zeros((resolution, resolution, resolution), dtype=bool)
+    occupancy[56:72, 56:72, 56:72] = True
+    bounds = [[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
+
+    host_sdf, block_size, active_blocks = mesh_upload._build_host_sdf_octree_sparse(
+        occupancy,
+        bounds,
+        resolution,
+    )
+
+    assert host_sdf.shape == (resolution, resolution, resolution)
+    assert block_size is not None
+    assert active_blocks is not None
+    assert len(active_blocks) > 0
+    assert host_sdf[0, 0, 0] > 0.0
+    assert host_sdf[63, 63, 63] < 0.0
+
+
+def test_build_host_field_populates_sparse_metadata_when_sparse_path_is_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
+    resolution = 128
+    synthetic = np.zeros((resolution, resolution, resolution), dtype=bool)
+    synthetic[56:72, 56:72, 56:72] = True
+
+    monkeypatch.setattr(mesh_upload, "_voxelize_and_fill", lambda *_args, **_kwargs: synthetic)
+
+    host = mesh_upload.build_host_field(mesh, resolution=resolution)
+
+    assert host.host_sdf.shape == (resolution, resolution, resolution)
+    assert host.block_size is not None
+    assert host.active_blocks is not None
+    assert len(host.active_blocks) > 0

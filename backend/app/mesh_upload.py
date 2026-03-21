@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 import numpy as np
 from scipy import ndimage
+from scipy.spatial import cKDTree
 try:
     from numba import njit, prange
 
@@ -137,12 +138,140 @@ def build_host_field(
     bounds = _build_bounds(mesh)
     occupancy = _voxelize_and_fill(mesh, bounds, resolution)
 
+    host_sdf, block_size, active_blocks = _build_host_sdf_octree_sparse(occupancy, bounds, resolution)
+    return HostFieldData(
+        mesh=mesh,
+        bounds=bounds,
+        host_sdf=host_sdf,
+        block_size=block_size,
+        active_blocks=active_blocks,
+    )
+
+
+def _build_host_sdf_dense(
+    occupancy: np.ndarray,
+    bounds: list[list[float]],
+    resolution: int,
+) -> np.ndarray:
     spacing = _bounds_spacing(bounds, resolution)
     outside = np.logical_not(occupancy)
     dist_out = ndimage.distance_transform_edt(outside, sampling=spacing)
     dist_in = ndimage.distance_transform_edt(occupancy, sampling=spacing)
-    host_sdf = dist_out - dist_in
-    return HostFieldData(mesh=mesh, bounds=bounds, host_sdf=host_sdf, block_size=None, active_blocks=None)
+    return dist_out - dist_in
+
+
+def _octree_collect_surface_blocks(
+    surface_mask: np.ndarray,
+    block_size: int,
+) -> set[tuple[int, int, int]]:
+    resolution = int(surface_mask.shape[0])
+    if resolution <= 0:
+        return set()
+
+    leaves: set[tuple[int, int, int]] = set()
+
+    def recurse(i0: int, i1: int, j0: int, j1: int, k0: int, k1: int) -> None:
+        if i0 >= i1 or j0 >= j1 or k0 >= k1:
+            return
+        if not np.any(surface_mask[i0:i1, j0:j1, k0:k1]):
+            return
+
+        if (i1 - i0) <= block_size and (j1 - j0) <= block_size and (k1 - k0) <= block_size:
+            leaves.add((i0 // block_size, j0 // block_size, k0 // block_size))
+            return
+
+        im = (i0 + i1) // 2
+        jm = (j0 + j1) // 2
+        km = (k0 + k1) // 2
+        i_ranges = ((i0, im), (im, i1)) if im > i0 else ((i0, i1),)
+        j_ranges = ((j0, jm), (jm, j1)) if jm > j0 else ((j0, j1),)
+        k_ranges = ((k0, km), (km, k1)) if km > k0 else ((k0, k1),)
+
+        for ia, ib in i_ranges:
+            for ja, jb in j_ranges:
+                for ka, kb in k_ranges:
+                    recurse(ia, ib, ja, jb, ka, kb)
+
+    recurse(0, resolution, 0, resolution, 0, resolution)
+    return leaves
+
+
+def _build_host_sdf_octree_sparse(
+    occupancy: np.ndarray,
+    bounds: list[list[float]],
+    resolution: int,
+) -> tuple[np.ndarray, int | None, list[tuple[int, int, int]] | None]:
+    # For smaller grids, full EDT is typically faster and simpler.
+    if resolution <= 96:
+        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None
+
+    spacing = _bounds_spacing(bounds, resolution)
+    max_spacing = float(max(spacing))
+    eroded = ndimage.binary_erosion(occupancy, iterations=1)
+    surface = np.logical_xor(occupancy, eroded)
+    if not np.any(surface):
+        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None
+
+    block_size = max(8, min(32, resolution // 6))
+    band_voxels = max(12, resolution // 6)
+    band_distance = float(band_voxels) * max_spacing
+
+    surface_blocks = _octree_collect_surface_blocks(surface, block_size=block_size)
+    if not surface_blocks:
+        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None
+
+    blocks_per_axis = int(math.ceil(resolution / float(block_size)))
+    halo_blocks = max(1, int(math.ceil(float(band_voxels) / float(block_size))))
+    active_blocks: set[tuple[int, int, int]] = set()
+    for bx, by, bz in surface_blocks:
+        for dx in range(-halo_blocks, halo_blocks + 1):
+            for dy in range(-halo_blocks, halo_blocks + 1):
+                for dz in range(-halo_blocks, halo_blocks + 1):
+                    nbx = bx + dx
+                    nby = by + dy
+                    nbz = bz + dz
+                    if 0 <= nbx < blocks_per_axis and 0 <= nby < blocks_per_axis and 0 <= nbz < blocks_per_axis:
+                        active_blocks.add((nbx, nby, nbz))
+
+    near_mask = np.zeros_like(occupancy, dtype=bool)
+    for bx, by, bz in active_blocks:
+        i0 = bx * block_size
+        j0 = by * block_size
+        k0 = bz * block_size
+        i1 = min(resolution, i0 + block_size)
+        j1 = min(resolution, j0 + block_size)
+        k1 = min(resolution, k0 + block_size)
+        near_mask[i0:i1, j0:j1, k0:k1] = True
+
+    near_ratio = float(np.count_nonzero(near_mask)) / float(near_mask.size)
+    if near_ratio >= 0.65:
+        # Sparse path helps only when most of the domain is pruned.
+        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None
+
+    surface_idx = np.argwhere(surface)
+    query_idx = np.argwhere(near_mask)
+    if surface_idx.size == 0 or query_idx.size == 0:
+        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None
+
+    origin = np.asarray([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
+    spacing_vec = np.asarray(spacing, dtype=np.float64)
+    surface_pts = origin + surface_idx.astype(np.float64) * spacing_vec
+    query_pts = origin + query_idx.astype(np.float64) * spacing_vec
+
+    try:
+        tree = cKDTree(surface_pts)
+        query_dist, _ = tree.query(query_pts, workers=-1)
+    except Exception:
+        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None
+
+    sign = np.where(occupancy, -1.0, 1.0).astype(np.float32, copy=False)
+    far_value = np.float32(max(band_distance + 2.0 * max_spacing, max_spacing))
+    host_sdf = sign * far_value
+
+    signed_query = query_dist.astype(np.float32, copy=False) * sign[query_idx[:, 0], query_idx[:, 1], query_idx[:, 2]]
+    host_sdf[query_idx[:, 0], query_idx[:, 1], query_idx[:, 2]] = signed_query
+    active_blocks_sorted = sorted(active_blocks)
+    return host_sdf, block_size, active_blocks_sorted
 
 
 def compose_hollow_lattice_field(

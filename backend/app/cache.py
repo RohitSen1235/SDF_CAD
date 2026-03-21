@@ -41,6 +41,9 @@ class LruCache(Generic[T]):
         while len(self._data) > self.maxsize:
             self._data.popitem(last=False)
 
+    def clear(self) -> None:
+        self._data.clear()
+
 
 @dataclass
 class CompileCacheEntry:
@@ -90,6 +93,18 @@ class UploadedHostFieldCacheEntry:
 
 
 uploaded_host_field_cache: LruCache[UploadedHostFieldCacheEntry] = LruCache(maxsize=8)
+
+
+def clear_all_preview_caches() -> None:
+    mesh_preview_cache.clear()
+    field_preview_cache.clear()
+    uploaded_mesh_preview_cache.clear()
+    uploaded_host_field_cache.clear()
+
+
+def clear_all_caches() -> None:
+    scene_compile_cache.clear()
+    clear_all_preview_caches()
 
 
 def hash_source(source: str) -> str:

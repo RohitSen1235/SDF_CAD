@@ -175,6 +175,11 @@ def _cached_axes(
     return x, y, z
 
 
+def clear_evaluator_caches() -> None:
+    _cached_grid.cache_clear()
+    _cached_axes.cache_clear()
+
+
 def _rotation_matrix_xyz(deg: tuple[float, float, float], dtype: np.dtype[Any]) -> np.ndarray:
     rx, ry, rz = np.deg2rad(np.array(deg, dtype=np.float64))
     cx, sx = np.cos(rx), np.sin(rx)

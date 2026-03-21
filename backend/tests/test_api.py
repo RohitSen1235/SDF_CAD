@@ -248,6 +248,34 @@ def test_export_endpoint_accepts_adaptive_meshing_mode() -> None:
     assert response.headers["content-type"].startswith("text/plain")
 
 
+def test_export_endpoint_skips_mesh_payload_encoding_and_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import cache as cache_module
+
+    cache_module.clear_all_caches()
+
+    def fail_encode(*_args, **_kwargs):
+        raise AssertionError("_encode_mesh_payload should not run for export path")
+
+    def fail_cache_set(*_args, **_kwargs):
+        raise AssertionError("mesh_preview_cache.set should not run for export path")
+
+    monkeypatch.setattr(main_module, "_encode_mesh_payload", fail_encode)
+    monkeypatch.setattr(main_module.mesh_preview_cache, "set", fail_cache_set)
+
+    compiled = client.post("/api/v1/scene/compile", json={"source": SOURCE}).json()["scene_ir"]
+    response = client.post(
+        "/api/v1/export",
+        json={
+            "scene_ir": compiled,
+            "parameter_values": {"r": 0.79},
+            "format": "stl",
+            "quality_profile": "interactive",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("model/stl")
+
+
 def test_mesh_preview_endpoint_obj_upload() -> None:
     response = client.post(
         "/api/v1/mesh/preview",
@@ -377,6 +405,31 @@ def test_mesh_export_endpoint_obj() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/plain")
     assert b"\nv " in response.content
+
+
+def test_uploaded_export_endpoint_skips_mesh_payload_encoding_and_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import cache as cache_module
+
+    cache_module.clear_all_caches()
+
+    def fail_encode(*_args, **_kwargs):
+        raise AssertionError("_encode_mesh_payload should not run for uploaded export path")
+
+    def fail_cache_set(*_args, **_kwargs):
+        raise AssertionError("uploaded_mesh_preview_cache.set should not run for uploaded export path")
+
+    monkeypatch.setattr(main_module, "_encode_mesh_payload", fail_encode)
+    monkeypatch.setattr(main_module.uploaded_mesh_preview_cache, "set", fail_cache_set)
+
+    form = _mesh_form()
+    form["format"] = "stl"
+    response = client.post(
+        "/api/v1/mesh/export",
+        data=form,
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("model/stl")
 
 
 def test_mesh_preview_rejects_unsupported_extension() -> None:
