@@ -44,6 +44,7 @@ from .mesh_upload import (
     MeshUploadError,
     ParsedMesh,
     build_host_field,
+    compose_hollow_lattice_field_sparse_with_backend,
     compose_hollow_lattice_field_with_backend,
     compute_resolution_for_lattice_pitch,
     parse_mesh_bytes,
@@ -85,6 +86,7 @@ from .models import (
     QualityProfile,
     MeshBackend,
     MeshPayload,
+    UploadedFieldStorageMode,
     UploadedMeshPreviewWsRequest,
     UploadedMeshPreviewWsResponse,
 )
@@ -434,6 +436,7 @@ def _enqueue_uploaded_preview_job(
     compute_backend: ComputeBackend,
     mesh_backend: MeshBackend,
     meshing_mode: MeshingMode,
+    field_storage_mode: UploadedFieldStorageMode = "auto",
 ) -> JobAcceptedResponse:
     from .worker_tasks import preview_uploaded_mesh_job
 
@@ -449,6 +452,7 @@ def _enqueue_uploaded_preview_job(
         "compute_backend": compute_backend,
         "mesh_backend": mesh_backend,
         "meshing_mode": meshing_mode,
+        "field_storage_mode": field_storage_mode,
     }
     try:
         task = preview_uploaded_mesh_job.delay(payload)
@@ -470,6 +474,7 @@ def _enqueue_uploaded_export_job(
     compute_backend: ComputeBackend,
     mesh_backend: MeshBackend,
     meshing_mode: MeshingMode,
+    field_storage_mode: UploadedFieldStorageMode = "auto",
     format: Literal["stl", "obj"],
 ) -> JobAcceptedResponse:
     from .worker_tasks import export_uploaded_mesh_job
@@ -486,6 +491,7 @@ def _enqueue_uploaded_export_job(
         "compute_backend": compute_backend,
         "mesh_backend": mesh_backend,
         "meshing_mode": meshing_mode,
+        "field_storage_mode": field_storage_mode,
         "format": format,
     }
     try:
@@ -728,11 +734,20 @@ def _resolve_uploaded_host_field(
     file_bytes: bytes,
     extension: str,
     resolution: int,
-) -> tuple[ParsedMesh, list[list[float]], np.ndarray, int | None, list[tuple[int, int, int]] | None]:
+    field_storage_mode: UploadedFieldStorageMode = "auto",
+) -> tuple[
+    ParsedMesh,
+    list[list[float]],
+    np.ndarray,
+    int | None,
+    list[tuple[int, int, int]] | None,
+    UploadedFieldStorageMode,
+]:
     host_key = hash_uploaded_mesh_host_request(
         file_bytes=file_bytes,
         extension=extension,
         quality_profile=f"res_{resolution}",  # use resolution as cache key discriminator
+        field_storage_mode=field_storage_mode,
     )
     cached = uploaded_host_field_cache.get(host_key)
     if cached is not None:
@@ -744,11 +759,18 @@ def _resolve_uploaded_host_field(
         active_blocks: list[tuple[int, int, int]] | None = None
         if cached.active_blocks:
             active_blocks = [(int(bx), int(by), int(bz)) for bx, by, bz in cached.active_blocks]
-        return parsed, bounds, cached.host_sdf, cached.block_size, active_blocks
+        return (
+            parsed,
+            bounds,
+            np.array(cached.host_sdf, copy=True),
+            cached.block_size,
+            active_blocks,
+            cached.field_storage_mode,
+        )
 
     parsed = parse_mesh_bytes(file_bytes, extension)
     validate_triangle_mesh(parsed)
-    host = build_host_field(parsed, resolution=resolution)
+    host = build_host_field(parsed, resolution=resolution, field_storage_mode=field_storage_mode)
 
     uploaded_host_field_cache.set(
         host_key,
@@ -756,12 +778,26 @@ def _resolve_uploaded_host_field(
             vertices=np.array(parsed.vertices, dtype=np.float64, copy=True),
             faces=np.array(parsed.faces, dtype=np.int32, copy=True),
             bounds=[[float(axis[0]), float(axis[1])] for axis in host.bounds],
-            host_sdf=host.host_sdf,
+            host_sdf=np.array(host.host_sdf, copy=True),
+            field_storage_mode=host.field_storage_mode,
             block_size=host.block_size,
             active_blocks=host.active_blocks,
+            sparse_background_value=host.sparse_background_value,
+            sparse_bricks=(
+                {k: np.array(v, copy=True) for k, v in host.sparse_bricks.items()}
+                if host.sparse_bricks is not None
+                else None
+            ),
         ),
     )
-    return parsed, host.bounds, host.host_sdf, host.block_size, host.active_blocks
+    return (
+        parsed,
+        host.bounds,
+        np.array(host.host_sdf, copy=True),
+        host.block_size,
+        host.active_blocks,
+        host.field_storage_mode,
+    )
 
 
 def _compute_mesh_upload_resolution(
@@ -796,6 +832,7 @@ def _run_uploaded_mesh_preview(
     compute_backend: ComputeBackend = "auto",
     mesh_backend: MeshBackend = "auto",
     meshing_mode: MeshingMode = "uniform",
+    field_storage_mode: UploadedFieldStorageMode = "auto",
 ) -> PreviewMeshResponse:
     _, stats, field_payload, mesh_payload = _run_uploaded_mesh_preview_meshdata(
         file_bytes=file_bytes,
@@ -810,6 +847,7 @@ def _run_uploaded_mesh_preview(
         compute_backend=compute_backend,
         mesh_backend=mesh_backend,
         meshing_mode=meshing_mode,
+        field_storage_mode=field_storage_mode,
     )
     if mesh_payload is None or field_payload is None:
         raise RuntimeError("uploaded preview payload was not generated")
@@ -828,6 +866,7 @@ def _run_uploaded_mesh_field_preview(
     quality_profile: QualityProfile,
     voxels_per_lattice_period: int = 6,
     compute_backend: ComputeBackend = "auto",
+    field_storage_mode: UploadedFieldStorageMode = "auto",
 ) -> PreviewFieldResponse:
     field, bounds, stats = _run_uploaded_mesh_field_preview_data(
         file_bytes=file_bytes,
@@ -840,6 +879,7 @@ def _run_uploaded_mesh_field_preview(
         quality_profile=quality_profile,
         voxels_per_lattice_period=voxels_per_lattice_period,
         compute_backend=compute_backend,
+        field_storage_mode=field_storage_mode,
     )
     field_payload = FieldPayload(
         encoding="f32-base64",
@@ -862,26 +902,42 @@ def _run_uploaded_mesh_field_preview_data(
     quality_profile: QualityProfile,
     voxels_per_lattice_period: int = 6,
     compute_backend: ComputeBackend = "auto",
+    field_storage_mode: UploadedFieldStorageMode = "auto",
 ) -> tuple[np.ndarray, list[list[float]], PreviewStats]:
     eval_start = time.perf_counter()
     resolution = _compute_mesh_upload_resolution(
         file_bytes, extension, lattice_pitch, quality_profile, voxels_per_lattice_period
     )
-    _, bounds, host_sdf, _, _ = _resolve_uploaded_host_field(
+    _, bounds, host_sdf, sparse_block_size, active_blocks, _ = _resolve_uploaded_host_field(
         file_bytes=file_bytes,
         extension=extension,
         resolution=resolution,
+        field_storage_mode=field_storage_mode,
     )
-    field, eval_backend_used = compose_hollow_lattice_field_with_backend(
-        host_sdf,
-        bounds,
-        shell_thickness=shell_thickness,
-        lattice_type=lattice_type,
-        lattice_pitch=lattice_pitch,
-        lattice_thickness=lattice_thickness,
-        lattice_phase=lattice_phase,
-        compute_backend=compute_backend,
-    )
+    if sparse_block_size is not None and active_blocks:
+        field, eval_backend_used, _ = compose_hollow_lattice_field_sparse_with_backend(
+            host_sdf,
+            bounds,
+            shell_thickness=shell_thickness,
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+            block_size=sparse_block_size,
+            active_blocks=active_blocks,
+            compute_backend=compute_backend,
+        )
+    else:
+        field, eval_backend_used = compose_hollow_lattice_field_with_backend(
+            host_sdf,
+            bounds,
+            shell_thickness=shell_thickness,
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+            compute_backend=compute_backend,
+        )
     eval_ms = (time.perf_counter() - eval_start) * 1000.0
     out_bounds = [[float(axis[0]), float(axis[1])] for axis in bounds]
     stats = PreviewStats(
@@ -911,6 +967,7 @@ def _run_uploaded_mesh_preview_meshdata(
     compute_backend: ComputeBackend = "auto",
     mesh_backend: MeshBackend = "auto",
     meshing_mode: MeshingMode = "uniform",
+    field_storage_mode: UploadedFieldStorageMode = "auto",
     encode_response_payloads: bool = True,
     cache_result: bool = True,
 ) -> tuple[MeshData, PreviewStats, FieldPayload | None, MeshPayload | None]:
@@ -926,6 +983,7 @@ def _run_uploaded_mesh_preview_meshdata(
         compute_backend=compute_backend,
         mesh_backend=mesh_backend,
         meshing_mode=meshing_mode,
+        field_storage_mode=field_storage_mode,
     )
     cached_mesh = uploaded_mesh_preview_cache.get(cache_key)
     if (
@@ -972,23 +1030,39 @@ def _run_uploaded_mesh_preview_meshdata(
     resolution = _compute_mesh_upload_resolution(
         file_bytes, extension, lattice_pitch, quality_profile, voxels_per_lattice_period
     )
-    parsed, bounds, host_sdf, sparse_block_size, active_blocks = _resolve_uploaded_host_field(
+    parsed, bounds, host_sdf, sparse_block_size, active_blocks, _ = _resolve_uploaded_host_field(
         file_bytes=file_bytes,
         extension=extension,
         resolution=resolution,
+        field_storage_mode=field_storage_mode,
     )
     host_ms = (time.perf_counter() - host_start) * 1000.0
     compose_start = time.perf_counter()
-    field, eval_backend_used = compose_hollow_lattice_field_with_backend(
-        host_sdf,
-        bounds,
-        shell_thickness=shell_thickness,
-        lattice_type=lattice_type,
-        lattice_pitch=lattice_pitch,
-        lattice_thickness=lattice_thickness,
-        lattice_phase=lattice_phase,
-        compute_backend=compute_backend,
-    )
+    if sparse_block_size is not None and active_blocks:
+        field, eval_backend_used, updated_blocks = compose_hollow_lattice_field_sparse_with_backend(
+            host_sdf,
+            bounds,
+            shell_thickness=shell_thickness,
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+            block_size=sparse_block_size,
+            active_blocks=active_blocks,
+            compute_backend=compute_backend,
+        )
+        active_blocks = updated_blocks or active_blocks
+    else:
+        field, eval_backend_used = compose_hollow_lattice_field_with_backend(
+            host_sdf,
+            bounds,
+            shell_thickness=shell_thickness,
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+            compute_backend=compute_backend,
+        )
     compose_ms = (time.perf_counter() - compose_start) * 1000.0
     eval_ms = (time.perf_counter() - eval_start) * 1000.0
 
@@ -1327,6 +1401,7 @@ async def preview_uploaded_mesh(
     compute_backend: ComputeBackend = Form("auto"),
     mesh_backend: MeshBackend = Form("auto"),
     meshing_mode: MeshingMode = Form("uniform"),
+    field_storage_mode: UploadedFieldStorageMode = Form("auto"),
     execution_mode: ExecutionMode = Form("auto"),
 ) -> PreviewMeshResponse | JobAcceptedResponse:
     file_bytes, extension = await _read_uploaded_mesh(file)
@@ -1344,6 +1419,7 @@ async def preview_uploaded_mesh(
                 compute_backend=compute_backend,
                 mesh_backend=mesh_backend,
                 meshing_mode=meshing_mode,
+                field_storage_mode=field_storage_mode,
             )
         except HTTPException as exc:
             if execution_mode == "queued" or exc.status_code != 503:
@@ -1367,6 +1443,7 @@ async def preview_uploaded_mesh(
             compute_backend=compute_backend,
             mesh_backend=mesh_backend,
             meshing_mode=meshing_mode,
+            field_storage_mode=field_storage_mode,
         )
         return result
     except (MeshUploadError, MeshingError) as exc:
@@ -1388,6 +1465,7 @@ async def preview_uploaded_mesh_binary(
     compute_backend: ComputeBackend = Form("auto"),
     mesh_backend: MeshBackend = Form("auto"),
     meshing_mode: MeshingMode = Form("uniform"),
+    field_storage_mode: UploadedFieldStorageMode = Form("auto"),
     execution_mode: ExecutionMode = Form("auto"),
 ) -> Response:
     file_bytes, extension = await _read_uploaded_mesh(file)
@@ -1411,6 +1489,7 @@ async def preview_uploaded_mesh_binary(
             compute_backend=compute_backend,
             mesh_backend=mesh_backend,
             meshing_mode=meshing_mode,
+            field_storage_mode=field_storage_mode,
             encode_response_payloads=False,
             cache_result=False,
         )
@@ -1437,6 +1516,7 @@ async def preview_uploaded_mesh_field(
     quality_profile: QualityProfile = Form("medium"),
     voxels_per_lattice_period: int = Form(6),
     compute_backend: ComputeBackend = Form("auto"),
+    field_storage_mode: UploadedFieldStorageMode = Form("auto"),
 ) -> PreviewFieldResponse:
     file_bytes, extension = await _read_uploaded_mesh(file)
     try:
@@ -1452,6 +1532,7 @@ async def preview_uploaded_mesh_field(
             quality_profile=quality_profile,
             voxels_per_lattice_period=voxels_per_lattice_period,
             compute_backend=compute_backend,
+            field_storage_mode=field_storage_mode,
         )
         return result
     except (MeshUploadError, MeshingError) as exc:
@@ -1471,6 +1552,7 @@ async def preview_uploaded_mesh_field_binary(
     quality_profile: QualityProfile = Form("medium"),
     voxels_per_lattice_period: int = Form(6),
     compute_backend: ComputeBackend = Form("auto"),
+    field_storage_mode: UploadedFieldStorageMode = Form("auto"),
 ) -> Response:
     file_bytes, extension = await _read_uploaded_mesh(file)
     try:
@@ -1486,6 +1568,7 @@ async def preview_uploaded_mesh_field_binary(
             quality_profile=quality_profile,
             voxels_per_lattice_period=voxels_per_lattice_period,
             compute_backend=compute_backend,
+            field_storage_mode=field_storage_mode,
         )
         headers = {
             "X-SDF-Stats": _stats_header_value(stats),
@@ -1516,6 +1599,7 @@ async def export_uploaded_mesh(
     compute_backend: ComputeBackend = Form("auto"),
     mesh_backend: MeshBackend = Form("auto"),
     meshing_mode: MeshingMode = Form("uniform"),
+    field_storage_mode: UploadedFieldStorageMode = Form("auto"),
     format: Literal["stl", "obj"] = Form("stl"),
     execution_mode: ExecutionMode = Form("auto"),
 ) -> Response | JobAcceptedResponse:
@@ -1534,6 +1618,7 @@ async def export_uploaded_mesh(
                 compute_backend=compute_backend,
                 mesh_backend=mesh_backend,
                 meshing_mode=meshing_mode,
+                field_storage_mode=field_storage_mode,
                 format=format,
             )
         except HTTPException as exc:
@@ -1558,6 +1643,7 @@ async def export_uploaded_mesh(
             compute_backend=compute_backend,
             mesh_backend=mesh_backend,
             meshing_mode=meshing_mode,
+            field_storage_mode=field_storage_mode,
             encode_response_payloads=False,
             cache_result=False,
         )
@@ -1612,6 +1698,7 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                 compute_backend=payload.compute_backend,
                 mesh_backend=payload.mesh_backend,
                 meshing_mode=payload.meshing_mode,
+                field_storage_mode=payload.field_storage_mode,
             )
             cached_mesh = uploaded_mesh_preview_cache.get(cache_key)
             if (
@@ -1675,23 +1762,39 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                         payload.quality_profile,
                         voxels_per_lattice_period,
                     )
-                    parsed, bounds, host_sdf, sparse_block_size, active_blocks = _resolve_uploaded_host_field(
+                    parsed, bounds, host_sdf, sparse_block_size, active_blocks, _ = _resolve_uploaded_host_field(
                         file_bytes=file_bytes,
                         extension=extension,
                         resolution=ws_resolution,
+                        field_storage_mode=payload.field_storage_mode,
                     )
                     host_ms = (time.perf_counter() - host_start) * 1000.0
                     compose_start = time.perf_counter()
-                    field, eval_backend_used = compose_hollow_lattice_field_with_backend(
-                        host_sdf,
-                        bounds,
-                        shell_thickness=payload.shell_thickness,
-                        lattice_type=payload.lattice_type,
-                        lattice_pitch=payload.lattice_pitch,
-                        lattice_thickness=payload.lattice_thickness,
-                        lattice_phase=payload.lattice_phase,
-                        compute_backend=payload.compute_backend,
-                    )
+                    if sparse_block_size is not None and active_blocks:
+                        field, eval_backend_used, updated_blocks = compose_hollow_lattice_field_sparse_with_backend(
+                            host_sdf,
+                            bounds,
+                            shell_thickness=payload.shell_thickness,
+                            lattice_type=payload.lattice_type,
+                            lattice_pitch=payload.lattice_pitch,
+                            lattice_thickness=payload.lattice_thickness,
+                            lattice_phase=payload.lattice_phase,
+                            block_size=sparse_block_size,
+                            active_blocks=active_blocks,
+                            compute_backend=payload.compute_backend,
+                        )
+                        active_blocks = updated_blocks or active_blocks
+                    else:
+                        field, eval_backend_used = compose_hollow_lattice_field_with_backend(
+                            host_sdf,
+                            bounds,
+                            shell_thickness=payload.shell_thickness,
+                            lattice_type=payload.lattice_type,
+                            lattice_pitch=payload.lattice_pitch,
+                            lattice_thickness=payload.lattice_thickness,
+                            lattice_phase=payload.lattice_phase,
+                            compute_backend=payload.compute_backend,
+                        )
                     compose_ms = (time.perf_counter() - compose_start) * 1000.0
                     eval_ms = (time.perf_counter() - eval_start) * 1000.0
                     field_payload = FieldPayload(

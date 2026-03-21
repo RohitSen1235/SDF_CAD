@@ -96,6 +96,7 @@ def preview_uploaded_mesh_job(payload: dict[str, Any]) -> dict[str, Any]:
             compute_backend=str(payload.get("compute_backend", "auto")),
             mesh_backend=str(payload.get("mesh_backend", "auto")),
             meshing_mode=str(payload.get("meshing_mode", "uniform")),
+            field_storage_mode=str(payload.get("field_storage_mode", "auto")),
         )
         return {"kind": "preview_uploaded_mesh", "payload": preview.model_dump(mode="json")}
     finally:
@@ -119,6 +120,7 @@ def export_uploaded_mesh_job(payload: dict[str, Any]) -> dict[str, Any]:
             compute_backend=str(payload.get("compute_backend", "auto")),
             mesh_backend=str(payload.get("mesh_backend", "auto")),
             meshing_mode=str(payload.get("meshing_mode", "uniform")),
+            field_storage_mode=str(payload.get("field_storage_mode", "auto")),
             encode_response_payloads=False,
             cache_result=False,
         )

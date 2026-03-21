@@ -172,7 +172,7 @@ def test_octree_sparse_host_sdf_returns_active_blocks_for_large_sparse_volume() 
     occupancy[56:72, 56:72, 56:72] = True
     bounds = [[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
 
-    host_sdf, block_size, active_blocks = mesh_upload._build_host_sdf_octree_sparse(
+    host_sdf, block_size, active_blocks, sparse_background_value = mesh_upload._build_host_sdf_octree_sparse(
         occupancy,
         bounds,
         resolution,
@@ -182,6 +182,7 @@ def test_octree_sparse_host_sdf_returns_active_blocks_for_large_sparse_volume() 
     assert block_size is not None
     assert active_blocks is not None
     assert len(active_blocks) > 0
+    assert sparse_background_value is not None
     assert host_sdf[0, 0, 0] > 0.0
     assert host_sdf[63, 63, 63] < 0.0
 
@@ -202,3 +203,13 @@ def test_build_host_field_populates_sparse_metadata_when_sparse_path_is_used(
     assert host.block_size is not None
     assert host.active_blocks is not None
     assert len(host.active_blocks) > 0
+    assert host.field_storage_mode == "octree_sparse"
+    assert host.sparse_bricks is not None
+
+
+def test_build_host_field_supports_explicit_dense_mode() -> None:
+    mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
+    host = mesh_upload.build_host_field(mesh, resolution=96, field_storage_mode="dense")
+    assert host.field_storage_mode == "dense"
+    assert host.block_size is None
+    assert host.active_blocks is None

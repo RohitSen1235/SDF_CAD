@@ -17,6 +17,7 @@ from .models import (
     MeshPayload,
     MeshingMode,
     SceneIR,
+    UploadedFieldStorageMode,
 )
 
 T = TypeVar("T")
@@ -88,8 +89,11 @@ class UploadedHostFieldCacheEntry:
     faces: np.ndarray
     bounds: list[list[float]]
     host_sdf: np.ndarray
+    field_storage_mode: UploadedFieldStorageMode = "dense"
     block_size: int | None = None
     active_blocks: list[tuple[int, int, int]] | None = None
+    sparse_background_value: float | None = None
+    sparse_bricks: dict[tuple[int, int, int], np.ndarray] | None = None
 
 
 uploaded_host_field_cache: LruCache[UploadedHostFieldCacheEntry] = LruCache(maxsize=8)
@@ -170,6 +174,7 @@ def hash_uploaded_mesh_request(
     compute_backend: str = "auto",
     mesh_backend: str = "auto",
     meshing_mode: str = "uniform",
+    field_storage_mode: str = "auto",
 ) -> str:
     payload: dict[str, Any] = {
         "file_hash": hashlib.sha256(file_bytes).hexdigest(),
@@ -183,6 +188,7 @@ def hash_uploaded_mesh_request(
         "compute_backend": compute_backend,
         "mesh_backend": mesh_backend,
         "meshing_mode": meshing_mode,
+        "field_storage_mode": field_storage_mode,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -193,11 +199,13 @@ def hash_uploaded_mesh_host_request(
     file_bytes: bytes,
     extension: str,
     quality_profile: str,
+    field_storage_mode: str = "auto",
 ) -> str:
     payload: dict[str, Any] = {
         "file_hash": hashlib.sha256(file_bytes).hexdigest(),
         "extension": extension.lower(),
         "quality_profile": quality_profile,
+        "field_storage_mode": field_storage_mode,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
