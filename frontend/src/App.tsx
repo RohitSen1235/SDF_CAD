@@ -453,7 +453,7 @@ export default function App() {
       return;
     }
     try {
-      const blob = await exportMesh(
+      await exportMesh(
         sceneIr,
         params,
         format,
@@ -463,11 +463,6 @@ export default function App() {
         meshBackend,
         meshingMode
       );
-      const link = document.createElement("a");
-      link.href = URL.createObjectURL(blob);
-      link.download = `sdf-model.${format}`;
-      link.click();
-      URL.revokeObjectURL(link.href);
     } catch (exportError) {
       setError((exportError as Error).message);
     }
@@ -569,7 +564,7 @@ export default function App() {
     }
 
     try {
-      const blob = await exportUploadedMesh(
+      await exportUploadedMesh(
         meshFile,
         meshWorkflowParams,
         format,
@@ -579,11 +574,6 @@ export default function App() {
         meshingMode,
         voxelsPerLatticePeriod
       );
-      const link = document.createElement("a");
-      link.href = URL.createObjectURL(blob);
-      link.download = `mesh-lattice.${format}`;
-      link.click();
-      URL.revokeObjectURL(link.href);
     } catch (exportError) {
       setError((exportError as Error).message);
     }

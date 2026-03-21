@@ -23,6 +23,20 @@ export interface CompileSceneResult {
   diagnostics: CompileDiagnostics;
 }
 
+interface JobAcceptedResponse {
+  job_id: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  status_url: string;
+  result_url: string;
+}
+
+interface JobStatusResponse {
+  job_id: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  task_name: string;
+  detail?: string | null;
+}
+
 async function parseJsonOrThrow(response: Response): Promise<any> {
   if (response.ok) {
     return response.json();
@@ -306,7 +320,7 @@ export async function exportMesh(
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
   meshingMode: MeshingMode = "uniform"
-): Promise<Blob> {
+): Promise<void> {
   try {
     const response = await fetch(`${API_BASE}/api/v1/export`, {
       method: "POST",
@@ -319,14 +333,24 @@ export async function exportMesh(
         compute_precision: computePrecision,
         compute_backend: computeBackend,
         mesh_backend: meshBackend,
-        meshing_mode: meshingMode
+        meshing_mode: meshingMode,
+        execution_mode: "auto"
       })
     });
+
     if (!response.ok) {
-      const payload = await response.json().catch(() => ({ detail: "Export failed" }));
-      throw new Error(payload.detail ?? "Export failed");
+      await parseErrorResponse(response, "Export failed");
     }
-    return response.blob();
+
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const accepted = (await response.json()) as JobAcceptedResponse;
+      await waitForJobAndTriggerBrowserDownload(accepted);
+      return;
+    }
+
+    const blob = await response.blob();
+    triggerBlobDownload(blob, `sdf-model.${format}`);
   } catch (error) {
     if ((error as Error)?.name === "AbortError") {
       throw error;
@@ -336,6 +360,32 @@ export async function exportMesh(
     }
     throw error;
   }
+}
+
+async function waitForJobAndTriggerBrowserDownload(job: JobAcceptedResponse): Promise<void> {
+  const maxAttempts = 600;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const statusResponse = await fetch(`${API_BASE}${job.status_url}`, { method: "GET" });
+    const statusPayload = (await parseJsonOrThrow(statusResponse)) as JobStatusResponse;
+    if (statusPayload.status === "succeeded") {
+      window.location.assign(`${API_BASE}${job.result_url}`);
+      return;
+    }
+    if (statusPayload.status === "failed") {
+      throw new Error(statusPayload.detail ?? "Export job failed");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  throw new Error("Export timed out while waiting for queued job result");
+}
+
+function triggerBlobDownload(blob: Blob, filename: string): void {
+  const link = document.createElement("a");
+  const href = URL.createObjectURL(blob);
+  link.href = href;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(href);
 }
 
 function appendMeshWorkflowFormData(
@@ -573,20 +623,30 @@ export async function exportUploadedMesh(
   meshBackend: MeshBackend = "auto",
   meshingMode: MeshingMode = "uniform",
   voxelsPerLatticePeriod: number = 6
-): Promise<Blob> {
+): Promise<void> {
   try {
     const body = new FormData();
     appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
     body.append("format", format);
+    body.append("execution_mode", "auto");
     const response = await fetch(`${API_BASE}/api/v1/mesh/export`, {
       method: "POST",
       body
     });
+
     if (!response.ok) {
-      const payload = await response.json().catch(() => ({ detail: "Export failed" }));
-      throw new Error(payload.detail ?? "Export failed");
+      await parseErrorResponse(response, "Export failed");
     }
-    return response.blob();
+
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const accepted = (await response.json()) as JobAcceptedResponse;
+      await waitForJobAndTriggerBrowserDownload(accepted);
+      return;
+    }
+
+    const blob = await response.blob();
+    triggerBlobDownload(blob, `mesh-lattice.${format}`);
   } catch (error) {
     if ((error as Error)?.name === "AbortError") {
       throw error;
