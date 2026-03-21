@@ -1,0 +1,17 @@
+.git
+.gitignore
+
+**/__pycache__/
+**/.pytest_cache/
+**/*.pyc
+**/*.pyo
+
+backend/.venv/
+frontend/node_modules/
+
+dist/
+build/
+coverage/
+
+*.log
+*.tmp

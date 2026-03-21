@@ -39,6 +39,48 @@ npm run dev
 
 Open `http://127.0.0.1:5173`.
 
+### Docker Compose
+
+From the repository root:
+
+```bash
+docker compose up --build
+```
+
+This starts:
+
+- Frontend: `http://127.0.0.1:5173`
+- Backend API: `http://127.0.0.1:8000`
+
+The frontend in Docker Compose is configured with `VITE_API_BASE=http://127.0.0.1:8000` so browser requests resolve to the backend published on the host port.
+
+By default, Compose runs only frontend + backend (same simple behavior as before containerization).
+
+If you want queued/background jobs, start the optional queue profile:
+
+```bash
+docker compose --profile queue up --build
+```
+
+That additionally starts:
+
+- Redis: `127.0.0.1:6379`
+- Celery worker
+
+For low-memory environments, the worker runs with `--concurrency=1 --pool=solo` in Compose to reduce memory pressure.
+
+To stop and remove containers:
+
+```bash
+docker compose down
+```
+
+If you hit stale-container conflicts from previous runs, clean up with:
+
+```bash
+docker compose down --remove-orphans
+```
+
 ## API
 
 - `POST /api/v1/scene/compile`

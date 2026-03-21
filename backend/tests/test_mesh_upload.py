@@ -156,3 +156,11 @@ def test_voxelize_falls_back_when_numba_kernel_fails(monkeypatch: pytest.MonkeyP
     filled = mesh_upload._voxelize_and_fill(mesh, bounds, resolution=40)
     assert called["python"] is True
     assert np.any(filled)
+
+
+def test_build_host_field_defaults_to_dense_host_sdf_metadata() -> None:
+    mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
+    host = mesh_upload.build_host_field(mesh, resolution=48)
+    assert host.host_sdf.shape == (48, 48, 48)
+    assert host.block_size is None
+    assert host.active_blocks is None

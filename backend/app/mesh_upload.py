@@ -40,6 +40,8 @@ class HostFieldData:
     mesh: ParsedMesh
     bounds: list[list[float]]
     host_sdf: np.ndarray
+    block_size: int | None = None
+    active_blocks: list[tuple[int, int, int]] | None = None
 
 
 def parse_mesh_bytes(data: bytes, extension: str) -> ParsedMesh:
@@ -140,7 +142,7 @@ def build_host_field(
     dist_out = ndimage.distance_transform_edt(outside, sampling=spacing)
     dist_in = ndimage.distance_transform_edt(occupancy, sampling=spacing)
     host_sdf = dist_out - dist_in
-    return HostFieldData(mesh=mesh, bounds=bounds, host_sdf=host_sdf)
+    return HostFieldData(mesh=mesh, bounds=bounds, host_sdf=host_sdf, block_size=None, active_blocks=None)
 
 
 def compose_hollow_lattice_field(

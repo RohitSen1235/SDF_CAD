@@ -4,7 +4,9 @@ import asyncio
 import base64
 import binascii
 import copy
+import json
 import logging
+import struct
 import time
 from pathlib import Path
 from typing import Literal
@@ -127,6 +129,13 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "X-SDF-Stats",
+        "X-SDF-Resolution",
+        "X-SDF-Bounds",
+        "X-SDF-Vertex-Count",
+        "X-SDF-Face-Count",
+    ],
 )
 
 
@@ -314,6 +323,12 @@ def _encode_field(field: np.ndarray) -> str:
     return base64.b64encode(payload).decode("ascii")
 
 
+def _pack_field_binary(field: np.ndarray) -> bytes:
+    # Preserve the same axis-major semantics as _encode_field() used by
+    # existing JSON/base64 payloads.
+    return np.asarray(field, dtype=np.float32).tobytes(order="F")
+
+
 def _encode_mesh_payload(mesh: MeshData) -> MeshPayload:
     vertices = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
     faces = np.ascontiguousarray(mesh.faces, dtype=np.uint32)
@@ -326,6 +341,25 @@ def _encode_mesh_payload(mesh: MeshData) -> MeshPayload:
         indices_b64=base64.b64encode(faces.tobytes()).decode("ascii"),
         normals_b64=base64.b64encode(normals.tobytes()).decode("ascii"),
     )
+
+
+def _pack_mesh_binary(mesh: MeshData) -> bytes:
+    vertices = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
+    faces = np.ascontiguousarray(mesh.faces, dtype=np.uint32)
+    normals = np.ascontiguousarray(mesh.normals, dtype=np.float32)
+    vertex_count = int(vertices.shape[0])
+    face_count = int(faces.shape[0])
+    header = b"SDFMESH1" + struct.pack("<II", vertex_count, face_count)
+    return header + vertices.tobytes() + faces.tobytes() + normals.tobytes()
+
+
+def _stats_header_value(stats: PreviewStats) -> str:
+    return json.dumps(stats.model_dump(mode="json"), separators=(",", ":"))
+
+
+def _bounds_header_value(bounds: list[list[float]]) -> str:
+    compact = [[float(axis[0]), float(axis[1])] for axis in bounds]
+    return json.dumps(compact, separators=(",", ":"))
 
 
 def _should_queue_scene_job(grid: GridConfig, execution_mode: ExecutionMode) -> bool:
@@ -590,6 +624,29 @@ def _run_field_preview(
     compute_precision: ComputePrecision = "float32",
     compute_backend: ComputeBackend = "auto",
 ) -> PreviewFieldResponse:
+    field, bounds, stats = _run_field_preview_data(
+        scene_ir,
+        param_values,
+        grid,
+        compute_precision,
+        compute_backend,
+    )
+    payload = FieldPayload(
+        encoding="f32-base64",
+        resolution=int(field.shape[0]),
+        bounds=bounds,
+        data=_encode_field(field),
+    )
+    return PreviewFieldResponse(field=payload, stats=stats)
+
+
+def _run_field_preview_data(
+    scene_ir,
+    param_values: dict[str, float],
+    grid: GridConfig,
+    compute_precision: ComputePrecision = "float32",
+    compute_backend: ComputeBackend = "auto",
+) -> tuple[np.ndarray, list[list[float]], PreviewStats]:
     ensure_scene_valid(scene_ir)
     merged_params = merge_parameter_values(scene_ir, param_values)
     field_key = _field_cache_key(scene_ir, merged_params, grid, compute_precision, compute_backend)
@@ -625,13 +682,8 @@ def _run_field_preview(
         mesh_backend="cpu",
         preview_mode="field",
     )
-    payload = FieldPayload(
-        encoding="f32-base64",
-        resolution=int(field.shape[0]),
-        bounds=[[float(axis[0]), float(axis[1])] for axis in grid.bounds],
-        data=_encode_field(field),
-    )
-    return PreviewFieldResponse(field=payload, stats=stats)
+    bounds = [[float(axis[0]), float(axis[1])] for axis in grid.bounds]
+    return field, bounds, stats
 
 
 def _stream_file_chunks(path: Path, chunk_size: int = 1024 * 1024, delete_after: bool = False):
@@ -671,7 +723,7 @@ def _resolve_uploaded_host_field(
     file_bytes: bytes,
     extension: str,
     resolution: int,
-) -> tuple[ParsedMesh, list[list[float]], np.ndarray]:
+) -> tuple[ParsedMesh, list[list[float]], np.ndarray, int | None, list[tuple[int, int, int]] | None]:
     host_key = hash_uploaded_mesh_host_request(
         file_bytes=file_bytes,
         extension=extension,
@@ -684,7 +736,10 @@ def _resolve_uploaded_host_field(
             faces=np.array(cached.faces, dtype=np.int32, copy=True),
         )
         bounds = [[float(axis[0]), float(axis[1])] for axis in cached.bounds]
-        return parsed, bounds, cached.host_sdf
+        active_blocks: list[tuple[int, int, int]] | None = None
+        if cached.active_blocks:
+            active_blocks = [(int(bx), int(by), int(bz)) for bx, by, bz in cached.active_blocks]
+        return parsed, bounds, cached.host_sdf, cached.block_size, active_blocks
 
     parsed = parse_mesh_bytes(file_bytes, extension)
     validate_triangle_mesh(parsed)
@@ -697,9 +752,11 @@ def _resolve_uploaded_host_field(
             faces=np.array(parsed.faces, dtype=np.int32, copy=True),
             bounds=[[float(axis[0]), float(axis[1])] for axis in host.bounds],
             host_sdf=host.host_sdf,
+            block_size=host.block_size,
+            active_blocks=host.active_blocks,
         ),
     )
-    return parsed, host.bounds, host.host_sdf
+    return parsed, host.bounds, host.host_sdf, host.block_size, host.active_blocks
 
 
 def _compute_mesh_upload_resolution(
@@ -765,11 +822,45 @@ def _run_uploaded_mesh_field_preview(
     voxels_per_lattice_period: int = 6,
     compute_backend: ComputeBackend = "auto",
 ) -> PreviewFieldResponse:
+    field, bounds, stats = _run_uploaded_mesh_field_preview_data(
+        file_bytes=file_bytes,
+        extension=extension,
+        shell_thickness=shell_thickness,
+        lattice_type=lattice_type,
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+        quality_profile=quality_profile,
+        voxels_per_lattice_period=voxels_per_lattice_period,
+        compute_backend=compute_backend,
+    )
+    field_payload = FieldPayload(
+        encoding="f32-base64",
+        resolution=int(field.shape[0]),
+        bounds=bounds,
+        data=_encode_field(field),
+    )
+    return PreviewFieldResponse(field=field_payload, stats=stats)
+
+
+def _run_uploaded_mesh_field_preview_data(
+    *,
+    file_bytes: bytes,
+    extension: str,
+    shell_thickness: float,
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"],
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+    quality_profile: QualityProfile,
+    voxels_per_lattice_period: int = 6,
+    compute_backend: ComputeBackend = "auto",
+) -> tuple[np.ndarray, list[list[float]], PreviewStats]:
     eval_start = time.perf_counter()
     resolution = _compute_mesh_upload_resolution(
         file_bytes, extension, lattice_pitch, quality_profile, voxels_per_lattice_period
     )
-    _, bounds, host_sdf = _resolve_uploaded_host_field(
+    _, bounds, host_sdf, _, _ = _resolve_uploaded_host_field(
         file_bytes=file_bytes,
         extension=extension,
         resolution=resolution,
@@ -785,12 +876,7 @@ def _run_uploaded_mesh_field_preview(
         compute_backend=compute_backend,
     )
     eval_ms = (time.perf_counter() - eval_start) * 1000.0
-    field_payload = FieldPayload(
-        encoding="f32-base64",
-        resolution=int(field.shape[0]),
-        bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
-        data=_encode_field(field),
-    )
+    out_bounds = [[float(axis[0]), float(axis[1])] for axis in bounds]
     stats = PreviewStats(
         eval_ms=eval_ms,
         mesh_ms=None,
@@ -801,7 +887,7 @@ def _run_uploaded_mesh_field_preview(
         mesh_backend="cpu",
         preview_mode="field",
     )
-    return PreviewFieldResponse(field=field_payload, stats=stats)
+    return field, out_bounds, stats
 
 
 def _run_uploaded_mesh_preview_meshdata(
@@ -876,7 +962,7 @@ def _run_uploaded_mesh_preview_meshdata(
     resolution = _compute_mesh_upload_resolution(
         file_bytes, extension, lattice_pitch, quality_profile, voxels_per_lattice_period
     )
-    parsed, bounds, host_sdf = _resolve_uploaded_host_field(
+    parsed, bounds, host_sdf, sparse_block_size, active_blocks = _resolve_uploaded_host_field(
         file_bytes=file_bytes,
         extension=extension,
         resolution=resolution,
@@ -903,6 +989,8 @@ def _run_uploaded_mesh_preview_meshdata(
         bounds,
         backend=mesh_backend,
         meshing_mode=meshing_mode,
+        active_blocks=active_blocks,
+        block_size=sparse_block_size,
     )
     mesher_ms = (time.perf_counter() - mesher_start) * 1000.0
     post_mesh_start = time.perf_counter()
@@ -982,6 +1070,37 @@ async def preview_mesh(payload: PreviewMeshRequest) -> PreviewMeshResponse | Job
         cleanup_gpu_memory(reason="preview_mesh_inline")
 
 
+@app.post("/api/v1/preview/mesh.binary", response_model=None)
+async def preview_mesh_binary(payload: PreviewMeshRequest) -> Response:
+    grid = _resolve_grid(payload.grid, payload.quality_profile)
+    if payload.execution_mode == "queued":
+        raise HTTPException(
+            status_code=409,
+            detail="Binary preview endpoint does not support explicit queued mode",
+        )
+    try:
+        mesh, stats, _ = await asyncio.to_thread(
+            _run_preview_meshdata,
+            payload.scene_ir,
+            payload.parameter_values,
+            grid,
+            payload.compute_precision,
+            payload.compute_backend,
+            payload.mesh_backend,
+            payload.meshing_mode,
+        )
+        headers = {
+            "X-SDF-Stats": _stats_header_value(stats),
+            "X-SDF-Vertex-Count": str(int(mesh.vertices.shape[0])),
+            "X-SDF-Face-Count": str(int(mesh.faces.shape[0])),
+        }
+        return Response(content=_pack_mesh_binary(mesh), media_type="application/octet-stream", headers=headers)
+    except (DslError, EvaluationError, MeshingError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        cleanup_gpu_memory(reason="preview_mesh_binary_inline")
+
+
 @app.post("/api/v1/preview/field", response_model=PreviewFieldResponse)
 async def preview_field(payload: PreviewFieldRequest) -> PreviewFieldResponse:
     grid = _resolve_grid(payload.grid, payload.quality_profile)
@@ -998,6 +1117,34 @@ async def preview_field(payload: PreviewFieldRequest) -> PreviewFieldResponse:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         cleanup_gpu_memory(reason="preview_field_inline")
+
+
+@app.post("/api/v1/preview/field.binary", response_model=None)
+async def preview_field_binary(payload: PreviewFieldRequest) -> Response:
+    grid = _resolve_grid(payload.grid, payload.quality_profile)
+    try:
+        field, bounds, stats = await asyncio.to_thread(
+            _run_field_preview_data,
+            payload.scene_ir,
+            payload.parameter_values,
+            grid,
+            payload.compute_precision,
+            payload.compute_backend,
+        )
+        headers = {
+            "X-SDF-Stats": _stats_header_value(stats),
+            "X-SDF-Resolution": str(int(field.shape[0])),
+            "X-SDF-Bounds": _bounds_header_value(bounds),
+        }
+        return Response(
+            content=_pack_field_binary(field),
+            media_type="application/octet-stream",
+            headers=headers,
+        )
+    except (DslError, EvaluationError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        cleanup_gpu_memory(reason="preview_field_binary_inline")
 
 
 @app.post("/api/v1/preview/program", response_model=PreviewProgramResponse)
@@ -1211,6 +1358,55 @@ async def preview_uploaded_mesh(
         cleanup_gpu_memory(reason="preview_uploaded_mesh_inline")
 
 
+@app.post("/api/v1/mesh/preview.binary", response_model=None)
+async def preview_uploaded_mesh_binary(
+    file: UploadFile = File(...),
+    shell_thickness: float = Form(...),
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"] = Form(...),
+    lattice_pitch: float = Form(...),
+    lattice_thickness: float = Form(...),
+    lattice_phase: float = Form(0.0),
+    quality_profile: QualityProfile = Form("medium"),
+    voxels_per_lattice_period: int = Form(6),
+    compute_backend: ComputeBackend = Form("auto"),
+    mesh_backend: MeshBackend = Form("auto"),
+    meshing_mode: MeshingMode = Form("uniform"),
+    execution_mode: ExecutionMode = Form("auto"),
+) -> Response:
+    file_bytes, extension = await _read_uploaded_mesh(file)
+    if execution_mode == "queued":
+        raise HTTPException(
+            status_code=409,
+            detail="Binary preview endpoint does not support explicit queued mode",
+        )
+    try:
+        mesh, stats, _, _ = await asyncio.to_thread(
+            _run_uploaded_mesh_preview_meshdata,
+            file_bytes=file_bytes,
+            extension=extension,
+            shell_thickness=shell_thickness,
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+            quality_profile=quality_profile,
+            voxels_per_lattice_period=voxels_per_lattice_period,
+            compute_backend=compute_backend,
+            mesh_backend=mesh_backend,
+            meshing_mode=meshing_mode,
+        )
+        headers = {
+            "X-SDF-Stats": _stats_header_value(stats),
+            "X-SDF-Vertex-Count": str(int(mesh.vertices.shape[0])),
+            "X-SDF-Face-Count": str(int(mesh.faces.shape[0])),
+        }
+        return Response(content=_pack_mesh_binary(mesh), media_type="application/octet-stream", headers=headers)
+    except (MeshUploadError, MeshingError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        cleanup_gpu_memory(reason="preview_uploaded_mesh_binary_inline")
+
+
 @app.post("/api/v1/mesh/field", response_model=PreviewFieldResponse)
 async def preview_uploaded_mesh_field(
     file: UploadFile = File(...),
@@ -1243,6 +1439,49 @@ async def preview_uploaded_mesh_field(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         cleanup_gpu_memory(reason="preview_uploaded_mesh_field_inline")
+
+
+@app.post("/api/v1/mesh/field.binary", response_model=None)
+async def preview_uploaded_mesh_field_binary(
+    file: UploadFile = File(...),
+    shell_thickness: float = Form(...),
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"] = Form(...),
+    lattice_pitch: float = Form(...),
+    lattice_thickness: float = Form(...),
+    lattice_phase: float = Form(0.0),
+    quality_profile: QualityProfile = Form("medium"),
+    voxels_per_lattice_period: int = Form(6),
+    compute_backend: ComputeBackend = Form("auto"),
+) -> Response:
+    file_bytes, extension = await _read_uploaded_mesh(file)
+    try:
+        field, bounds, stats = await asyncio.to_thread(
+            _run_uploaded_mesh_field_preview_data,
+            file_bytes=file_bytes,
+            extension=extension,
+            shell_thickness=shell_thickness,
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+            quality_profile=quality_profile,
+            voxels_per_lattice_period=voxels_per_lattice_period,
+            compute_backend=compute_backend,
+        )
+        headers = {
+            "X-SDF-Stats": _stats_header_value(stats),
+            "X-SDF-Resolution": str(int(field.shape[0])),
+            "X-SDF-Bounds": _bounds_header_value(bounds),
+        }
+        return Response(
+            content=_pack_field_binary(field),
+            media_type="application/octet-stream",
+            headers=headers,
+        )
+    except (MeshUploadError, MeshingError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        cleanup_gpu_memory(reason="preview_uploaded_mesh_field_binary_inline")
 
 
 @app.post("/api/v1/mesh/export", response_model=None)
@@ -1415,7 +1654,7 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                         payload.quality_profile,
                         voxels_per_lattice_period,
                     )
-                    parsed, bounds, host_sdf = _resolve_uploaded_host_field(
+                    parsed, bounds, host_sdf, sparse_block_size, active_blocks = _resolve_uploaded_host_field(
                         file_bytes=file_bytes,
                         extension=extension,
                         resolution=ws_resolution,
@@ -1444,11 +1683,31 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                         "mesh_upload field_phase host_ms=%.2f compose_ms=%.2f eval_ms=%.2f",
                         host_ms, compose_ms, eval_ms,
                     )
-                    return parsed, bounds, host_sdf, field, eval_backend_used, eval_ms, field_payload
+                    return (
+                        parsed,
+                        bounds,
+                        host_sdf,
+                        sparse_block_size,
+                        active_blocks,
+                        field,
+                        eval_backend_used,
+                        eval_ms,
+                        field_payload,
+                    )
                 finally:
                     cleanup_gpu_memory(reason="uploaded_mesh_ws_field_phase")
 
-            parsed, bounds, host_sdf, field, eval_backend_used, eval_ms, field_payload = (
+            (
+                parsed,
+                bounds,
+                host_sdf,
+                sparse_block_size,
+                active_blocks,
+                field,
+                eval_backend_used,
+                eval_ms,
+                field_payload,
+            ) = (
                 await asyncio.to_thread(_compute_field_phase)
             )
 
@@ -1479,6 +1738,8 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                         bounds,
                         backend=payload.mesh_backend,
                         meshing_mode=payload.meshing_mode,
+                        active_blocks=active_blocks,
+                        block_size=sparse_block_size,
                     )
                     interior = _strip_outer_surface(generated, host_sdf, bounds)
                     outer = _meshdata_from_parsed(parsed)

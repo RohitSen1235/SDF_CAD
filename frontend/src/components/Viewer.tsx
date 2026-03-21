@@ -288,29 +288,40 @@ function decodeBase64Bytes(base64: string): Uint8Array {
 }
 
 function toGeometry(mesh: MeshPayload | null): THREE.BufferGeometry | null {
-  if (!mesh || mesh.encoding !== "mesh-f32-u32-base64-v1") {
+  if (!mesh) {
     return null;
   }
+  let vertices: Float32Array;
+  let indices: Uint32Array;
+  let normals: Float32Array;
 
-  const expectedVerticesBytes = mesh.vertex_count * 3 * Float32Array.BYTES_PER_ELEMENT;
-  const expectedIndicesBytes = mesh.face_count * 3 * Uint32Array.BYTES_PER_ELEMENT;
-  const expectedNormalsBytes = mesh.vertex_count * 3 * Float32Array.BYTES_PER_ELEMENT;
+  if (mesh.encoding === "mesh-f32-u32-binary-v1") {
+    vertices = mesh.vertices;
+    indices = mesh.indices;
+    normals = mesh.normals;
+  } else if (mesh.encoding === "mesh-f32-u32-base64-v1") {
+    const expectedVerticesBytes = mesh.vertex_count * 3 * Float32Array.BYTES_PER_ELEMENT;
+    const expectedIndicesBytes = mesh.face_count * 3 * Uint32Array.BYTES_PER_ELEMENT;
+    const expectedNormalsBytes = mesh.vertex_count * 3 * Float32Array.BYTES_PER_ELEMENT;
 
-  const verticesBytes = decodeBase64Bytes(mesh.vertices_b64);
-  const indicesBytes = decodeBase64Bytes(mesh.indices_b64);
-  const normalsBytes = decodeBase64Bytes(mesh.normals_b64);
+    const verticesBytes = decodeBase64Bytes(mesh.vertices_b64);
+    const indicesBytes = decodeBase64Bytes(mesh.indices_b64);
+    const normalsBytes = decodeBase64Bytes(mesh.normals_b64);
 
-  if (
-    verticesBytes.byteLength !== expectedVerticesBytes ||
-    indicesBytes.byteLength !== expectedIndicesBytes ||
-    normalsBytes.byteLength !== expectedNormalsBytes
-  ) {
+    if (
+      verticesBytes.byteLength !== expectedVerticesBytes ||
+      indicesBytes.byteLength !== expectedIndicesBytes ||
+      normalsBytes.byteLength !== expectedNormalsBytes
+    ) {
+      return null;
+    }
+
+    vertices = new Float32Array(verticesBytes.buffer, verticesBytes.byteOffset, expectedVerticesBytes / 4);
+    indices = new Uint32Array(indicesBytes.buffer, indicesBytes.byteOffset, expectedIndicesBytes / 4);
+    normals = new Float32Array(normalsBytes.buffer, normalsBytes.byteOffset, expectedNormalsBytes / 4);
+  } else {
     return null;
   }
-
-  const vertices = new Float32Array(verticesBytes.buffer.slice(0));
-  const indices = new Uint32Array(indicesBytes.buffer.slice(0));
-  const normals = new Float32Array(normalsBytes.buffer.slice(0));
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(vertices, 3));
@@ -328,15 +339,17 @@ function toGeometry(mesh: MeshPayload | null): THREE.BufferGeometry | null {
 
 function decodeFloat32Base64(base64: string): Float32Array {
   const bytes = decodeBase64Bytes(base64);
-  return new Float32Array(bytes.buffer.slice(0));
+  return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / Float32Array.BYTES_PER_ELEMENT);
 }
 
 function toFieldTexture(field: FieldPayload | null): THREE.Data3DTexture | null {
-  if (!field || field.encoding !== "f32-base64") {
+  if (!field) {
     return null;
   }
-
-  const values = decodeFloat32Base64(field.data);
+  const values = field.encoding === "f32-binary-v1" ? field.data : field.encoding === "f32-base64" ? decodeFloat32Base64(field.data) : null;
+  if (!values) {
+    return null;
+  }
   const expected = field.resolution * field.resolution * field.resolution;
   if (values.length !== expected) {
     return null;

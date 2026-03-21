@@ -71,3 +71,35 @@ def test_adaptive_meshing_mode_routes_to_cpu_adaptive(monkeypatch) -> None:
     mesh, backend = meshing.build_mesh_with_backend(field, bounds, backend="cuda", meshing_mode="adaptive")
     assert mesh is fake_mesh
     assert backend == "cpu"
+
+
+def test_active_blocks_route_to_sparse_block_mesher(monkeypatch) -> None:
+    field = np.array(
+        [[[-1.0, 1.0], [1.0, 1.0]], [[1.0, 1.0], [1.0, 1.0]]],
+        dtype=np.float32,
+    )
+    bounds = [[-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0]]
+    fake_mesh = meshing.MeshData(
+        vertices=np.zeros((0, 3), dtype=np.float64),
+        faces=np.zeros((1, 3), dtype=np.int32),
+        normals=np.zeros((0, 3), dtype=np.float64),
+    )
+
+    called = {"sparse": False}
+
+    def fake_sparse(_f, _b, _active, _block):
+        called["sparse"] = True
+        return fake_mesh
+
+    monkeypatch.setattr(meshing, "_mesh_active_blocks_cpu", fake_sparse)
+    mesh, backend = meshing.build_mesh_with_backend(
+        field,
+        bounds,
+        backend="cpu",
+        meshing_mode="uniform",
+        active_blocks=[(0, 0, 0)],
+        block_size=16,
+    )
+    assert called["sparse"] is True
+    assert mesh is fake_mesh
+    assert backend == "cpu"

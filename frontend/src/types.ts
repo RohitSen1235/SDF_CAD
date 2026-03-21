@@ -54,7 +54,7 @@ export interface GridConfig {
   resolution: number;
 }
 
-export interface MeshPayload {
+export interface MeshPayloadBase64 {
   encoding: "mesh-f32-u32-base64-v1";
   vertex_count: number;
   face_count: number;
@@ -63,12 +63,32 @@ export interface MeshPayload {
   normals_b64: string;
 }
 
-export interface FieldPayload {
+export interface MeshPayloadBinary {
+  encoding: "mesh-f32-u32-binary-v1";
+  vertex_count: number;
+  face_count: number;
+  vertices: Float32Array;
+  indices: Uint32Array;
+  normals: Float32Array;
+}
+
+export type MeshPayload = MeshPayloadBase64 | MeshPayloadBinary;
+
+export interface FieldPayloadBase64 {
   encoding: "f32-base64";
   resolution: number;
   bounds: [[number, number], [number, number], [number, number]];
   data: string;
 }
+
+export interface FieldPayloadBinary {
+  encoding: "f32-binary-v1";
+  resolution: number;
+  bounds: [[number, number], [number, number], [number, number]];
+  data: Float32Array;
+}
+
+export type FieldPayload = FieldPayloadBase64 | FieldPayloadBinary;
 
 export interface PreviewStats {
   eval_ms: number;

@@ -94,6 +94,26 @@ def test_preview_mesh_endpoint_accepts_quality_profile() -> None:
     assert payload["stats"]["compute_backend"] == "cpu"
 
 
+def test_preview_mesh_binary_endpoint_returns_octet_stream() -> None:
+    compiled = client.post("/api/v1/scene/compile", json={"source": SOURCE}).json()["scene_ir"]
+    response = client.post(
+        "/api/v1/preview/mesh.binary",
+        json={
+            "scene_ir": compiled,
+            "parameter_values": {"r": 0.7},
+            "quality_profile": "interactive",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/octet-stream")
+    assert response.headers.get("x-sdf-stats")
+    assert response.headers.get("x-sdf-vertex-count")
+    assert response.headers.get("x-sdf-face-count")
+    payload = response.content
+    assert payload[:8] == b"SDFMESH1"
+    assert len(payload) > 16
+
+
 def test_preview_field_endpoint_returns_volume_payload() -> None:
     compiled = client.post("/api/v1/scene/compile", json={"source": SOURCE}).json()["scene_ir"]
     response = client.post(
@@ -112,6 +132,25 @@ def test_preview_field_endpoint_returns_volume_payload() -> None:
     assert payload["stats"]["preview_mode"] == "field"
     assert payload["stats"]["mesh_ms"] is None
     assert payload["stats"]["voxel_count"] == 64 * 64 * 64
+
+
+def test_preview_field_binary_endpoint_returns_octet_stream() -> None:
+    compiled = client.post("/api/v1/scene/compile", json={"source": SOURCE}).json()["scene_ir"]
+    response = client.post(
+        "/api/v1/preview/field.binary",
+        json={
+            "scene_ir": compiled,
+            "parameter_values": {"r": 0.7},
+            "quality_profile": "interactive",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/octet-stream")
+    assert response.headers.get("x-sdf-stats")
+    assert response.headers.get("x-sdf-resolution") == "64"
+    assert response.headers.get("x-sdf-bounds")
+    # 64^3 float32 samples
+    assert len(response.content) == 64 * 64 * 64 * 4
 
 
 def test_preview_field_endpoint_does_not_call_mesher(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -224,6 +263,18 @@ def test_mesh_preview_endpoint_obj_upload() -> None:
     assert payload["field"]["data"]
 
 
+def test_mesh_preview_binary_endpoint_obj_upload() -> None:
+    response = client.post(
+        "/api/v1/mesh/preview.binary",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/octet-stream")
+    assert response.headers.get("x-sdf-stats")
+    assert response.content[:8] == b"SDFMESH1"
+
+
 def test_mesh_field_endpoint_obj_upload() -> None:
     response = client.post(
         "/api/v1/mesh/field",
@@ -238,6 +289,18 @@ def test_mesh_field_endpoint_obj_upload() -> None:
     assert payload["stats"]["preview_mode"] == "field"
     assert payload["stats"]["mesh_ms"] is None
     assert payload["stats"]["tri_count"] == 0
+
+
+def test_mesh_field_binary_endpoint_obj_upload() -> None:
+    response = client.post(
+        "/api/v1/mesh/field.binary",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/octet-stream")
+    assert response.headers.get("x-sdf-stats")
+    assert response.headers.get("x-sdf-resolution") == "48"
 
 
 def test_mesh_field_endpoint_does_not_call_mesher(monkeypatch: pytest.MonkeyPatch) -> None:

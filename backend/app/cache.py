@@ -85,6 +85,8 @@ class UploadedHostFieldCacheEntry:
     faces: np.ndarray
     bounds: list[list[float]]
     host_sdf: np.ndarray
+    block_size: int | None = None
+    active_blocks: list[tuple[int, int, int]] | None = None
 
 
 uploaded_host_field_cache: LruCache[UploadedHostFieldCacheEntry] = LruCache(maxsize=8)
