@@ -392,7 +392,6 @@ function appendMeshWorkflowFormData(
   body: FormData,
   file: File,
   params: MeshWorkflowParams,
-  qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
   meshingMode: MeshingMode = "uniform",
@@ -404,7 +403,6 @@ function appendMeshWorkflowFormData(
   body.append("lattice_pitch", String(params.latticePitch));
   body.append("lattice_thickness", String(params.latticeThickness));
   body.append("lattice_phase", String(params.latticePhase));
-  body.append("quality_profile", qualityProfile);
   body.append("voxels_per_lattice_period", String(voxelsPerLatticePeriod));
   body.append("compute_backend", computeBackend);
   body.append("mesh_backend", meshBackend);
@@ -414,7 +412,6 @@ function appendMeshWorkflowFormData(
 export async function previewUploadedMesh(
   file: File,
   params: MeshWorkflowParams,
-  qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
   meshingMode: MeshingMode = "uniform",
@@ -422,7 +419,7 @@ export async function previewUploadedMesh(
 ): Promise<PreviewMeshResponse> {
   try {
     const body = new FormData();
-    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
+    appendMeshWorkflowFormData(body, file, params, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
     const response = await fetch(`${API_BASE}/api/v1/mesh/preview.binary`, {
       method: "POST",
       body
@@ -439,7 +436,7 @@ export async function previewUploadedMesh(
     }
 
     const fallbackBody = new FormData();
-    appendMeshWorkflowFormData(fallbackBody, file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
+    appendMeshWorkflowFormData(fallbackBody, file, params, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
     const fallback = await fetch(`${API_BASE}/api/v1/mesh/preview`, {
       method: "POST",
       body: fallbackBody
@@ -459,7 +456,6 @@ export async function previewUploadedMesh(
 export async function previewUploadedMeshField(
   file: File,
   params: MeshWorkflowParams,
-  qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   voxelsPerLatticePeriod: number = 6,
   signal?: AbortSignal
@@ -470,7 +466,6 @@ export async function previewUploadedMeshField(
       body,
       file,
       params,
-      qualityProfile,
       computeBackend,
       "auto",
       "uniform",
@@ -504,7 +499,6 @@ export async function previewUploadedMeshField(
       fallbackBody,
       file,
       params,
-      qualityProfile,
       computeBackend,
       "auto",
       "uniform",
@@ -530,7 +524,6 @@ export async function previewUploadedMeshField(
 export async function previewUploadedMeshPhased(
   file: File,
   params: MeshWorkflowParams,
-  qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
   meshingMode: MeshingMode = "uniform",
@@ -541,7 +534,7 @@ export async function previewUploadedMeshPhased(
   const wsBase = toWebSocketBase(API_BASE);
   const url = `${wsBase}/api/v1/mesh/preview/ws`;
   const fallbackToHttp = async (): Promise<PreviewMeshResponse> =>
-    previewUploadedMesh(file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
+    previewUploadedMesh(file, params, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
 
   return new Promise<PreviewMeshResponse>((resolve, reject) => {
     let settled = false;
@@ -558,7 +551,6 @@ export async function previewUploadedMeshPhased(
           lattice_pitch: params.latticePitch,
           lattice_thickness: params.latticeThickness,
           lattice_phase: params.latticePhase,
-          quality_profile: qualityProfile,
           voxels_per_lattice_period: voxelsPerLatticePeriod,
           compute_backend: computeBackend,
           mesh_backend: meshBackend,
@@ -621,7 +613,6 @@ export async function exportUploadedMesh(
   file: File,
   params: MeshWorkflowParams,
   format: "stl" | "obj",
-  qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
   meshingMode: MeshingMode = "uniform",
@@ -629,7 +620,7 @@ export async function exportUploadedMesh(
 ): Promise<void> {
   try {
     const body = new FormData();
-    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
+    appendMeshWorkflowFormData(body, file, params, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
     body.append("format", format);
     body.append("execution_mode", "auto");
     const response = await fetch(`${API_BASE}/api/v1/mesh/export`, {

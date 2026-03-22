@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from app import mesh_upload
+from app.meshing import build_mesh
 from app.mesh_upload import MeshUploadError, parse_mesh_bytes, validate_triangle_mesh
 
 
@@ -162,6 +163,7 @@ def test_build_host_field_defaults_to_dense_host_sdf_metadata() -> None:
     mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
     host = mesh_upload.build_host_field(mesh, resolution=48)
     assert host.host_sdf.shape == (48, 48, 48)
+    assert host.host_sdf.dtype == np.float32
     assert host.block_size is None
     assert host.active_blocks is None
 
@@ -210,6 +212,89 @@ def test_build_host_field_populates_sparse_metadata_when_sparse_path_is_used(
 def test_build_host_field_supports_explicit_dense_mode() -> None:
     mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
     host = mesh_upload.build_host_field(mesh, resolution=96, field_storage_mode="dense")
+    assert host.host_sdf.dtype == np.float32
     assert host.field_storage_mode == "dense"
     assert host.block_size is None
     assert host.active_blocks is None
+
+
+def _legacy_compose_field(
+    host_sdf: np.ndarray,
+    bounds: list[list[float]],
+    *,
+    shell_thickness: float,
+    lattice_type: str,
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+) -> np.ndarray:
+    host64 = np.asarray(host_sdf, dtype=np.float64)
+    shell_field = np.maximum(host64, -host64 - abs(shell_thickness))
+    cavity = host64 + abs(shell_thickness)
+    lattice_clipped = cavity.copy()
+
+    mask = cavity < 0.0
+    if np.any(mask):
+        resolution = host64.shape[0]
+        x_axis = np.linspace(bounds[0][0], bounds[0][1], resolution, dtype=np.float64)
+        y_axis = np.linspace(bounds[1][0], bounds[1][1], resolution, dtype=np.float64)
+        z_axis = np.linspace(bounds[2][0], bounds[2][1], resolution, dtype=np.float64)
+        ix, iy, iz = np.nonzero(mask)
+        lattice_values = mesh_upload._tpms_field(
+            x_axis[ix],
+            y_axis[iy],
+            z_axis[iz],
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+        )
+        lattice_clipped[mask] = np.maximum(lattice_values, cavity[mask])
+
+    return np.minimum(shell_field, lattice_clipped)
+
+
+def test_uploaded_compose_normalizes_to_float32_and_preserves_mesh_parity() -> None:
+    mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
+    host = mesh_upload.build_host_field(mesh, resolution=48, field_storage_mode="dense")
+
+    field = mesh_upload.compose_hollow_lattice_field(
+        host.host_sdf,
+        host.bounds,
+        shell_thickness=0.08,
+        lattice_type="gyroid",
+        lattice_pitch=0.45,
+        lattice_thickness=0.09,
+        lattice_phase=0.0,
+    )
+    legacy_field = _legacy_compose_field(
+        host.host_sdf,
+        host.bounds,
+        shell_thickness=0.08,
+        lattice_type="gyroid",
+        lattice_pitch=0.45,
+        lattice_thickness=0.09,
+        lattice_phase=0.0,
+    )
+
+    spacing = np.array(mesh_upload._bounds_spacing(host.bounds, int(field.shape[0])), dtype=np.float64)
+    max_spacing = float(np.max(spacing))
+
+    assert field.dtype == np.float32
+    assert np.max(np.abs(field.astype(np.float64) - legacy_field)) <= (0.5 * max_spacing)
+
+    mesh_new = build_mesh(field, host.bounds, backend="cpu")
+    mesh_legacy = build_mesh(np.asarray(legacy_field, dtype=np.float32), host.bounds, backend="cpu")
+
+    new_min = np.min(mesh_new.vertices, axis=0)
+    new_max = np.max(mesh_new.vertices, axis=0)
+    legacy_min = np.min(mesh_legacy.vertices, axis=0)
+    legacy_max = np.max(mesh_legacy.vertices, axis=0)
+
+    assert np.max(np.abs(new_min - legacy_min)) <= max_spacing
+    assert np.max(np.abs(new_max - legacy_max)) <= max_spacing
+
+    tri_delta = abs(int(mesh_new.faces.shape[0]) - int(mesh_legacy.faces.shape[0])) / float(
+        max(1, int(mesh_legacy.faces.shape[0]))
+    )
+    assert tri_delta <= 0.02

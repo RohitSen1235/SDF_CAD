@@ -45,7 +45,6 @@ def _mesh_form(lattice_type: str = "gyroid") -> dict[str, str]:
         "lattice_pitch": "0.45",
         "lattice_thickness": "0.09",
         "lattice_phase": "0.0",
-        "quality_profile": "interactive",
     }
 
 
@@ -287,7 +286,7 @@ def test_mesh_preview_endpoint_obj_upload() -> None:
     assert payload["stats"]["tri_count"] > 0
     assert payload["mesh"]["encoding"] == "mesh-f32-u32-base64-v1"
     assert payload["field"]["encoding"] == "f32-base64"
-    assert payload["field"]["resolution"] == 48
+    assert payload["field"]["resolution"] == 24
     assert payload["field"]["data"]
 
 
@@ -312,7 +311,7 @@ def test_mesh_field_endpoint_obj_upload() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["field"]["encoding"] == "f32-base64"
-    assert payload["field"]["resolution"] == 48
+    assert payload["field"]["resolution"] == 24
     assert payload["field"]["data"]
     assert payload["stats"]["preview_mode"] == "field"
     assert payload["stats"]["mesh_ms"] is None
@@ -328,7 +327,7 @@ def test_mesh_field_binary_endpoint_obj_upload() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/octet-stream")
     assert response.headers.get("x-sdf-stats")
-    assert response.headers.get("x-sdf-resolution") == "48"
+    assert response.headers.get("x-sdf-resolution") == "24"
 
 
 def test_mesh_field_endpoint_does_not_call_mesher(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -363,6 +362,50 @@ def test_mesh_preview_preserves_original_outer_vertices() -> None:
     assert has_vertex([0.0, 0.0, 0.0])
     assert has_vertex([1.0, 0.0, 0.0])
     assert has_vertex([0.0, 1.0, 0.0])
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "/api/v1/mesh/preview",
+        "/api/v1/mesh/preview.binary",
+        "/api/v1/mesh/field",
+        "/api/v1/mesh/field.binary",
+        "/api/v1/mesh/export",
+    ],
+)
+def test_uploaded_mesh_endpoints_reject_legacy_quality_profile(endpoint: str) -> None:
+    form = _mesh_form()
+    form["quality_profile"] = "interactive"
+    if endpoint == "/api/v1/mesh/export":
+        form["format"] = "stl"
+    response = client.post(
+        endpoint,
+        data=form,
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 422
+    assert "voxels_per_lattice_period" in response.json()["detail"]
+
+
+def test_uploaded_mesh_preview_ws_rejects_legacy_quality_profile() -> None:
+    with client.websocket_connect("/api/v1/mesh/preview/ws") as websocket:
+        websocket.send_json(
+            {
+                "file_name": "tetra.obj",
+                "file_data_base64": base64.b64encode(MESH_OBJ).decode("ascii"),
+                "shell_thickness": 0.08,
+                "lattice_type": "gyroid",
+                "lattice_pitch": 0.45,
+                "lattice_thickness": 0.09,
+                "lattice_phase": 0.0,
+                "quality_profile": "interactive",
+                "voxels_per_lattice_period": 6,
+            }
+        )
+        payload = websocket.receive_json()
+    assert payload["phase"] == "error"
+    assert "Extra inputs are not permitted" in payload["error"]
 
 
 @pytest.mark.parametrize("lattice_type", ["gyroid", "schwarz_p", "diamond"])
@@ -450,6 +493,51 @@ def test_mesh_preview_rejects_oversized_upload(monkeypatch: pytest.MonkeyPatch) 
         files={"file": ("big.obj", b"x" * 129, "text/plain")},
     )
     assert response.status_code == 413
+
+
+def test_uploaded_queueing_uses_computed_resolution_in_auto_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main_module, "REDIS_CLIENT_AVAILABLE", True)
+    monkeypatch.setattr(
+        main_module,
+        "_compute_mesh_upload_resolution",
+        lambda *args, **kwargs: main_module.AUTO_QUEUE_RESOLUTION_THRESHOLD,
+    )
+    should_queue = main_module._should_queue_uploaded_request(
+        file_bytes=MESH_OBJ,
+        extension=".obj",
+        lattice_pitch=0.45,
+        voxels_per_lattice_period=6,
+        execution_mode="auto",
+    )
+    assert should_queue is True
+
+    monkeypatch.setattr(
+        main_module,
+        "_compute_mesh_upload_resolution",
+        lambda *args, **kwargs: main_module.AUTO_QUEUE_RESOLUTION_THRESHOLD - 1,
+    )
+    should_queue = main_module._should_queue_uploaded_request(
+        file_bytes=MESH_OBJ,
+        extension=".obj",
+        lattice_pitch=0.45,
+        voxels_per_lattice_period=6,
+        execution_mode="auto",
+    )
+    assert should_queue is False
+
+
+def test_uploaded_queueing_uses_file_size_threshold_in_auto_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main_module, "REDIS_CLIENT_AVAILABLE", True)
+    monkeypatch.setattr(main_module, "AUTO_QUEUE_UPLOAD_BYTES_THRESHOLD", 1)
+    monkeypatch.setattr(main_module, "_compute_mesh_upload_resolution", lambda *args, **kwargs: 1)
+    should_queue = main_module._should_queue_uploaded_request(
+        file_bytes=MESH_OBJ,
+        extension=".obj",
+        lattice_pitch=0.45,
+        voxels_per_lattice_period=6,
+        execution_mode="auto",
+    )
+    assert should_queue is True
 
 
 def test_preview_mesh_queued_mode_returns_job_and_result() -> None:

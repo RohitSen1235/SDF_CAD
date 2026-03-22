@@ -260,11 +260,21 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Lattice thickness"), { target: { value: "0.12" } });
     fireEvent.change(screen.getByLabelText("Lattice phase"), { target: { value: "0.35" } });
     fireEvent.change(screen.getByLabelText("Shell thickness"), { target: { value: "0.1" } });
-    fireEvent.change(screen.getByLabelText("Mesh preview quality"), { target: { value: "high" } });
     fireEvent.change(screen.getByLabelText("Mesh field backend"), { target: { value: "cuda" } });
     fireEvent.change(screen.getByLabelText("Voxels per lattice period"), { target: { value: "8" } });
 
     expect(previewUploadedMeshField).not.toHaveBeenCalled();
+  });
+
+  it("removes uploaded mesh quality controls while keeping DSL quality", () => {
+    render(<App />);
+
+    expect(screen.getByLabelText("Quality")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+
+    expect(screen.queryByLabelText("Mesh preview quality")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Mesh export quality")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Voxels per lattice period")).toBeInTheDocument();
   });
 
   it("runs uploaded field preview immediately when Preview Field is clicked", async () => {
@@ -419,8 +429,8 @@ describe("App", () => {
 
     const calls = previewUploadedMesh.mock.calls;
     const lastCall = calls[calls.length - 1];
+    expect(lastCall?.[2]).toBe("cuda");
     expect(lastCall?.[3]).toBe("cuda");
-    expect(lastCall?.[4]).toBe("cuda");
   });
 
   it("sends selected meshing mode for mesh workflow commit", async () => {
@@ -440,7 +450,31 @@ describe("App", () => {
 
     const calls = previewUploadedMesh.mock.calls;
     const lastCall = calls[calls.length - 1];
-    expect(lastCall?.[5]).toBe("adaptive");
+    expect(lastCall?.[4]).toBe("adaptive");
+  });
+
+  it("does not pass a quality argument in mesh workflow preview or commit calls", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    previewUploadedMeshField.mockClear();
+    previewUploadedMesh.mockClear();
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [file] } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalled();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
+    await waitFor(() => {
+      expect(previewUploadedMesh).toHaveBeenCalled();
+    });
+
+    expect(previewUploadedMeshField.mock.calls[0]).toHaveLength(5);
+    expect(previewUploadedMesh.mock.calls[0]).toHaveLength(6);
   });
 
   it("disables mesh export until commit completes and resets on input changes", async () => {
@@ -454,7 +488,6 @@ describe("App", () => {
     const exportStl = screen.getByRole("button", { name: "Export STL" });
     expect(exportStl).toBeDisabled();
 
-    fireEvent.change(screen.getByLabelText("Mesh export quality"), { target: { value: "ultra" } });
     fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
     await waitFor(() => {
       expect(previewUploadedMesh).toHaveBeenCalled();
@@ -470,7 +503,7 @@ describe("App", () => {
     const calls = exportUploadedMesh.mock.calls;
     const lastCall = calls[calls.length - 1];
     expect(lastCall?.[2]).toBe("stl");
-    expect(lastCall?.[3]).toBe("ultra");
+    expect(lastCall?.[3]).toBe("auto");
 
     fireEvent.change(screen.getByLabelText("Lattice pitch"), { target: { value: "0.55" } });
     expect(exportStl).toBeDisabled();

@@ -186,8 +186,6 @@ export default function App() {
   const [meshLatticePitch, setMeshLatticePitch] = useState(0.45);
   const [meshLatticeThickness, setMeshLatticeThickness] = useState(0.09);
   const [meshLatticePhase, setMeshLatticePhase] = useState(0.0);
-  const [meshPreviewQuality, setMeshPreviewQuality] = useState<QualityProfile>("medium");
-  const [meshExportQuality, setMeshExportQuality] = useState<QualityProfile>("high");
   const [voxelsPerLatticePeriod, setVoxelsPerLatticePeriod] = useState(6);
   const [meshCommitted, setMeshCommitted] = useState(false);
 
@@ -278,7 +276,6 @@ export default function App() {
       const response = await previewUploadedMeshField(
         meshFile,
         meshWorkflowParams,
-        meshPreviewQuality,
         computeBackend,
         voxelsPerLatticePeriod,
         controller.signal
@@ -311,7 +308,6 @@ export default function App() {
     abortActiveMeshFieldPreview,
     computeBackend,
     meshFile,
-    meshPreviewQuality,
     meshWorkflowParams,
     voxelsPerLatticePeriod
   ]);
@@ -588,7 +584,6 @@ export default function App() {
       const response = await previewUploadedMesh(
         meshFile,
         meshWorkflowParams,
-        meshExportQuality,
         computeBackend,
         meshBackend,
         meshingMode,
@@ -622,7 +617,6 @@ export default function App() {
         meshFile,
         meshWorkflowParams,
         format,
-        meshExportQuality,
         computeBackend,
         meshBackend,
         meshingMode,
@@ -646,8 +640,6 @@ export default function App() {
     meshLatticePitch,
     meshLatticeThickness,
     meshLatticePhase,
-    meshPreviewQuality,
-    meshExportQuality,
     computeBackend,
     meshBackend,
     meshingMode,
@@ -695,8 +687,6 @@ export default function App() {
     setError(null);
   };
 
-  const statusQuality = workflow === "dsl" ? quality : meshPreviewQuality;
-
   return (
     <div className="shell">
       <header className="topbar">
@@ -706,7 +696,7 @@ export default function App() {
             {workflow === "dsl" ? (isCompiling ? "Compiling" : "Compiled") : "Mesh Workflow"}
           </span>
           <span className={isPreviewing ? "pill active" : "pill"}>{isPreviewing ? "Previewing" : "Preview Ready"}</span>
-          <span className="pill">Q: {statusQuality}</span>
+          {workflow === "dsl" ? <span className="pill">Q: {quality}</span> : null}
         </div>
       </header>
 
@@ -963,36 +953,6 @@ export default function App() {
                     {estimatedMemory > 1000 ? " ⚠️ Large — may be slow" : ""}
                   </p>
                 </div>
-
-                <label className="slider-row">
-                  <span>Preview quality</span>
-                  <select
-                    aria-label="Mesh preview quality"
-                    value={meshPreviewQuality}
-                    onChange={(event) => setMeshPreviewQuality(event.target.value as QualityProfile)}
-                  >
-                    {QUALITY_ORDER.map((item) => (
-                      <option key={item} value={item}>
-                        {item}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                <label className="slider-row">
-                  <span>Export quality</span>
-                  <select
-                    aria-label="Mesh export quality"
-                    value={meshExportQuality}
-                    onChange={(event) => setMeshExportQuality(event.target.value as QualityProfile)}
-                  >
-                    {QUALITY_ORDER.map((item) => (
-                      <option key={item} value={item}>
-                        {item}
-                      </option>
-                    ))}
-                  </select>
-                </label>
 
                 <label className="slider-row">
                   <span>Field backend</span>

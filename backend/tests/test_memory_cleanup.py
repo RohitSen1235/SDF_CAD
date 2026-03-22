@@ -8,6 +8,7 @@ def test_clear_all_caches_empties_process_lru_caches() -> None:
     cache.mesh_preview_cache.set("mesh", object())
     cache.field_preview_cache.set("field", object())
     cache.uploaded_mesh_preview_cache.set("uploaded_mesh", object())
+    cache.uploaded_composed_field_cache.set("uploaded_composed", object())
     cache.uploaded_host_field_cache.set("uploaded_field", object())
 
     cache.clear_all_caches()
@@ -16,6 +17,7 @@ def test_clear_all_caches_empties_process_lru_caches() -> None:
     assert cache.mesh_preview_cache.get("mesh") is None
     assert cache.field_preview_cache.get("field") is None
     assert cache.uploaded_mesh_preview_cache.get("uploaded_mesh") is None
+    assert cache.uploaded_composed_field_cache.get("uploaded_composed") is None
     assert cache.uploaded_host_field_cache.get("uploaded_field") is None
 
 

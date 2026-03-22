@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 NodeType = Literal[
@@ -220,6 +220,8 @@ class PreviewWsResponse(BaseModel):
 
 
 class UploadedMeshPreviewWsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     file_name: str
     file_data_base64: str
     shell_thickness: float
@@ -227,7 +229,6 @@ class UploadedMeshPreviewWsRequest(BaseModel):
     lattice_pitch: float
     lattice_thickness: float
     lattice_phase: float = 0.0
-    quality_profile: QualityProfile = "medium"
     voxels_per_lattice_period: int = 6
     compute_backend: ComputeBackend = "auto"
     mesh_backend: MeshBackend = "auto"

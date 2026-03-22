@@ -149,7 +149,7 @@ def build_host_field(
     occupancy = _voxelize_and_fill(mesh, bounds, resolution)
 
     if field_storage_mode == "dense":
-        host_sdf = _build_host_sdf_dense(occupancy, bounds, resolution)
+        host_sdf = np.asarray(_build_host_sdf_dense(occupancy, bounds, resolution), dtype=np.float32)
         return HostFieldData(
             mesh=mesh,
             bounds=bounds,
@@ -164,6 +164,7 @@ def build_host_field(
         bounds,
         resolution,
     )
+    host_sdf = np.asarray(host_sdf, dtype=np.float32)
 
     use_sparse = bool(block_size and active_blocks)
     if field_storage_mode == "octree_sparse" and not use_sparse:
@@ -454,34 +455,43 @@ def _compose_hollow_lattice_field_cpu(
     if host_sdf.ndim != 3:
         raise MeshUploadError("host_sdf must be a 3D grid")
 
-    shell_field = np.maximum(host_sdf, -host_sdf - abs(shell_thickness))
-    cavity = host_sdf + abs(shell_thickness)
-    lattice_clipped = cavity.copy()
+    thickness = np.float32(abs(shell_thickness))
+    shell_field = np.empty_like(host_sdf, dtype=np.float32)
+    np.negative(host_sdf, out=shell_field)
+    shell_field -= thickness
+    np.maximum(host_sdf, shell_field, out=shell_field)
+
+    out = np.empty_like(host_sdf, dtype=np.float32)
+    np.add(host_sdf, thickness, out=out)
 
     # Expensive TPMS trig is needed only inside cavity voxels.
-    mask = cavity < 0.0
+    mask = out < 0.0
     if np.any(mask):
         resolution = host_sdf.shape[0]
-        x_axis = np.linspace(bounds[0][0], bounds[0][1], resolution, dtype=np.float64)
-        y_axis = np.linspace(bounds[1][0], bounds[1][1], resolution, dtype=np.float64)
-        z_axis = np.linspace(bounds[2][0], bounds[2][1], resolution, dtype=np.float64)
+        x_axis = np.linspace(bounds[0][0], bounds[0][1], resolution, dtype=host_sdf.dtype)
+        y_axis = np.linspace(bounds[1][0], bounds[1][1], resolution, dtype=host_sdf.dtype)
+        z_axis = np.linspace(bounds[2][0], bounds[2][1], resolution, dtype=host_sdf.dtype)
         ix, iy, iz = np.nonzero(mask)
 
         qx = x_axis[ix]
         qy = y_axis[iy]
         qz = z_axis[iz]
-        lattice_values = _tpms_field(
-            qx,
-            qy,
-            qz,
-            lattice_type=lattice_type,
-            lattice_pitch=lattice_pitch,
-            lattice_thickness=lattice_thickness,
-            lattice_phase=lattice_phase,
+        lattice_values = np.asarray(
+            _tpms_field(
+                qx,
+                qy,
+                qz,
+                lattice_type=lattice_type,
+                lattice_pitch=lattice_pitch,
+                lattice_thickness=lattice_thickness,
+                lattice_phase=lattice_phase,
+            ),
+            dtype=host_sdf.dtype,
         )
-        lattice_clipped[mask] = np.maximum(lattice_values, cavity[mask])
+        out[mask] = np.maximum(lattice_values, out[mask])
 
-    return np.minimum(shell_field, lattice_clipped)
+    np.minimum(shell_field, out, out=out)
+    return out
 
 
 def _compose_hollow_lattice_field_cuda(
@@ -504,12 +514,17 @@ def _compose_hollow_lattice_field_cuda(
     if host_sdf.ndim != 3:
         raise MeshUploadError("host_sdf must be a 3D grid")
 
+    thickness = cp.float32(abs(shell_thickness))
     host = cp.asarray(host_sdf, dtype=cp.float32)
-    shell_field = cp.maximum(host, -host - abs(shell_thickness))
-    cavity = host + abs(shell_thickness)
-    lattice_clipped = cavity.copy()
+    shell_field = cp.empty_like(host)
+    cp.negative(host, out=shell_field)
+    shell_field -= thickness
+    cp.maximum(host, shell_field, out=shell_field)
 
-    mask = cavity < 0.0
+    out = cp.empty_like(host)
+    cp.add(host, thickness, out=out)
+
+    mask = out < 0.0
     if bool(cp.any(mask).item()):
         resolution = host.shape[0]
         x_axis = cp.linspace(bounds[0][0], bounds[0][1], resolution, dtype=cp.float32)
@@ -529,9 +544,9 @@ def _compose_hollow_lattice_field_cuda(
             lattice_thickness=lattice_thickness,
             lattice_phase=lattice_phase,
         )
-        lattice_clipped[mask] = cp.maximum(lattice_values, cavity[mask])
+        out[mask] = cp.maximum(lattice_values, out[mask])
 
-    out = cp.minimum(shell_field, lattice_clipped)
+    cp.minimum(shell_field, out, out=out)
     return cp.asnumpy(out)
 
 
