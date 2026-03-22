@@ -11,6 +11,10 @@ def test_clear_all_caches_empties_process_lru_caches() -> None:
     cache.uploaded_mesh_metadata_cache.set("uploaded_metadata", object())
     cache.uploaded_composed_field_cache.set("uploaded_composed", object())
     cache.uploaded_host_field_cache.set("uploaded_field", object())
+    cache.uploaded_field_preview_trace_store.set(
+        "uploaded_trace",
+        cache.UploadedFieldPreviewTraceEntry(trace_id="uploaded_trace", created_at=0.0, route="/api/v1/mesh/field.binary"),
+    )
 
     cache.clear_all_caches()
 
@@ -21,6 +25,7 @@ def test_clear_all_caches_empties_process_lru_caches() -> None:
     assert cache.uploaded_mesh_metadata_cache.get("uploaded_metadata") is None
     assert cache.uploaded_composed_field_cache.get("uploaded_composed") is None
     assert cache.uploaded_host_field_cache.get("uploaded_field") is None
+    assert cache.uploaded_field_preview_trace_store.get("uploaded_trace") is None
 
 
 def test_clear_evaluator_caches_clears_lru_entries() -> None:

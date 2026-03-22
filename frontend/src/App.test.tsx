@@ -19,6 +19,7 @@ const exportMesh = vi.fn();
 const previewUploadedMesh = vi.fn();
 const previewUploadedMeshField = vi.fn();
 const exportUploadedMesh = vi.fn();
+const submitUploadedFieldPreviewTelemetry = vi.fn();
 
 vi.mock("./lib/api", () => ({
   compileScene: (...args: unknown[]) => compileScene(...args),
@@ -27,7 +28,8 @@ vi.mock("./lib/api", () => ({
   exportMesh: (...args: unknown[]) => exportMesh(...args),
   previewUploadedMesh: (...args: unknown[]) => previewUploadedMesh(...args),
   previewUploadedMeshField: (...args: unknown[]) => previewUploadedMeshField(...args),
-  exportUploadedMesh: (...args: unknown[]) => exportUploadedMesh(...args)
+  exportUploadedMesh: (...args: unknown[]) => exportUploadedMesh(...args),
+  submitUploadedFieldPreviewTelemetry: (...args: unknown[]) => submitUploadedFieldPreviewTelemetry(...args)
 }));
 
 const compiledScene = {
@@ -101,6 +103,7 @@ describe("App", () => {
     previewUploadedMesh.mockResolvedValue(meshPreviewPayload);
     previewUploadedMeshField.mockResolvedValue(fieldPreviewPayload);
     exportUploadedMesh.mockResolvedValue(new Blob(["ok"]));
+    submitUploadedFieldPreviewTelemetry.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -324,6 +327,54 @@ describe("App", () => {
     });
     expect(screen.getByText("Field cache: hit")).toBeInTheDocument();
     expect(screen.getByText("Mesh cache: miss")).toBeInTheDocument();
+  });
+
+  it("posts uploaded field preview telemetry after the first visible field frame", async () => {
+    vi.spyOn(performance, "now").mockReturnValue(100);
+    previewUploadedMeshField.mockResolvedValueOnce({
+      ...fieldPreviewPayload,
+      trace: {
+        traceId: "trace-123",
+        clientResponseWaitMs: 11,
+        clientDownloadMs: 22,
+        clientDecodeMs: 33,
+        fieldAssignedAtMs: 100
+      }
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
+
+    const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
+    const onUploadedFieldPreviewVisible = latestViewerProps.onUploadedFieldPreviewVisible as
+      | ((payload: { traceId: string; textureReadyAtMs: number; firstVisibleFrameAtMs: number }) => void)
+      | undefined;
+    expect(onUploadedFieldPreviewVisible).toBeDefined();
+
+    onUploadedFieldPreviewVisible?.({
+      traceId: "trace-123",
+      textureReadyAtMs: 120,
+      firstVisibleFrameAtMs: 140
+    });
+
+    await waitFor(() => {
+      expect(submitUploadedFieldPreviewTelemetry).toHaveBeenCalledWith({
+        trace_id: "trace-123",
+        client_response_wait_ms: 11,
+        client_download_ms: 22,
+        client_decode_ms: 33,
+        client_texture_upload_and_first_frame_ms: 40,
+        client_total_visible_ms: 106
+      });
+    });
   });
 
   it("clears the previous preview immediately when Preview Field is clicked", async () => {

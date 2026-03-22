@@ -316,6 +316,7 @@ def test_mesh_field_endpoint_obj_upload() -> None:
     assert payload["stats"]["preview_mode"] == "field"
     assert payload["stats"]["mesh_ms"] is None
     assert payload["stats"]["tri_count"] == 0
+    assert response.headers.get("x-sdf-trace-id")
 
 
 def test_mesh_field_binary_endpoint_obj_upload() -> None:
@@ -328,6 +329,46 @@ def test_mesh_field_binary_endpoint_obj_upload() -> None:
     assert response.headers["content-type"].startswith("application/octet-stream")
     assert response.headers.get("x-sdf-stats")
     assert response.headers.get("x-sdf-resolution") == "24"
+    assert response.headers.get("x-sdf-trace-id")
+
+
+def test_uploaded_field_preview_telemetry_endpoint_merges_with_server_trace() -> None:
+    response = client.post(
+        "/api/v1/mesh/field.binary",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    trace_id = response.headers.get("x-sdf-trace-id")
+    assert trace_id
+
+    telemetry = client.post(
+        "/api/v1/internal/mesh/field-preview-telemetry",
+        json={
+            "trace_id": trace_id,
+            "client_response_wait_ms": 10.0,
+            "client_download_ms": 20.0,
+            "client_decode_ms": 30.0,
+            "client_texture_upload_and_first_frame_ms": 40.0,
+            "client_total_visible_ms": 100.0,
+        },
+    )
+    assert telemetry.status_code == 204
+
+
+def test_uploaded_field_preview_telemetry_endpoint_rejects_unknown_trace_id() -> None:
+    telemetry = client.post(
+        "/api/v1/internal/mesh/field-preview-telemetry",
+        json={
+            "trace_id": "missing-trace",
+            "client_response_wait_ms": 10.0,
+            "client_download_ms": 20.0,
+            "client_decode_ms": 30.0,
+            "client_texture_upload_and_first_frame_ms": 40.0,
+            "client_total_visible_ms": 100.0,
+        },
+    )
+    assert telemetry.status_code == 404
 
 
 def test_mesh_field_endpoint_does_not_call_mesher(monkeypatch: pytest.MonkeyPatch) -> None:

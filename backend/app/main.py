@@ -8,9 +8,10 @@ import json
 import logging
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 import numpy as np
 from celery.result import AsyncResult
@@ -21,6 +22,7 @@ from fastapi.responses import Response, StreamingResponse
 from .cache import (
     CompileCacheEntry,
     MeshCacheEntry,
+    UploadedFieldPreviewTraceEntry,
     UploadedComposedFieldCacheEntry,
     UploadedHostFieldCacheEntry,
     UploadedMeshMetadataCacheEntry,
@@ -35,6 +37,7 @@ from .cache import (
     mesh_preview_cache,
     scene_compile_cache,
     uploaded_composed_field_cache,
+    uploaded_field_preview_trace_store,
     uploaded_host_field_cache,
     uploaded_mesh_metadata_cache,
     uploaded_mesh_preview_cache,
@@ -94,11 +97,19 @@ from .models import (
     MeshBackend,
     MeshPayload,
     UploadedFieldStorageMode,
+    UploadedFieldPreviewClientTelemetry,
     UploadedMeshPreviewWsRequest,
     UploadedMeshPreviewWsResponse,
 )
 
 logger = logging.getLogger(__name__)
+_uvicorn_error_logger = logging.getLogger("uvicorn.error")
+if _uvicorn_error_logger.handlers:
+    logger.handlers = _uvicorn_error_logger.handlers
+    logger.setLevel(_uvicorn_error_logger.level or logging.INFO)
+    logger.propagate = False
+else:
+    logger.setLevel(logging.INFO)
 
 try:
     import redis as _redis  # type: ignore
@@ -138,6 +149,7 @@ app.add_middleware(
         "X-SDF-Bounds",
         "X-SDF-Vertex-Count",
         "X-SDF-Face-Count",
+        "X-SDF-Trace-Id",
     ],
 )
 
@@ -221,6 +233,147 @@ class UploadedMeshMetadata:
     outer_mesh: MeshData
     mesh_span: float
     cache_hit: bool
+
+
+@dataclass(frozen=True)
+class UploadedHostFieldResult:
+    parsed: ParsedMesh
+    bounds: list[list[float]]
+    host_sdf: np.ndarray
+    block_size: int | None
+    active_blocks: list[tuple[int, int, int]] | None
+    field_storage_mode: UploadedFieldStorageMode
+    cache_hit: bool
+
+
+@dataclass(frozen=True)
+class UploadedComposedFieldResult:
+    parsed: ParsedMesh
+    resolution: int
+    bounds: list[list[float]]
+    host_sdf: np.ndarray
+    sparse_block_size: int | None
+    active_blocks: list[tuple[int, int, int]] | None
+    field: np.ndarray
+    eval_backend_used: Literal["cpu", "cuda"]
+    eval_ms: float
+    field_cache_hit: bool
+
+
+@dataclass(frozen=True)
+class UploadedFieldPreviewServerAudit:
+    metadata_cache_hit: bool
+    host_cache_hit: bool
+    field_cache_hit: bool
+    resolution: int
+    voxel_count: int
+    payload_bytes: int
+    compute_backend: Literal["cpu", "cuda"]
+    server_upload_read_ms: float
+    server_metadata_resolve_ms: float
+    server_host_field_ms: float
+    server_compose_field_ms: float
+    server_pack_binary_ms: float
+    server_handler_total_ms: float
+
+
+def _log_uploaded_field_preview_server_trace(
+    *,
+    trace_id: str,
+    route: str,
+    extension: str,
+    audit: UploadedFieldPreviewServerAudit,
+) -> None:
+    print(
+        "\n".join(
+            [
+                "uploaded_field_preview_server",
+                f"trace_id={trace_id}",
+                f"route={route}",
+                f"extension={extension}",
+                f"resolution={audit.resolution}",
+                f"voxel_count={audit.voxel_count}",
+                f"payload_bytes={audit.payload_bytes}",
+                f"compute_backend={audit.compute_backend}",
+                f"metadata_cache_hit={audit.metadata_cache_hit}",
+                f"host_cache_hit={audit.host_cache_hit}",
+                f"field_cache_hit={audit.field_cache_hit}",
+                f"server_upload_read_ms={audit.server_upload_read_ms:.3f}",
+                f"server_metadata_resolve_ms={audit.server_metadata_resolve_ms:.3f}",
+                f"server_host_field_ms={audit.server_host_field_ms:.3f}",
+                f"server_compose_field_ms={audit.server_compose_field_ms:.3f}",
+                f"server_pack_binary_ms={audit.server_pack_binary_ms:.3f}",
+                f"server_handler_total_ms={audit.server_handler_total_ms:.3f}",
+            ]
+        ),
+        flush=True,
+    )
+
+
+def _log_uploaded_field_preview_consolidated_trace(entry: UploadedFieldPreviewTraceEntry) -> None:
+    print(
+        "\n".join(
+            [
+                "uploaded_field_preview_trace",
+                f"trace_id={entry.trace_id}",
+                f"route={entry.route}",
+                f"extension={entry.extension}",
+                f"resolution={entry.resolution}",
+                f"voxel_count={entry.voxel_count}",
+                f"payload_bytes={entry.payload_bytes}",
+                f"compute_backend={entry.compute_backend}",
+                f"metadata_cache_hit={entry.metadata_cache_hit}",
+                f"host_cache_hit={entry.host_cache_hit}",
+                f"field_cache_hit={entry.field_cache_hit}",
+                f"mesh_cache_hit={entry.mesh_cache_hit}",
+                f"server_upload_read_ms={entry.server_upload_read_ms}",
+                f"server_metadata_resolve_ms={entry.server_metadata_resolve_ms}",
+                f"server_host_field_ms={entry.server_host_field_ms}",
+                f"server_compose_field_ms={entry.server_compose_field_ms}",
+                f"server_pack_binary_ms={entry.server_pack_binary_ms}",
+                f"server_handler_total_ms={entry.server_handler_total_ms}",
+                f"client_response_wait_ms={entry.client_response_wait_ms}",
+                f"client_download_ms={entry.client_download_ms}",
+                f"client_decode_ms={entry.client_decode_ms}",
+                f"client_texture_upload_and_first_frame_ms={entry.client_texture_upload_and_first_frame_ms}",
+                f"client_total_visible_ms={entry.client_total_visible_ms}",
+            ]
+        ),
+        flush=True,
+    )
+
+
+def _record_uploaded_field_preview_server_trace(
+    *,
+    trace_id: str,
+    route: str,
+    extension: str,
+    audit: UploadedFieldPreviewServerAudit,
+) -> None:
+    uploaded_field_preview_trace_store.set(
+        trace_id,
+        UploadedFieldPreviewTraceEntry(
+            trace_id=trace_id,
+            created_at=time.time(),
+            route=route,
+            extension=extension,
+            resolution=audit.resolution,
+            voxel_count=audit.voxel_count,
+            payload_bytes=audit.payload_bytes,
+            compute_backend=audit.compute_backend,
+            field_cache_hit=audit.field_cache_hit,
+            mesh_cache_hit=False,
+            host_cache_hit=audit.host_cache_hit,
+            metadata_cache_hit=audit.metadata_cache_hit,
+            server_upload_read_ms=audit.server_upload_read_ms,
+            server_metadata_resolve_ms=audit.server_metadata_resolve_ms,
+            server_host_field_ms=audit.server_host_field_ms,
+            server_compose_field_ms=audit.server_compose_field_ms,
+            server_pack_binary_ms=audit.server_pack_binary_ms,
+            server_handler_total_ms=audit.server_handler_total_ms,
+        ),
+    )
+    _log_uploaded_field_preview_server_trace(trace_id=trace_id, route=route, extension=extension, audit=audit)
 
 
 def _sample_field_trilinear(
@@ -809,14 +962,7 @@ def _resolve_uploaded_host_field(
     resolution: int,
     parsed: ParsedMesh | None = None,
     field_storage_mode: UploadedFieldStorageMode = "auto",
-) -> tuple[
-    ParsedMesh,
-    list[list[float]],
-    np.ndarray,
-    int | None,
-    list[tuple[int, int, int]] | None,
-    UploadedFieldStorageMode,
-]:
+) -> UploadedHostFieldResult:
     if parsed is None:
         parsed = _resolve_uploaded_mesh_metadata(file_bytes=file_bytes, extension=extension).parsed
     host_key = hash_uploaded_mesh_host_request(
@@ -831,13 +977,14 @@ def _resolve_uploaded_host_field(
         active_blocks: list[tuple[int, int, int]] | None = None
         if cached.active_blocks:
             active_blocks = [(int(bx), int(by), int(bz)) for bx, by, bz in cached.active_blocks]
-        return (
-            parsed,
-            bounds,
-            cached.host_sdf,
-            cached.block_size,
-            active_blocks,
-            cached.field_storage_mode,
+        return UploadedHostFieldResult(
+            parsed=parsed,
+            bounds=bounds,
+            host_sdf=cached.host_sdf,
+            block_size=cached.block_size,
+            active_blocks=active_blocks,
+            field_storage_mode=cached.field_storage_mode,
+            cache_hit=True,
         )
 
     host = build_host_field(parsed, resolution=resolution, field_storage_mode=field_storage_mode)
@@ -859,13 +1006,14 @@ def _resolve_uploaded_host_field(
             ),
         ),
     )
-    return (
-        parsed,
-        host.bounds,
-        frozen_host_sdf,
-        host.block_size,
-        host.active_blocks,
-        host.field_storage_mode,
+    return UploadedHostFieldResult(
+        parsed=parsed,
+        bounds=host.bounds,
+        host_sdf=frozen_host_sdf,
+        block_size=host.block_size,
+        active_blocks=host.active_blocks,
+        field_storage_mode=host.field_storage_mode,
+        cache_hit=False,
     )
 
 
@@ -1007,19 +1155,12 @@ def _resolve_uploaded_composed_field(
     compute_backend: ComputeBackend = "auto",
     parsed: ParsedMesh | None = None,
     resolution: int | None = None,
+    bounds: list[list[float]] | None = None,
+    host_sdf: np.ndarray | None = None,
+    sparse_block_size: int | None = None,
+    host_active_blocks: list[tuple[int, int, int]] | None = None,
     field_storage_mode: UploadedFieldStorageMode = "auto",
-) -> tuple[
-    ParsedMesh,
-    int,
-    list[list[float]],
-    np.ndarray,
-    int | None,
-    list[tuple[int, int, int]] | None,
-    np.ndarray,
-    Literal["cpu", "cuda"],
-    float,
-    bool,
-]:
+) -> UploadedComposedFieldResult:
     if parsed is None or resolution is None:
         metadata = _resolve_uploaded_mesh_metadata(file_bytes=file_bytes, extension=extension)
         if parsed is None:
@@ -1033,13 +1174,22 @@ def _resolve_uploaded_composed_field(
 
     assert parsed is not None
     assert resolution is not None
-    parsed, bounds, host_sdf, sparse_block_size, host_active_blocks, _ = _resolve_uploaded_host_field(
-        file_bytes=file_bytes,
-        extension=extension,
-        resolution=resolution,
-        parsed=parsed,
-        field_storage_mode=field_storage_mode,
-    )
+    if bounds is None or host_sdf is None:
+        host_result = _resolve_uploaded_host_field(
+            file_bytes=file_bytes,
+            extension=extension,
+            resolution=resolution,
+            parsed=parsed,
+            field_storage_mode=field_storage_mode,
+        )
+        parsed = host_result.parsed
+        bounds = host_result.bounds
+        host_sdf = host_result.host_sdf
+        sparse_block_size = host_result.block_size
+        host_active_blocks = host_result.active_blocks
+
+    assert bounds is not None
+    assert host_sdf is not None
 
     field_key = _uploaded_mesh_field_payload_key(
         file_bytes=file_bytes,
@@ -1059,17 +1209,17 @@ def _resolve_uploaded_composed_field(
         active_blocks: list[tuple[int, int, int]] | None = None
         if cached_field.active_blocks:
             active_blocks = [(int(bx), int(by), int(bz)) for bx, by, bz in cached_field.active_blocks]
-        return (
-            parsed,
-            resolution,
-            [[float(axis[0]), float(axis[1])] for axis in cached_field.bounds],
-            host_sdf,
-            cached_field.block_size,
-            active_blocks,
-            cached_field.field,
-            "cuda" if cached_field.eval_backend == "cuda" else "cpu",
-            0.0,
-            True,
+        return UploadedComposedFieldResult(
+            parsed=parsed,
+            resolution=resolution,
+            bounds=[[float(axis[0]), float(axis[1])] for axis in cached_field.bounds],
+            host_sdf=host_sdf,
+            sparse_block_size=cached_field.block_size,
+            active_blocks=active_blocks,
+            field=cached_field.field,
+            eval_backend_used="cuda" if cached_field.eval_backend == "cuda" else "cpu",
+            eval_ms=0.0,
+            field_cache_hit=True,
         )
 
     eval_start = time.perf_counter()
@@ -1116,17 +1266,17 @@ def _resolve_uploaded_composed_field(
         ),
     )
     eval_ms = (time.perf_counter() - eval_start) * 1000.0
-    return (
-        parsed,
-        resolution,
-        bounds,
-        host_sdf,
-        sparse_block_size,
-        active_blocks,
-        field,
-        eval_backend_used,
-        eval_ms,
-        False,
+    return UploadedComposedFieldResult(
+        parsed=parsed,
+        resolution=resolution,
+        bounds=bounds,
+        host_sdf=host_sdf,
+        sparse_block_size=sparse_block_size,
+        active_blocks=active_blocks,
+        field=field,
+        eval_backend_used=eval_backend_used,
+        eval_ms=eval_ms,
+        field_cache_hit=False,
     )
 
 
@@ -1193,6 +1343,88 @@ def _run_uploaded_mesh_field_preview(
     return PreviewFieldResponse(field=field_payload, stats=stats)
 
 
+def _run_uploaded_mesh_field_preview_data_with_audit(
+    *,
+    file_bytes: bytes,
+    extension: str,
+    shell_thickness: float,
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"],
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+    voxels_per_lattice_period: int = 6,
+    compute_backend: ComputeBackend = "auto",
+    field_storage_mode: UploadedFieldStorageMode = "auto",
+) -> tuple[np.ndarray, list[list[float]], PreviewStats, UploadedFieldPreviewServerAudit]:
+    metadata_start = time.perf_counter()
+    metadata = _resolve_uploaded_mesh_metadata(file_bytes=file_bytes, extension=extension)
+    server_metadata_resolve_ms = (time.perf_counter() - metadata_start) * 1000.0
+    resolution, _ = _resolve_mesh_resolution(
+        lattice_pitch,
+        metadata.mesh_span,
+        voxels_per_lattice_period,
+    )
+
+    host_start = time.perf_counter()
+    host_result = _resolve_uploaded_host_field(
+        file_bytes=file_bytes,
+        extension=extension,
+        resolution=resolution,
+        parsed=metadata.parsed,
+        field_storage_mode=field_storage_mode,
+    )
+    server_host_field_ms = (time.perf_counter() - host_start) * 1000.0
+
+    composed = _resolve_uploaded_composed_field(
+        file_bytes=file_bytes,
+        extension=extension,
+        shell_thickness=shell_thickness,
+        lattice_type=lattice_type,
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+        voxels_per_lattice_period=voxels_per_lattice_period,
+        compute_backend=compute_backend,
+        parsed=host_result.parsed,
+        resolution=resolution,
+        bounds=host_result.bounds,
+        host_sdf=host_result.host_sdf,
+        sparse_block_size=host_result.block_size,
+        host_active_blocks=host_result.active_blocks,
+        field_storage_mode=field_storage_mode,
+    )
+
+    out_bounds = [[float(axis[0]), float(axis[1])] for axis in composed.bounds]
+    stats = PreviewStats(
+        eval_ms=composed.eval_ms,
+        mesh_ms=None,
+        tri_count=0,
+        voxel_count=int(composed.field.size),
+        cache_hit=composed.field_cache_hit,
+        field_cache_hit=composed.field_cache_hit,
+        mesh_cache_hit=False,
+        compute_backend=composed.eval_backend_used,
+        mesh_backend="cpu",
+        preview_mode="field",
+    )
+    audit = UploadedFieldPreviewServerAudit(
+        metadata_cache_hit=metadata.cache_hit,
+        host_cache_hit=host_result.cache_hit,
+        field_cache_hit=composed.field_cache_hit,
+        resolution=int(composed.field.shape[0]),
+        voxel_count=int(composed.field.size),
+        payload_bytes=int(composed.field.size * np.dtype(np.float32).itemsize),
+        compute_backend=composed.eval_backend_used,
+        server_upload_read_ms=0.0,
+        server_metadata_resolve_ms=server_metadata_resolve_ms,
+        server_host_field_ms=server_host_field_ms,
+        server_compose_field_ms=composed.eval_ms,
+        server_pack_binary_ms=0.0,
+        server_handler_total_ms=0.0,
+    )
+    return composed.field, out_bounds, stats, audit
+
+
 def _run_uploaded_mesh_field_preview_data(
     *,
     file_bytes: bytes,
@@ -1206,24 +1438,7 @@ def _run_uploaded_mesh_field_preview_data(
     compute_backend: ComputeBackend = "auto",
     field_storage_mode: UploadedFieldStorageMode = "auto",
 ) -> tuple[np.ndarray, list[list[float]], PreviewStats]:
-    metadata = _resolve_uploaded_mesh_metadata(file_bytes=file_bytes, extension=extension)
-    resolution, _ = _resolve_mesh_resolution(
-        lattice_pitch,
-        metadata.mesh_span,
-        voxels_per_lattice_period,
-    )
-    (
-        _parsed,
-        _resolution,
-        bounds,
-        _host_sdf,
-        _sparse_block_size,
-        _active_blocks,
-        field,
-        eval_backend_used,
-        eval_ms,
-        field_cache_hit,
-    ) = _resolve_uploaded_composed_field(
+    field, bounds, stats, _audit = _run_uploaded_mesh_field_preview_data_with_audit(
         file_bytes=file_bytes,
         extension=extension,
         shell_thickness=shell_thickness,
@@ -1233,24 +1448,9 @@ def _run_uploaded_mesh_field_preview_data(
         lattice_phase=lattice_phase,
         voxels_per_lattice_period=voxels_per_lattice_period,
         compute_backend=compute_backend,
-        parsed=metadata.parsed,
-        resolution=resolution,
         field_storage_mode=field_storage_mode,
     )
-    out_bounds = [[float(axis[0]), float(axis[1])] for axis in bounds]
-    stats = PreviewStats(
-        eval_ms=eval_ms,
-        mesh_ms=None,
-        tri_count=0,
-        voxel_count=int(field.size),
-        cache_hit=field_cache_hit,
-        field_cache_hit=field_cache_hit,
-        mesh_cache_hit=False,
-        compute_backend=eval_backend_used,
-        mesh_backend="cpu",
-        preview_mode="field",
-    )
-    return field, out_bounds, stats
+    return field, bounds, stats
 
 
 def _run_uploaded_mesh_preview_meshdata(
@@ -1343,18 +1543,7 @@ def _run_uploaded_mesh_preview_meshdata(
             cached_field,
             cached_mesh_payload if encode_response_payloads else None,
         )
-    (
-        parsed,
-        resolution,
-        bounds,
-        host_sdf,
-        sparse_block_size,
-        active_blocks,
-        field,
-        eval_backend_used,
-        eval_ms,
-        field_cache_hit,
-    ) = _resolve_uploaded_composed_field(
+    composed = _resolve_uploaded_composed_field(
         file_bytes=file_bytes,
         extension=extension,
         shell_thickness=shell_thickness,
@@ -1368,6 +1557,16 @@ def _run_uploaded_mesh_preview_meshdata(
         resolution=resolution,
         field_storage_mode=field_storage_mode,
     )
+    parsed = composed.parsed
+    resolution = composed.resolution
+    bounds = composed.bounds
+    host_sdf = composed.host_sdf
+    sparse_block_size = composed.sparse_block_size
+    active_blocks = composed.active_blocks
+    field = composed.field
+    eval_backend_used = composed.eval_backend_used
+    eval_ms = composed.eval_ms
+    field_cache_hit = composed.field_cache_hit
 
     mesh_start = time.perf_counter()
     mesher_start = time.perf_counter()
@@ -1817,6 +2016,7 @@ async def preview_uploaded_mesh_binary(
 @app.post("/api/v1/mesh/field", response_model=PreviewFieldResponse)
 async def preview_uploaded_mesh_field(
     request: Request,
+    response: Response,
     file: UploadFile = File(...),
     shell_thickness: float = Form(...),
     lattice_type: Literal["gyroid", "schwarz_p", "diamond"] = Form(...),
@@ -1827,11 +2027,15 @@ async def preview_uploaded_mesh_field(
     compute_backend: ComputeBackend = Form("auto"),
     field_storage_mode: UploadedFieldStorageMode = Form("auto"),
 ) -> PreviewFieldResponse:
+    trace_id = uuid4().hex
+    route_started = time.perf_counter()
     await _reject_legacy_uploaded_mesh_quality_profile(request)
+    upload_read_start = time.perf_counter()
     file_bytes, extension = await _read_uploaded_mesh(file)
+    server_upload_read_ms = (time.perf_counter() - upload_read_start) * 1000.0
     try:
-        result = await asyncio.to_thread(
-            _run_uploaded_mesh_field_preview,
+        field, bounds, stats, audit = await asyncio.to_thread(
+            _run_uploaded_mesh_field_preview_data_with_audit,
             file_bytes=file_bytes,
             extension=extension,
             shell_thickness=shell_thickness,
@@ -1843,7 +2047,19 @@ async def preview_uploaded_mesh_field(
             compute_backend=compute_backend,
             field_storage_mode=field_storage_mode,
         )
-        return result
+        final_audit = replace(
+            audit,
+            server_upload_read_ms=server_upload_read_ms,
+            server_handler_total_ms=(time.perf_counter() - route_started) * 1000.0,
+        )
+        _record_uploaded_field_preview_server_trace(
+            trace_id=trace_id,
+            route="/api/v1/mesh/field",
+            extension=extension,
+            audit=final_audit,
+        )
+        response.headers["X-SDF-Trace-Id"] = trace_id
+        return PreviewFieldResponse(field=_build_uploaded_field_payload(field, bounds), stats=stats)
     except (MeshUploadError, MeshingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
@@ -1863,11 +2079,15 @@ async def preview_uploaded_mesh_field_binary(
     compute_backend: ComputeBackend = Form("auto"),
     field_storage_mode: UploadedFieldStorageMode = Form("auto"),
 ) -> Response:
+    trace_id = uuid4().hex
+    route_started = time.perf_counter()
     await _reject_legacy_uploaded_mesh_quality_profile(request)
+    upload_read_start = time.perf_counter()
     file_bytes, extension = await _read_uploaded_mesh(file)
+    server_upload_read_ms = (time.perf_counter() - upload_read_start) * 1000.0
     try:
-        field, bounds, stats = await asyncio.to_thread(
-            _run_uploaded_mesh_field_preview_data,
+        field, bounds, stats, audit = await asyncio.to_thread(
+            _run_uploaded_mesh_field_preview_data_with_audit,
             file_bytes=file_bytes,
             extension=extension,
             shell_thickness=shell_thickness,
@@ -1879,13 +2099,30 @@ async def preview_uploaded_mesh_field_binary(
             compute_backend=compute_backend,
             field_storage_mode=field_storage_mode,
         )
+        pack_started = time.perf_counter()
+        packet = _pack_field_binary(field)
+        server_pack_binary_ms = (time.perf_counter() - pack_started) * 1000.0
+        final_audit = replace(
+            audit,
+            payload_bytes=len(packet),
+            server_upload_read_ms=server_upload_read_ms,
+            server_pack_binary_ms=server_pack_binary_ms,
+            server_handler_total_ms=(time.perf_counter() - route_started) * 1000.0,
+        )
+        _record_uploaded_field_preview_server_trace(
+            trace_id=trace_id,
+            route="/api/v1/mesh/field.binary",
+            extension=extension,
+            audit=final_audit,
+        )
         headers = {
             "X-SDF-Stats": _stats_header_value(stats),
             "X-SDF-Resolution": str(int(field.shape[0])),
             "X-SDF-Bounds": _bounds_header_value(bounds),
+            "X-SDF-Trace-Id": trace_id,
         }
         return Response(
-            content=_pack_field_binary(field),
+            content=packet,
             media_type="application/octet-stream",
             headers=headers,
         )
@@ -1893,6 +2130,24 @@ async def preview_uploaded_mesh_field_binary(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         cleanup_gpu_memory(reason="preview_uploaded_mesh_field_binary_inline")
+
+
+@app.post("/api/v1/internal/mesh/field-preview-telemetry", response_model=None, status_code=204)
+async def record_uploaded_field_preview_telemetry(payload: UploadedFieldPreviewClientTelemetry) -> Response:
+    trace_entry = uploaded_field_preview_trace_store.pop(payload.trace_id)
+    if trace_entry is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired uploaded field preview trace_id")
+
+    merged = replace(
+        trace_entry,
+        client_response_wait_ms=payload.client_response_wait_ms,
+        client_download_ms=payload.client_download_ms,
+        client_decode_ms=payload.client_decode_ms,
+        client_texture_upload_and_first_frame_ms=payload.client_texture_upload_and_first_frame_ms,
+        client_total_visible_ms=payload.client_total_visible_ms,
+    )
+    _log_uploaded_field_preview_consolidated_trace(merged)
+    return Response(status_code=204)
 
 
 @app.post("/api/v1/mesh/export", response_model=None)
@@ -2095,18 +2350,7 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
             # keepalive ping and cause an AssertionError).
             def _compute_field_phase():
                 try:
-                    (
-                        parsed,
-                        _resolution,
-                        bounds,
-                        host_sdf,
-                        sparse_block_size,
-                        active_blocks,
-                        field,
-                        eval_backend_used,
-                        eval_ms,
-                        field_cache_hit,
-                    ) = _resolve_uploaded_composed_field(
+                    composed = _resolve_uploaded_composed_field(
                         file_bytes=file_bytes,
                         extension=extension,
                         shell_thickness=payload.shell_thickness,
@@ -2120,6 +2364,15 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                         resolution=resolution,
                         field_storage_mode=payload.field_storage_mode,
                     )
+                    parsed = composed.parsed
+                    bounds = composed.bounds
+                    host_sdf = composed.host_sdf
+                    sparse_block_size = composed.sparse_block_size
+                    active_blocks = composed.active_blocks
+                    field = composed.field
+                    eval_backend_used = composed.eval_backend_used
+                    eval_ms = composed.eval_ms
+                    field_cache_hit = composed.field_cache_hit
                     field_payload = _build_uploaded_field_payload(field, bounds)
                     logger.debug(
                         "mesh_upload field_phase eval_ms=%.2f cache_hit=%s",

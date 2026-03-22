@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
@@ -121,6 +122,76 @@ class UploadedHostFieldCacheEntry:
 uploaded_host_field_cache: LruCache[UploadedHostFieldCacheEntry] = LruCache(maxsize=8)
 
 
+@dataclass
+class UploadedFieldPreviewTraceEntry:
+    trace_id: str
+    created_at: float
+    route: str
+    extension: str | None = None
+    resolution: int | None = None
+    voxel_count: int | None = None
+    payload_bytes: int | None = None
+    compute_backend: str | None = None
+    field_cache_hit: bool = False
+    mesh_cache_hit: bool = False
+    host_cache_hit: bool = False
+    metadata_cache_hit: bool = False
+    server_upload_read_ms: float | None = None
+    server_metadata_resolve_ms: float | None = None
+    server_host_field_ms: float | None = None
+    server_compose_field_ms: float | None = None
+    server_pack_binary_ms: float | None = None
+    server_handler_total_ms: float | None = None
+    client_response_wait_ms: float | None = None
+    client_download_ms: float | None = None
+    client_decode_ms: float | None = None
+    client_texture_upload_and_first_frame_ms: float | None = None
+    client_total_visible_ms: float | None = None
+
+
+class ExpiringTraceStore:
+    def __init__(self, ttl_seconds: float = 300.0, maxsize: int = 256) -> None:
+        self.ttl_seconds = ttl_seconds
+        self.maxsize = maxsize
+        self._data: OrderedDict[str, UploadedFieldPreviewTraceEntry] = OrderedDict()
+
+    def _purge_expired(self, now: float | None = None) -> None:
+        current = now if now is not None else time.time()
+        expired_keys = [
+            key
+            for key, value in self._data.items()
+            if (current - value.created_at) > self.ttl_seconds
+        ]
+        for key in expired_keys:
+            self._data.pop(key, None)
+
+    def get(self, key: str) -> UploadedFieldPreviewTraceEntry | None:
+        self._purge_expired()
+        value = self._data.get(key)
+        if value is None:
+            return None
+        self._data.move_to_end(key, last=True)
+        return value
+
+    def set(self, key: str, value: UploadedFieldPreviewTraceEntry) -> None:
+        self._purge_expired()
+        if key in self._data:
+            self._data.move_to_end(key, last=True)
+        self._data[key] = value
+        while len(self._data) > self.maxsize:
+            self._data.popitem(last=False)
+
+    def pop(self, key: str) -> UploadedFieldPreviewTraceEntry | None:
+        self._purge_expired()
+        return self._data.pop(key, None)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+
+uploaded_field_preview_trace_store = ExpiringTraceStore()
+
+
 def clear_all_preview_caches() -> None:
     mesh_preview_cache.clear()
     field_preview_cache.clear()
@@ -128,6 +199,7 @@ def clear_all_preview_caches() -> None:
     uploaded_mesh_metadata_cache.clear()
     uploaded_composed_field_cache.clear()
     uploaded_host_field_cache.clear()
+    uploaded_field_preview_trace_store.clear()
 
 
 def clear_all_caches() -> None:

@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from app import cache as cache_module
@@ -282,9 +284,51 @@ def test_uploaded_host_cache_returns_shared_immutable_arrays() -> None:
         parsed=metadata.parsed,
     )
 
-    first_parsed, _, first_host_sdf, *_ = first
-    second_parsed, _, second_host_sdf, *_ = second
-    assert first_parsed.vertices is second_parsed.vertices
-    assert first_parsed.faces is second_parsed.faces
-    assert first_host_sdf is second_host_sdf
-    assert first_host_sdf.flags.writeable is False
+    assert first.parsed.vertices is second.parsed.vertices
+    assert first.parsed.faces is second.parsed.faces
+    assert first.host_sdf is second.host_sdf
+    assert first.host_sdf.flags.writeable is False
+    assert first.cache_hit is False
+    assert second.cache_hit is True
+
+
+def test_uploaded_field_preview_audit_reports_zero_compose_time_on_cache_hit() -> None:
+    _, _, _, first_audit = main_module._run_uploaded_mesh_field_preview_data_with_audit(
+        file_bytes=MESH_OBJ,
+        extension=".obj",
+        shell_thickness=0.08,
+        lattice_type="gyroid",
+        lattice_pitch=0.45,
+        lattice_thickness=0.09,
+        lattice_phase=0.0,
+    )
+    _, _, _, second_audit = main_module._run_uploaded_mesh_field_preview_data_with_audit(
+        file_bytes=MESH_OBJ,
+        extension=".obj",
+        shell_thickness=0.08,
+        lattice_type="gyroid",
+        lattice_pitch=0.45,
+        lattice_thickness=0.09,
+        lattice_phase=0.0,
+    )
+
+    assert first_audit.field_cache_hit is False
+    assert first_audit.server_compose_field_ms > 0.0
+    assert second_audit.field_cache_hit is True
+    assert second_audit.server_compose_field_ms == 0.0
+
+
+def test_uploaded_field_preview_trace_store_expires_entries() -> None:
+    cache_module.uploaded_field_preview_trace_store.ttl_seconds = 0.001
+    try:
+        cache_module.uploaded_field_preview_trace_store.set(
+            "trace-expire",
+            cache_module.UploadedFieldPreviewTraceEntry(
+                trace_id="trace-expire",
+                created_at=time.time() - 1.0,
+                route="/api/v1/mesh/field.binary",
+            ),
+        )
+        assert cache_module.uploaded_field_preview_trace_store.get("trace-expire") is None
+    finally:
+        cache_module.uploaded_field_preview_trace_store.ttl_seconds = 300.0

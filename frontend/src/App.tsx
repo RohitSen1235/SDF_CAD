@@ -8,7 +8,8 @@ import {
   previewField,
   previewMesh,
   previewUploadedMesh,
-  previewUploadedMeshField
+  previewUploadedMeshField,
+  submitUploadedFieldPreviewTelemetry
 } from "./lib/api";
 import { parseLocalMeshPreview } from "./lib/localMeshPreview";
 import {
@@ -23,7 +24,8 @@ import {
   MeshWorkflowParams,
   PreviewStats,
   QualityProfile,
-  SceneIR
+  SceneIR,
+  UploadedFieldPreviewTrace
 } from "./types";
 
 interface SavedFieldExpression {
@@ -192,6 +194,7 @@ export default function App() {
   const [field, setField] = useState<FieldPayload | null>(null);
   const [mesh, setMesh] = useState<MeshPayload | null>(null);
   const [stats, setStats] = useState<PreviewStats | null>(null);
+  const [uploadedFieldPreviewTrace, setUploadedFieldPreviewTrace] = useState<UploadedFieldPreviewTrace | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isCompiling, setIsCompiling] = useState(false);
   const [isPreviewing, setIsPreviewing] = useState(false);
@@ -220,6 +223,7 @@ export default function App() {
   });
   const meshFieldPreviewRunIdRef = useRef(0);
   const meshFieldPreviewControllerRef = useRef<AbortController | null>(null);
+  const uploadedFieldTelemetrySentRef = useRef<Set<string>>(new Set());
 
   const meshWorkflowParams = useMemo<MeshWorkflowParams>(
     () => ({
@@ -283,9 +287,18 @@ export default function App() {
       if (meshFieldPreviewRunIdRef.current !== runId) {
         return;
       }
+      const fieldAssignedAtMs = performance.now();
       setField(response.field);
       setMesh(null);
       setStats(response.stats);
+      setUploadedFieldPreviewTrace(
+        response.trace
+          ? {
+              ...response.trace,
+              fieldAssignedAtMs
+            }
+          : null
+      );
       setMeshCommitted(false);
       setError(null);
     } catch (previewError) {
@@ -354,6 +367,7 @@ export default function App() {
       setField(null);
       setMesh(null);
       setStats(null);
+      setUploadedFieldPreviewTrace(null);
 
       try {
         const gridBounds = inferPreviewBounds(nextDiagnostics);
@@ -383,6 +397,7 @@ export default function App() {
           fieldSucceeded = true;
           setField(fieldResponse.field);
           setStats(fieldResponse.stats);
+          setUploadedFieldPreviewTrace(null);
         } catch (previewError) {
           if ((previewError as Error).name === "AbortError") {
             return;
@@ -417,6 +432,7 @@ export default function App() {
           setField(null);
           setMesh(meshResponse.mesh);
           setStats(meshResponse.stats);
+          setUploadedFieldPreviewTrace(null);
           setError(null);
           return;
         } catch (previewError) {
@@ -567,6 +583,7 @@ export default function App() {
     setField(null);
     setMesh(null);
     setStats(null);
+    setUploadedFieldPreviewTrace(null);
     setMeshCommitted(false);
     await runMeshFieldPreview();
   };
@@ -592,6 +609,7 @@ export default function App() {
       setField(response.field ?? null);
       setMesh(response.mesh);
       setStats(response.stats);
+      setUploadedFieldPreviewTrace(null);
       setMeshCommitted(true);
       setError(null);
     } catch (previewError) {
@@ -632,6 +650,7 @@ export default function App() {
       return;
     }
     setMeshCommitted(false);
+    setUploadedFieldPreviewTrace(null);
   }, [
     workflow,
     meshFile,
@@ -645,6 +664,44 @@ export default function App() {
     meshingMode,
     voxelsPerLatticePeriod
   ]);
+
+  const onUploadedFieldPreviewVisible = useCallback(
+    async ({
+      traceId,
+      textureReadyAtMs: _textureReadyAtMs,
+      firstVisibleFrameAtMs
+    }: {
+      traceId: string;
+      textureReadyAtMs: number;
+      firstVisibleFrameAtMs: number;
+    }) => {
+      if (uploadedFieldTelemetrySentRef.current.has(traceId)) {
+        return;
+      }
+      if (!uploadedFieldPreviewTrace || uploadedFieldPreviewTrace.traceId !== traceId) {
+        return;
+      }
+      uploadedFieldTelemetrySentRef.current.add(traceId);
+      try {
+        const textureAndFirstFrameMs = Math.max(0, firstVisibleFrameAtMs - uploadedFieldPreviewTrace.fieldAssignedAtMs);
+        await submitUploadedFieldPreviewTelemetry({
+          trace_id: traceId,
+          client_response_wait_ms: uploadedFieldPreviewTrace.clientResponseWaitMs,
+          client_download_ms: uploadedFieldPreviewTrace.clientDownloadMs,
+          client_decode_ms: uploadedFieldPreviewTrace.clientDecodeMs,
+          client_texture_upload_and_first_frame_ms: textureAndFirstFrameMs,
+          client_total_visible_ms:
+            uploadedFieldPreviewTrace.clientResponseWaitMs +
+            uploadedFieldPreviewTrace.clientDownloadMs +
+            uploadedFieldPreviewTrace.clientDecodeMs +
+            textureAndFirstFrameMs
+        });
+      } catch (telemetryError) {
+        console.warn("Uploaded field preview telemetry failed", telemetryError);
+      }
+    },
+    [uploadedFieldPreviewTrace]
+  );
 
   useEffect(() => cancelPendingMeshFieldPreview, [cancelPendingMeshFieldPreview]);
 
@@ -851,6 +908,7 @@ export default function App() {
                       setMeshFile(selected);
                       setField(null);
                       setStats(null);
+                      setUploadedFieldPreviewTrace(null);
                       setMeshCommitted(false);
                       setError(null);
                       if (!selected) {
@@ -1100,6 +1158,8 @@ export default function App() {
             <Viewer
               mesh={mesh}
               field={field}
+              uploadedFieldPreviewTrace={field && !mesh ? uploadedFieldPreviewTrace : null}
+              onUploadedFieldPreviewVisible={onUploadedFieldPreviewVisible}
               wireframe={wireframe}
               transformMode={transformMode}
               fitSignal={fitSignal}

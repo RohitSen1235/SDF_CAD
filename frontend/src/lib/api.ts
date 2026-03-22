@@ -13,7 +13,9 @@ import {
   PreviewFieldResponse,
   PreviewMeshResponse,
   QualityProfile,
-  SceneIR
+  SceneIR,
+  UploadedFieldPreviewClientTelemetry,
+  UploadedPreviewFieldResponse
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
@@ -114,6 +116,15 @@ function parseBoundsHeader(response: Response): [[number, number], [number, numb
   } catch {
     throw new Error("Invalid X-SDF-Bounds response header");
   }
+}
+
+function parseTraceIdHeader(response: Response): string | null {
+  const raw = response.headers.get("X-SDF-Trace-Id");
+  if (!raw) {
+    return null;
+  }
+  const value = raw.trim();
+  return value.length > 0 ? value : null;
 }
 
 function decodeBinaryMeshPacket(buffer: ArrayBuffer): MeshPayloadBinary {
@@ -459,7 +470,7 @@ export async function previewUploadedMeshField(
   computeBackend: ComputeBackend = "auto",
   voxelsPerLatticePeriod: number = 6,
   signal?: AbortSignal
-): Promise<PreviewFieldResponse> {
+): Promise<UploadedPreviewFieldResponse> {
   try {
     const body = new FormData();
     appendMeshWorkflowFormData(
@@ -471,12 +482,14 @@ export async function previewUploadedMeshField(
       "uniform",
       voxelsPerLatticePeriod
     );
+    const fetchStartedAt = performance.now();
     const response = await fetch(`${API_BASE}/api/v1/mesh/field.binary`, {
       method: "POST",
       body,
       signal
     });
     if (response.ok) {
+      const headersReceivedAt = performance.now();
       const stats = parseStatsHeader(response);
       const resolutionRaw = response.headers.get("X-SDF-Resolution");
       const resolution = resolutionRaw ? Number(resolutionRaw) : NaN;
@@ -484,10 +497,23 @@ export async function previewUploadedMeshField(
         throw new Error("Missing or invalid X-SDF-Resolution response header");
       }
       const bounds = parseBoundsHeader(response);
+      const traceId = parseTraceIdHeader(response);
       const packet = await response.arrayBuffer();
+      const arrayBufferDoneAt = performance.now();
+      const field = decodeBinaryFieldPayload(packet, resolution, bounds);
+      const decodeDoneAt = performance.now();
       return {
-        field: decodeBinaryFieldPayload(packet, resolution, bounds),
-        stats
+        field,
+        stats,
+        trace: traceId
+          ? {
+              traceId,
+              clientResponseWaitMs: headersReceivedAt - fetchStartedAt,
+              clientDownloadMs: arrayBufferDoneAt - headersReceivedAt,
+              clientDecodeMs: decodeDoneAt - arrayBufferDoneAt,
+              fieldAssignedAtMs: decodeDoneAt
+            }
+          : null
       };
     }
     if (response.status !== 404 && response.status !== 405) {
@@ -514,6 +540,26 @@ export async function previewUploadedMeshField(
     if ((error as Error)?.name === "AbortError") {
       throw error;
     }
+    if (error instanceof TypeError) {
+      throw asNetworkError(error);
+    }
+    throw error;
+  }
+}
+
+export async function submitUploadedFieldPreviewTelemetry(
+  payload: UploadedFieldPreviewClientTelemetry
+): Promise<void> {
+  try {
+    const response = await fetch(`${API_BASE}/api/v1/internal/mesh/field-preview-telemetry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      await parseErrorResponse(response, "Uploaded field preview telemetry failed");
+    }
+  } catch (error) {
     if (error instanceof TypeError) {
       throw asNetworkError(error);
     }

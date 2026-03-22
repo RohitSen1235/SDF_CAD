@@ -176,6 +176,15 @@ class PreviewFieldResponse(BaseModel):
     stats: PreviewStats
 
 
+class UploadedFieldPreviewClientTelemetry(BaseModel):
+    trace_id: str
+    client_response_wait_ms: float = Field(ge=0.0)
+    client_download_ms: float = Field(ge=0.0)
+    client_decode_ms: float = Field(ge=0.0)
+    client_texture_upload_and_first_frame_ms: float = Field(ge=0.0)
+    client_total_visible_ms: float = Field(ge=0.0)
+
+
 class ExportMeshRequest(BaseModel):
     scene_ir: SceneIR
     parameter_values: dict[str, float] = Field(default_factory=dict)
