@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 
@@ -101,6 +101,10 @@ describe("App", () => {
     previewUploadedMesh.mockResolvedValue(meshPreviewPayload);
     previewUploadedMeshField.mockResolvedValue(fieldPreviewPayload);
     exportUploadedMesh.mockResolvedValue(new Blob(["ok"]));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("renders DSL workflow with manual compile controls", () => {
@@ -238,13 +242,36 @@ describe("App", () => {
     expect(editor).toHaveValue(savedSource);
   });
 
-  it("calls uploaded field preview API when Preview Field is clicked", async () => {
+  it("does not auto-preview uploaded field when mesh preview parameters change", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
 
-    previewUploadedMeshField.mockResolvedValueOnce(fieldPreviewPayload);
-    previewUploadedMeshField.mockClear();
     previewUploadedMesh.mockClear();
+    previewUploadedMeshField.mockClear();
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [file] } });
+
+    expect(previewUploadedMeshField).not.toHaveBeenCalled();
+    expect(previewUploadedMesh).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText("Lattice pitch"), { target: { value: "0.55" } });
+    fireEvent.change(screen.getByLabelText("Lattice thickness"), { target: { value: "0.12" } });
+    fireEvent.change(screen.getByLabelText("Lattice phase"), { target: { value: "0.35" } });
+    fireEvent.change(screen.getByLabelText("Shell thickness"), { target: { value: "0.1" } });
+    fireEvent.change(screen.getByLabelText("Mesh preview quality"), { target: { value: "high" } });
+    fireEvent.change(screen.getByLabelText("Mesh field backend"), { target: { value: "cuda" } });
+    fireEvent.change(screen.getByLabelText("Voxels per lattice period"), { target: { value: "8" } });
+
+    expect(previewUploadedMeshField).not.toHaveBeenCalled();
+  });
+
+  it("runs uploaded field preview immediately when Preview Field is clicked", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+
+    previewUploadedMeshField.mockClear();
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
@@ -253,13 +280,96 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
 
     await waitFor(() => {
-      expect(previewUploadedMeshField).toHaveBeenCalled();
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     });
-    expect(previewUploadedMesh).not.toHaveBeenCalled();
 
+    expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    expect(previewUploadedMeshField.mock.calls[0]?.[1]).toMatchObject({
+      latticePitch: 0.45,
+      latticeThickness: 0.09,
+      latticePhase: 0
+    });
+  });
+
+  it("clears the previous preview immediately when Preview Field is clicked", async () => {
+    let resolvePreview: ((value: typeof fieldPreviewPayload) => void) | null = null;
+    previewUploadedMeshField.mockImplementationOnce(
+      () =>
+        new Promise<typeof fieldPreviewPayload>((resolve) => {
+          resolvePreview = resolve;
+        })
+    );
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [file] } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
+
+    const clearedViewerCall = await waitFor(() => {
+      const found = viewerMock.mock.calls.find(([props]) => {
+        const viewerProps = props as Record<string, unknown>;
+        return viewerProps.field == null && viewerProps.mesh == null;
+      });
+      expect(found).toBeDefined();
+      return found;
+    });
+    const clearedViewerProps = clearedViewerCall?.[0] as Record<string, unknown>;
+    expect(clearedViewerProps.field).toBeNull();
+    expect(clearedViewerProps.mesh).toBeNull();
+
+    expect(resolvePreview).not.toBeNull();
+    resolvePreview!(fieldPreviewPayload);
+
+    await waitFor(() => {
+      const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
+      expect(latestViewerProps.field).toEqual(fieldPreviewPayload.field);
+      expect(latestViewerProps.mesh).toBeNull();
+    });
+  });
+
+  it("keeps the last preview visible after mesh parameter changes until re-previewed", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [file] } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
+
+    fireEvent.change(screen.getByLabelText("Lattice phase"), { target: { value: "0.35" } });
+    expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
     expect(latestViewerProps.field).toEqual(fieldPreviewPayload.field);
     expect(latestViewerProps.mesh).toBeNull();
+  });
+
+  it("does not pass transparentShell to Viewer for field previews", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Generate Shape" }));
+
+    await waitFor(() => {
+      expect(previewField).toHaveBeenCalledTimes(1);
+    });
+
+    const fieldOnlyCall = viewerMock.mock.calls.find(([props]) => {
+      const viewerProps = props as Record<string, unknown>;
+      return viewerProps.field != null && viewerProps.mesh == null;
+    });
+
+    expect(fieldOnlyCall).toBeDefined();
+    const fieldOnlyProps = fieldOnlyCall?.[0] as Record<string, unknown>;
+    expect("transparentShell" in fieldOnlyProps).toBe(false);
   });
 
   it("renders uploaded source mesh locally right after file selection", async () => {

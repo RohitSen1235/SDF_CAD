@@ -461,7 +461,8 @@ export async function previewUploadedMeshField(
   params: MeshWorkflowParams,
   qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
-  voxelsPerLatticePeriod: number = 6
+  voxelsPerLatticePeriod: number = 6,
+  signal?: AbortSignal
 ): Promise<PreviewFieldResponse> {
   try {
     const body = new FormData();
@@ -477,7 +478,8 @@ export async function previewUploadedMeshField(
     );
     const response = await fetch(`${API_BASE}/api/v1/mesh/field.binary`, {
       method: "POST",
-      body
+      body,
+      signal
     });
     if (response.ok) {
       const stats = parseStatsHeader(response);
@@ -510,7 +512,8 @@ export async function previewUploadedMeshField(
     );
     const fallback = await fetch(`${API_BASE}/api/v1/mesh/field`, {
       method: "POST",
-      body: fallbackBody
+      body: fallbackBody,
+      signal
     });
     return parseJsonOrThrow(fallback);
   } catch (error) {

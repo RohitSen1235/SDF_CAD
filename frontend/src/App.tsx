@@ -220,6 +220,8 @@ export default function App() {
     field: null,
     mesh: null
   });
+  const meshFieldPreviewRunIdRef = useRef(0);
+  const meshFieldPreviewControllerRef = useRef<AbortController | null>(null);
 
   const meshWorkflowParams = useMemo<MeshWorkflowParams>(
     () => ({
@@ -246,6 +248,73 @@ export default function App() {
     previewControllersRef.current.mesh?.abort();
     previewControllersRef.current = { field: null, mesh: null };
   }, []);
+
+  const abortActiveMeshFieldPreview = useCallback(() => {
+    meshFieldPreviewControllerRef.current?.abort();
+    meshFieldPreviewControllerRef.current = null;
+  }, []);
+
+  const cancelPendingMeshFieldPreview = useCallback(() => {
+    abortActiveMeshFieldPreview();
+  }, [abortActiveMeshFieldPreview]);
+
+  const runMeshFieldPreview = useCallback(async () => {
+    if (!meshFile) {
+      setError("Upload an STL or OBJ file first.");
+      return;
+    }
+
+    abortActiveMeshFieldPreview();
+
+    const runId = meshFieldPreviewRunIdRef.current + 1;
+    meshFieldPreviewRunIdRef.current = runId;
+    const controller = new AbortController();
+    meshFieldPreviewControllerRef.current = controller;
+
+    setIsPreviewing(true);
+    setError(null);
+
+    try {
+      const response = await previewUploadedMeshField(
+        meshFile,
+        meshWorkflowParams,
+        meshPreviewQuality,
+        computeBackend,
+        voxelsPerLatticePeriod,
+        controller.signal
+      );
+      if (meshFieldPreviewRunIdRef.current !== runId) {
+        return;
+      }
+      setField(response.field);
+      setMesh(null);
+      setStats(response.stats);
+      setMeshCommitted(false);
+      setError(null);
+    } catch (previewError) {
+      if ((previewError as Error).name === "AbortError") {
+        return;
+      }
+      if (meshFieldPreviewRunIdRef.current !== runId) {
+        return;
+      }
+      setError((previewError as Error).message);
+    } finally {
+      if (meshFieldPreviewControllerRef.current === controller) {
+        meshFieldPreviewControllerRef.current = null;
+      }
+      if (meshFieldPreviewRunIdRef.current === runId) {
+        setIsPreviewing(false);
+      }
+    }
+  }, [
+    abortActiveMeshFieldPreview,
+    computeBackend,
+    meshFile,
+    meshPreviewQuality,
+    meshWorkflowParams,
+    voxelsPerLatticePeriod
+  ]);
 
   const compileAndSync = useCallback(
     async (
@@ -499,27 +568,11 @@ export default function App() {
       setError("Upload an STL or OBJ file first.");
       return;
     }
-
-    setIsPreviewing(true);
-    setError(null);
+    setField(null);
+    setMesh(null);
+    setStats(null);
     setMeshCommitted(false);
-    try {
-      const response = await previewUploadedMeshField(
-        meshFile,
-        meshWorkflowParams,
-        meshPreviewQuality,
-        computeBackend,
-        voxelsPerLatticePeriod
-      );
-      setField(response.field);
-      setMesh(null);
-      setStats(response.stats);
-      setError(null);
-    } catch (previewError) {
-      setError((previewError as Error).message);
-    } finally {
-      setIsPreviewing(false);
-    }
+    await runMeshFieldPreview();
   };
 
   const onCommitMesh = async () => {
@@ -528,6 +581,7 @@ export default function App() {
       return;
     }
 
+    cancelPendingMeshFieldPreview();
     setIsPreviewing(true);
     setError(null);
     try {
@@ -599,6 +653,8 @@ export default function App() {
     meshingMode,
     voxelsPerLatticePeriod
   ]);
+
+  useEffect(() => cancelPendingMeshFieldPreview, [cancelPendingMeshFieldPreview]);
 
   const onSaveExpression = () => {
     const name = expressionName.trim();
@@ -1091,7 +1147,6 @@ export default function App() {
               showGrid={showGrid}
               sectionEnabled={sectionEnabled}
               sectionLevel={sectionLevel}
-              transparentShell={workflow === "mesh"}
             />
           </div>
 
