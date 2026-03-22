@@ -78,17 +78,24 @@ const FIELD_FRAGMENT_SHADER = `
     return normalize(vec3(dx, dy, dz));
   }
 
-  vec3 shade(vec3 p, float voxel, vec3 baseColor, float rimStrength) {
-    float normalEps = max(voxel * 2.0, 1e-3);
+  vec3 shade(vec3 p, float voxel, vec3 baseColor, float surfaceMix) {
+    float normalEps = max(voxel * mix(2.0, 3.1, surfaceMix), 1e-3);
     vec3 normal = estimateNormal(p, normalEps);
     vec3 keyLight = normalize(vec3(0.55, 0.78, 0.38));
     vec3 fillLight = normalize(vec3(-0.45, 0.3, -0.85));
+    vec3 viewDir = normalize(cameraPosition - p);
+    vec3 halfVec = normalize(keyLight + viewDir);
     float diffKey = max(dot(normal, keyLight), 0.0);
     float diffFill = max(dot(normal, fillLight), 0.0);
-    float hemi = 0.58 + 0.42 * (normal.y * 0.5 + 0.5);
-    float rim = pow(1.0 - abs(dot(normal, normalize(cameraPosition - p))), 2.2);
-    vec3 lit = baseColor * (0.34 + 0.62 * diffKey + 0.24 * diffFill) * hemi;
-    return lit + baseColor * rim * rimStrength * 0.24;
+    float hemi = mix(0.84, 0.7 + 0.3 * (normal.y * 0.5 + 0.5), surfaceMix);
+    float rim = pow(1.0 - abs(dot(normal, viewDir)), mix(3.1, 1.95, surfaceMix));
+    float diffuse = mix(0.92 + 0.16 * diffKey + 0.05 * diffFill, 0.76 + 0.58 * diffKey + 0.22 * diffFill, surfaceMix);
+    vec3 lit = baseColor * diffuse * hemi;
+    float rimStrength = mix(0.08, 0.34, surfaceMix);
+    float specular = pow(max(dot(normal, halfVec), 0.0), mix(24.0, 52.0, surfaceMix));
+    float glossStrength = smoothstep(0.22, 0.95, surfaceMix) * 0.28;
+    vec3 glossColor = mix(baseColor, vec3(0.97, 0.995, 1.0), 0.72);
+    return lit + baseColor * rim * rimStrength + glossColor * specular * glossStrength;
   }
 
   void main() {
@@ -114,12 +121,12 @@ const FIELD_FRAGMENT_SHADER = `
 
     const int MAX_STEPS = 2048;
     const int MAX_SURFACE_HITS = 4;
-    const float SHELL_ALPHA = 0.18;
+    const float SHELL_ALPHA = 0.12;
     float skipDist = voxel * 2.2;
     float raySpan = max(tEnd - tStart, minStep);
 
-    vec3 shellColor = mix(uColor, vec3(0.96, 0.985, 1.0), 0.56);
-    vec3 interiorColor = mix(uColor, vec3(0.86, 0.92, 1.0), 0.42);
+    vec3 shellColor = mix(vec3(0.86, 0.95, 1.0), vec3(0.94, 0.985, 1.0), 0.62);
+    vec3 interiorColor = mix(uColor, vec3(0.42, 0.98, 0.96), 0.58);
 
     vec3 accumColor = vec3(0.0);
     float accumAlpha = 0.0;
@@ -159,17 +166,18 @@ const FIELD_FRAGMENT_SHADER = `
 
         float travel = clamp((length(pHit - ro) - tStart) / raySpan, 0.0, 1.0);
         float layerMix = clamp(float(hitCount) / float(MAX_SURFACE_HITS - 1), 0.0, 1.0);
-        vec3 baseColor = mix(shellColor, interiorColor, min(layerMix * 1.35, 1.0));
-        float rimStrength = mix(0.75, 0.35, layerMix);
-        vec3 litColor = shade(pHit, voxel, baseColor, rimStrength);
-        litColor *= mix(1.08, 0.92, travel);
+        float surfaceMix = smoothstep(0.12, 0.8, layerMix);
+        float interiorMix = smoothstep(0.22, 1.0, surfaceMix);
+        vec3 baseColor = mix(shellColor, interiorColor, surfaceMix);
+        vec3 litColor = shade(pHit, voxel, baseColor, surfaceMix);
+        litColor *= mix(1.18, mix(1.2, 1.1, travel), interiorMix);
 
         float hitAlpha;
         if (hitCount == 0) {
           hitAlpha = SHELL_ALPHA;
         } else {
-          float layerAlpha = mix(0.3, 0.16, clamp(float(hitCount - 1) / 3.0, 0.0, 1.0));
-          hitAlpha = layerAlpha * mix(1.0, 0.82, travel);
+          float layerAlpha = mix(0.5, 0.32, clamp(float(hitCount - 1) / 3.0, 0.0, 1.0));
+          hitAlpha = layerAlpha * mix(1.04, 0.94, travel);
         }
 
         float remaining = 1.0 - accumAlpha;
@@ -191,7 +199,7 @@ const FIELD_FRAGMENT_SHADER = `
     }
 
     if (accumAlpha < 0.02) { discard; }
-    outColor = vec4(accumColor / accumAlpha, min(accumAlpha, 0.86));
+    outColor = vec4(accumColor / accumAlpha, min(accumAlpha, 0.88));
   }
 `;
 
@@ -420,6 +428,7 @@ export function Viewer({
   }, [field]);
 
   const hasField = fieldTexture !== null && fieldBounds !== null;
+  const fieldOnly = hasField && !geometry;
 
   const targetBox = useMemo(() => {
     if (fieldBounds) {
@@ -456,16 +465,16 @@ export function Viewer({
         gl.localClippingEnabled = true;
       }}
     >
-      <color attach="background" args={["#1b3347"]} />
-      <ambientLight intensity={0.56} />
-      <hemisphereLight args={["#f4fbff", "#7190ab", 0.72]} />
-      <directionalLight position={[5, 6, 4]} intensity={1.08} />
-      <directionalLight position={[-5, -6, -4]} intensity={0.9} />
+      <color attach="background" args={[fieldOnly ? "#30556f" : "#1b3347"]} />
+      <ambientLight intensity={fieldOnly ? 0.72 : 0.56} />
+      <hemisphereLight args={["#f4fbff", fieldOnly ? "#89abc4" : "#7190ab", fieldOnly ? 0.92 : 0.72]} />
+      <directionalLight position={[5, 6, 4]} intensity={fieldOnly ? 1.18 : 1.08} />
+      <directionalLight position={[-5, -6, -4]} intensity={fieldOnly ? 0.78 : 0.9} />
 
       {showGrid ? <gridHelper args={[12, 24, "#2f536d", "#1d2f3d"]} /> : null}
       {showAxes ? <axesHelper args={[2.5]} /> : null}
 
-      {hasField && fieldBounds && !geometry ? (
+      {fieldOnly && fieldBounds ? (
         <mesh ref={meshRef} position={fieldBounds.center.toArray() as [number, number, number]} renderOrder={3}>
           <boxGeometry args={fieldBounds.size.toArray() as [number, number, number]} />
           <shaderMaterial
