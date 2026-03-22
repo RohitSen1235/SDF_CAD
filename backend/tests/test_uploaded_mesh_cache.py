@@ -55,12 +55,16 @@ def test_uploaded_mesh_preview_reuses_composed_field_after_field_preview(monkeyp
         lattice_phase=0.0,
     )
     assert mesh_stats.cache_hit is True
+    assert mesh_stats.field_cache_hit is True
+    assert mesh_stats.mesh_cache_hit is False
+    assert mesh_stats.eval_ms == 0.0
+    assert mesh_stats.mesh_ms is not None and mesh_stats.mesh_ms > 0.0
     assert field_payload is not None
     assert mesh_payload is not None
     assert calls["compose"] == 1
 
 
-def test_uploaded_binary_preview_reuses_composed_field_after_field_preview(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_uploaded_mesh_preview_reuses_full_mesh_cache_on_second_commit(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = {"compose": 0}
     original = main_module.compose_hollow_lattice_field_with_backend
 
@@ -81,7 +85,49 @@ def test_uploaded_binary_preview_reuses_composed_field_after_field_preview(monke
     )
     assert field_stats.cache_hit is False
 
-    _, mesh_stats, field_payload, mesh_payload = main_module._run_uploaded_mesh_preview_meshdata(
+    _, first_mesh_stats, _, _ = main_module._run_uploaded_mesh_preview_meshdata(
+        file_bytes=MESH_OBJ,
+        extension=".obj",
+        shell_thickness=0.08,
+        lattice_type="gyroid",
+        lattice_pitch=0.45,
+        lattice_thickness=0.09,
+        lattice_phase=0.0,
+    )
+    assert first_mesh_stats.field_cache_hit is True
+    assert first_mesh_stats.mesh_cache_hit is False
+    assert first_mesh_stats.eval_ms == 0.0
+
+    _, second_mesh_stats, field_payload, mesh_payload = main_module._run_uploaded_mesh_preview_meshdata(
+        file_bytes=MESH_OBJ,
+        extension=".obj",
+        shell_thickness=0.08,
+        lattice_type="gyroid",
+        lattice_pitch=0.45,
+        lattice_thickness=0.09,
+        lattice_phase=0.0,
+    )
+    assert second_mesh_stats.cache_hit is True
+    assert second_mesh_stats.field_cache_hit is True
+    assert second_mesh_stats.mesh_cache_hit is True
+    assert second_mesh_stats.eval_ms == 0.0
+    assert second_mesh_stats.mesh_ms == 0.0
+    assert field_payload is not None
+    assert mesh_payload is not None
+    assert calls["compose"] == 1
+
+
+def test_uploaded_binary_preview_seeds_and_reuses_full_mesh_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"compose": 0}
+    original = main_module.compose_hollow_lattice_field_with_backend
+
+    def track_compose(*args, **kwargs):
+        calls["compose"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(main_module, "compose_hollow_lattice_field_with_backend", track_compose)
+
+    _, first_stats, field_payload, mesh_payload = main_module._run_uploaded_mesh_preview_meshdata(
         file_bytes=MESH_OBJ,
         extension=".obj",
         shell_thickness=0.08,
@@ -90,11 +136,32 @@ def test_uploaded_binary_preview_reuses_composed_field_after_field_preview(monke
         lattice_thickness=0.09,
         lattice_phase=0.0,
         encode_response_payloads=False,
-        cache_result=False,
+        cache_result=True,
     )
-    assert mesh_stats.cache_hit is True
+    assert first_stats.mesh_cache_hit is False
+    assert first_stats.mesh_ms is not None and first_stats.mesh_ms > 0.0
     assert field_payload is None
     assert mesh_payload is None
+
+    mesh, second_stats, field_payload, mesh_payload = main_module._run_uploaded_mesh_preview_meshdata(
+        file_bytes=MESH_OBJ,
+        extension=".obj",
+        shell_thickness=0.08,
+        lattice_type="gyroid",
+        lattice_pitch=0.45,
+        lattice_thickness=0.09,
+        lattice_phase=0.0,
+        encode_response_payloads=False,
+        cache_result=True,
+    )
+    assert second_stats.cache_hit is True
+    assert second_stats.field_cache_hit is True
+    assert second_stats.mesh_cache_hit is True
+    assert second_stats.eval_ms == 0.0
+    assert second_stats.mesh_ms == 0.0
+    assert field_payload is None
+    assert mesh_payload is None
+    assert mesh.faces.shape[0] > 0
     assert calls["compose"] == 1
 
 
@@ -124,6 +191,8 @@ def test_uploaded_composed_field_cache_ignores_mesh_settings_but_invalidates_on_
         cache_result=False,
     )
     assert first_stats.cache_hit is False
+    assert first_stats.field_cache_hit is False
+    assert first_stats.mesh_cache_hit is False
     assert calls["compose"] == 1
 
     _, second_stats, _, _ = main_module._run_uploaded_mesh_preview_meshdata(
@@ -140,6 +209,9 @@ def test_uploaded_composed_field_cache_ignores_mesh_settings_but_invalidates_on_
         cache_result=False,
     )
     assert second_stats.cache_hit is True
+    assert second_stats.field_cache_hit is True
+    assert second_stats.mesh_cache_hit is False
+    assert second_stats.eval_ms == 0.0
     assert calls["compose"] == 1
 
     _, third_stats, _, _ = main_module._run_uploaded_mesh_preview_meshdata(
@@ -156,6 +228,7 @@ def test_uploaded_composed_field_cache_ignores_mesh_settings_but_invalidates_on_
         cache_result=False,
     )
     assert third_stats.cache_hit is False
+    assert third_stats.field_cache_hit is False
     assert calls["compose"] == 2
 
     _, fourth_stats, _, _ = main_module._run_uploaded_mesh_preview_meshdata(
@@ -173,4 +246,45 @@ def test_uploaded_composed_field_cache_ignores_mesh_settings_but_invalidates_on_
         cache_result=False,
     )
     assert fourth_stats.cache_hit is False
+    assert fourth_stats.field_cache_hit is False
     assert calls["compose"] == 3
+
+
+def test_uploaded_metadata_cache_avoids_reparsing_for_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"parse": 0}
+    original = main_module.parse_mesh_bytes
+
+    def track_parse(*args, **kwargs):
+        calls["parse"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(main_module, "parse_mesh_bytes", track_parse)
+
+    first = main_module._compute_mesh_upload_resolution(MESH_OBJ, ".obj", 0.45, 6)
+    second = main_module._compute_mesh_upload_resolution(MESH_OBJ, ".obj", 0.45, 6)
+
+    assert first == second
+    assert calls["parse"] == 1
+
+
+def test_uploaded_host_cache_returns_shared_immutable_arrays() -> None:
+    metadata = main_module._resolve_uploaded_mesh_metadata(file_bytes=MESH_OBJ, extension=".obj")
+    first = main_module._resolve_uploaded_host_field(
+        file_bytes=MESH_OBJ,
+        extension=".obj",
+        resolution=24,
+        parsed=metadata.parsed,
+    )
+    second = main_module._resolve_uploaded_host_field(
+        file_bytes=MESH_OBJ,
+        extension=".obj",
+        resolution=24,
+        parsed=metadata.parsed,
+    )
+
+    first_parsed, _, first_host_sdf, *_ = first
+    second_parsed, _, second_host_sdf, *_ = second
+    assert first_parsed.vertices is second_parsed.vertices
+    assert first_parsed.faces is second_parsed.faces
+    assert first_host_sdf is second_host_sdf
+    assert first_host_sdf.flags.writeable is False

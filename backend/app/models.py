@@ -144,6 +144,8 @@ class PreviewStats(BaseModel):
     tri_count: int
     voxel_count: int | None = None
     cache_hit: bool = False
+    field_cache_hit: bool = False
+    mesh_cache_hit: bool = False
     compute_precision: ComputePrecision = "float32"
     compute_backend: Literal["cpu", "cuda"] = "cpu"
     mesh_backend: Literal["cpu", "cuda"] = "cpu"

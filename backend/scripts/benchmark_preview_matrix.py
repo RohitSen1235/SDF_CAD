@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from app import cache as cache_module
-from app.main import _run_uploaded_mesh_field_preview_data
+from app.main import _run_uploaded_mesh_field_preview_data, _run_uploaded_mesh_preview_meshdata
 from app.mesh_upload import build_host_field, parse_mesh_bytes
 
 
@@ -27,6 +27,9 @@ class BenchmarkResult:
     first_eval_ms: float
     second_eval_ms: float
     eval_drop_ratio: float
+    mesh_commit_eval_ms: float
+    repeated_mesh_eval_ms: float
+    repeated_mesh_ms: float
     legacy_peak_bytes: int
     optimized_peak_bytes: int
     memory_drop_ratio: float
@@ -78,6 +81,36 @@ def run_acceptance_benchmark(
         field_storage_mode="dense",
     )
 
+    _, mesh_commit_stats, _, _ = _run_uploaded_mesh_preview_meshdata(
+        file_bytes=MESH_OBJ,
+        extension=".obj",
+        shell_thickness=shell_thickness,
+        lattice_type="gyroid",
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+        voxels_per_lattice_period=voxels_per_lattice_period,
+        compute_backend="cpu",
+        field_storage_mode="dense",
+        encode_response_payloads=False,
+        cache_result=True,
+    )
+
+    _, repeated_mesh_stats, _, _ = _run_uploaded_mesh_preview_meshdata(
+        file_bytes=MESH_OBJ,
+        extension=".obj",
+        shell_thickness=shell_thickness,
+        lattice_type="gyroid",
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+        voxels_per_lattice_period=voxels_per_lattice_period,
+        compute_backend="cpu",
+        field_storage_mode="dense",
+        encode_response_payloads=False,
+        cache_result=True,
+    )
+
     mesh = parse_mesh_bytes(MESH_OBJ, ".obj")
     resolution = max(48, second_stats.voxel_count and round(second_stats.voxel_count ** (1.0 / 3.0)) or 48)
     host = build_host_field(mesh, resolution=int(resolution), field_storage_mode="dense")
@@ -91,6 +124,9 @@ def run_acceptance_benchmark(
         first_eval_ms=float(first_stats.eval_ms),
         second_eval_ms=float(second_stats.eval_ms),
         eval_drop_ratio=eval_drop_ratio,
+        mesh_commit_eval_ms=float(mesh_commit_stats.eval_ms),
+        repeated_mesh_eval_ms=float(repeated_mesh_stats.eval_ms),
+        repeated_mesh_ms=float(repeated_mesh_stats.mesh_ms or 0.0),
         legacy_peak_bytes=legacy_peak_bytes,
         optimized_peak_bytes=optimized_peak_bytes,
         memory_drop_ratio=memory_drop_ratio,
@@ -109,12 +145,19 @@ def main() -> int:
     print(f"first_eval_ms={result.first_eval_ms:.3f}")
     print(f"second_eval_ms={result.second_eval_ms:.3f}")
     print(f"eval_drop_ratio={result.eval_drop_ratio:.3%}")
+    print(f"mesh_commit_eval_ms={result.mesh_commit_eval_ms:.3f}")
+    print(f"repeated_mesh_eval_ms={result.repeated_mesh_eval_ms:.3f}")
+    print(f"repeated_mesh_ms={result.repeated_mesh_ms:.3f}")
     print(f"legacy_peak_bytes={result.legacy_peak_bytes}")
     print(f"optimized_peak_bytes={result.optimized_peak_bytes}")
     print(f"memory_drop_ratio={result.memory_drop_ratio:.3%}")
 
-    if result.eval_drop_ratio < 0.80:
-        raise SystemExit("Acceptance failed: second-request eval_ms did not drop by at least 80%")
+    if result.second_eval_ms != 0.0:
+        raise SystemExit("Acceptance failed: second field-preview eval_ms should be exactly 0.0")
+    if result.mesh_commit_eval_ms != 0.0:
+        raise SystemExit("Acceptance failed: preview-field to mesh-preview eval_ms should be exactly 0.0")
+    if result.repeated_mesh_eval_ms != 0.0 or result.repeated_mesh_ms != 0.0:
+        raise SystemExit("Acceptance failed: repeated mesh preview should be a full mesh cache hit with 0.0 timings")
     if result.memory_drop_ratio < 0.25:
         raise SystemExit("Acceptance failed: estimated dense compose peak bytes did not drop by at least 25%")
     return 0

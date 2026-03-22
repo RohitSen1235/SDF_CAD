@@ -70,7 +70,7 @@ field_preview_cache: LruCache[tuple[np.ndarray, str]] = LruCache(maxsize=8)
 
 @dataclass
 class UploadedMeshCacheEntry:
-    mesh: MeshPayload
+    mesh: MeshPayload | None
     vertices: np.ndarray
     faces: np.ndarray
     normals: np.ndarray
@@ -81,6 +81,17 @@ class UploadedMeshCacheEntry:
 
 
 uploaded_mesh_preview_cache: LruCache[UploadedMeshCacheEntry] = LruCache(maxsize=12)
+
+
+@dataclass
+class UploadedMeshMetadataCacheEntry:
+    vertices: np.ndarray
+    faces: np.ndarray
+    normals: np.ndarray
+    mesh_span: float
+
+
+uploaded_mesh_metadata_cache: LruCache[UploadedMeshMetadataCacheEntry] = LruCache(maxsize=12)
 
 
 @dataclass
@@ -98,8 +109,6 @@ uploaded_composed_field_cache: LruCache[UploadedComposedFieldCacheEntry] = LruCa
 
 @dataclass
 class UploadedHostFieldCacheEntry:
-    vertices: np.ndarray
-    faces: np.ndarray
     bounds: list[list[float]]
     host_sdf: np.ndarray
     field_storage_mode: UploadedFieldStorageMode = "dense"
@@ -116,6 +125,7 @@ def clear_all_preview_caches() -> None:
     mesh_preview_cache.clear()
     field_preview_cache.clear()
     uploaded_mesh_preview_cache.clear()
+    uploaded_mesh_metadata_cache.clear()
     uploaded_composed_field_cache.clear()
     uploaded_host_field_cache.clear()
 
@@ -205,6 +215,19 @@ def hash_uploaded_mesh_request(
         "mesh_backend": mesh_backend,
         "meshing_mode": meshing_mode,
         "field_storage_mode": field_storage_mode,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def hash_uploaded_mesh_metadata_request(
+    *,
+    file_bytes: bytes,
+    extension: str,
+) -> str:
+    payload: dict[str, Any] = {
+        "file_hash": hashlib.sha256(file_bytes).hexdigest(),
+        "extension": extension.lower(),
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()

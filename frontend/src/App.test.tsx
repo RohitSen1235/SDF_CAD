@@ -301,6 +301,31 @@ describe("App", () => {
     });
   });
 
+  it("shows separate field and mesh cache status for cached field previews", async () => {
+    previewUploadedMeshField.mockResolvedValueOnce({
+      ...fieldPreviewPayload,
+      stats: {
+        ...fieldPreviewPayload.stats,
+        eval_ms: 0,
+        field_cache_hit: true,
+        mesh_cache_hit: false
+      }
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Eval: 0.0 ms")).toBeInTheDocument();
+    });
+    expect(screen.getByText("Field cache: hit")).toBeInTheDocument();
+    expect(screen.getByText("Mesh cache: miss")).toBeInTheDocument();
+  });
+
   it("clears the previous preview immediately when Preview Field is clicked", async () => {
     let resolvePreview: ((value: typeof fieldPreviewPayload) => void) | null = null;
     previewUploadedMeshField.mockImplementationOnce(
@@ -507,5 +532,32 @@ describe("App", () => {
 
     fireEvent.change(screen.getByLabelText("Lattice pitch"), { target: { value: "0.55" } });
     expect(exportStl).toBeDisabled();
+  });
+
+  it("shows separate field and mesh cache status for cached uploaded mesh commits", async () => {
+    previewUploadedMesh.mockResolvedValueOnce({
+      ...meshPreviewPayload,
+      stats: {
+        ...meshPreviewPayload.stats,
+        eval_ms: 0,
+        mesh_ms: 0,
+        field_cache_hit: true,
+        mesh_cache_hit: true
+      }
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Mesh: 0.0 ms")).toBeInTheDocument();
+    });
+    expect(screen.getByText("Eval: 0.0 ms")).toBeInTheDocument();
+    expect(screen.getByText("Field cache: hit")).toBeInTheDocument();
+    expect(screen.getByText("Mesh cache: hit")).toBeInTheDocument();
   });
 });

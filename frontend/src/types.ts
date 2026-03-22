@@ -96,6 +96,8 @@ export interface PreviewStats {
   tri_count: number;
   voxel_count?: number;
   cache_hit?: boolean;
+  field_cache_hit?: boolean;
+  mesh_cache_hit?: boolean;
   compute_precision?: ComputePrecision;
   compute_backend?: "cpu" | "cuda";
   mesh_backend?: "cpu" | "cuda";

@@ -1118,7 +1118,8 @@ export default function App() {
             <span>Mesh: {stats?.mesh_ms != null ? stats.mesh_ms.toFixed(1) : "n/a"} ms</span>
             <span>Eval backend: {stats?.compute_backend ?? "cpu"}</span>
             <span>Mesh backend: {stats?.mesh_backend ?? "cpu"}</span>
-            <span>Cache: {stats?.cache_hit ? "hit" : "miss"}</span>
+            <span>Field cache: {stats?.field_cache_hit ? "hit" : "miss"}</span>
+            <span>Mesh cache: {stats?.mesh_cache_hit ? "hit" : "miss"}</span>
           </div>
           {error ? <p className="error">{error}</p> : null}
         </section>
