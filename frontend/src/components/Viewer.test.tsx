@@ -89,9 +89,11 @@ describe("Viewer section capping", () => {
     expect(container.querySelectorAll("shadermaterial").length).toBe(0);
   });
 
-  it("keeps shader section cap for field-only rendering", () => {
+  it("uses a translucent shader path for field-only rendering", () => {
     const { container } = renderViewer({ mesh: null });
+    const fieldMesh = container.querySelector("mesh > boxgeometry");
 
+    expect(fieldMesh).not.toBeNull();
     expect(container.querySelectorAll("shadermaterial").length).toBeGreaterThanOrEqual(2);
     expect(container.querySelectorAll("meshbasicmaterial").length).toBe(0);
     expect(container.querySelectorAll("meshstandardmaterial").length).toBe(0);

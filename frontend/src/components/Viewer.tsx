@@ -16,9 +16,6 @@ export interface ViewerProps {
   showGrid: boolean;
   sectionEnabled: boolean;
   sectionLevel: number;
-  /** When true the field renderer uses a ghost outer shell so the interior
-   *  TPMS lattice is visible through it. Used by the Mesh workflow. */
-  transparentShell?: boolean;
 }
 
 const FIELD_VERTEX_SHADER = `
@@ -34,9 +31,8 @@ const FIELD_VERTEX_SHADER = `
 // Uses hardware LinearFilter on the 3D texture for smooth trilinear sampling,
 // and a wider normal-estimation epsilon to avoid voxel-grid bumpiness.
 //
-// When uTransparentShell > 0.5 (mesh workflow), the shader performs multi-hit
-// compositing: the outer shell is rendered as a ghost (low alpha) so the
-// interior TPMS lattice struts are visible through it.
+// Field-only rendering always uses multi-hit compositing so the outer shell
+// reads as a soft ghost while interior field morphology remains visible.
 const FIELD_FRAGMENT_SHADER = `
   precision highp float;
   precision highp sampler3D;
@@ -49,9 +45,6 @@ const FIELD_FRAGMENT_SHADER = `
   uniform float uSectionLevel;
   uniform float uResolution;
   uniform float uStepScale;
-  // When > 0.5: render outer shell as semi-transparent ghost so interior
-  // lattice is visible. Used by the Mesh workflow field preview.
-  uniform float uTransparentShell;
 
   in vec3 vWorldPos;
   out vec4 outColor;
@@ -85,13 +78,17 @@ const FIELD_FRAGMENT_SHADER = `
     return normalize(vec3(dx, dy, dz));
   }
 
-  vec3 shade(vec3 p, float voxel) {
+  vec3 shade(vec3 p, float voxel, vec3 baseColor, float rimStrength) {
     float normalEps = max(voxel * 2.0, 1e-3);
     vec3 normal = estimateNormal(p, normalEps);
-    vec3 lightDir = normalize(vec3(0.55, 0.75, 0.4));
-    float diff = max(dot(normal, lightDir), 0.0);
-    float hemi = 0.4 + 0.6 * (normal.y * 0.5 + 0.5);
-    return uColor * (0.28 + 0.72 * diff) * hemi;
+    vec3 keyLight = normalize(vec3(0.55, 0.78, 0.38));
+    vec3 fillLight = normalize(vec3(-0.45, 0.3, -0.85));
+    float diffKey = max(dot(normal, keyLight), 0.0);
+    float diffFill = max(dot(normal, fillLight), 0.0);
+    float hemi = 0.58 + 0.42 * (normal.y * 0.5 + 0.5);
+    float rim = pow(1.0 - abs(dot(normal, normalize(cameraPosition - p))), 2.2);
+    vec3 lit = baseColor * (0.34 + 0.62 * diffKey + 0.24 * diffFill) * hemi;
+    return lit + baseColor * rim * rimStrength * 0.24;
   }
 
   void main() {
@@ -115,67 +112,25 @@ const FIELD_FRAGMENT_SHADER = `
     float maxStep = max(voxel * 1.25, minStep);
     float hitEps = max(voxel * 0.8, 1e-4);
 
-    // ── Opaque mode (DSL workflow) ────────────────────────────────────────────
-    if (uTransparentShell < 0.5) {
-      const int MAX_STEPS = 1536;
-      float t = tStart;
-      float prev = sampleField(ro + rd * tStart);
-      bool hitSurface = false;
-      vec3 pHit = vec3(0.0);
-
-      for (int i = 0; i < MAX_STEPS; i++) {
-        if (t > tEnd) break;
-        vec3 p = ro + rd * t;
-        float s = sampleField(p);
-
-        if (abs(s) <= hitEps) {
-          pHit = p;
-          hitSurface = true;
-          break;
-        }
-
-        bool crossed = (prev > 0.0 && s <= 0.0) || (prev < 0.0 && s >= 0.0);
-        if (crossed) {
-          float a = prev / (prev - s + 1e-6);
-          float prevT = max(t - minStep, tStart);
-          pHit = mix(ro + rd * prevT, p, clamp(a, 0.0, 1.0));
-          hitSurface = true;
-          break;
-        }
-
-        float stepSize = clamp(abs(s) * 0.55, minStep, maxStep) * uStepScale;
-        prev = s;
-        t += stepSize;
-      }
-
-      if (!hitSurface) { discard; }
-      if (uSectionEnabled > 0.5 && pHit.y > uSectionLevel) { discard; }
-
-      // Use 2x voxel size for normal epsilon — wider neighbourhood averages out
-      // grid quantization and produces smooth, non-bumpy shading.
-      outColor = vec4(shade(pHit, voxel), 1.0);
-      return;
-    }
-
-    // ── Transparent-shell mode (Mesh workflow) ────────────────────────────────
-    // Multi-hit compositing: collect up to 2 surface crossings.
-    // Hit 0 = outer shell → ghost alpha (0.18).
-    // Hit 1 = interior lattice strut → full alpha (1.0).
-    // This lets the user see the TPMS lattice through the translucent skin.
-    const int MAX_STEPS_T = 1536;
+    const int MAX_STEPS = 2048;
+    const int MAX_SURFACE_HITS = 4;
     const float SHELL_ALPHA = 0.18;
-    // After the first hit we step past the surface by a small skip (relative to
-    // voxel size) to avoid re-detecting the same crossing immediately.
-    float SKIP_DIST = voxel * 3.0;
+    float skipDist = voxel * 2.2;
+    float raySpan = max(tEnd - tStart, minStep);
 
-    vec4 accum = vec4(0.0);   // accumulated RGBA (pre-multiplied alpha)
+    vec3 shellColor = mix(uColor, vec3(0.96, 0.985, 1.0), 0.56);
+    vec3 interiorColor = mix(uColor, vec3(0.86, 0.92, 1.0), 0.42);
+
+    vec3 accumColor = vec3(0.0);
+    float accumAlpha = 0.0;
     float t = tStart;
     float prev = sampleField(ro + rd * tStart);
     int hitCount = 0;
 
-    for (int i = 0; i < MAX_STEPS_T; i++) {
+    for (int i = 0; i < MAX_STEPS; i++) {
       if (t > tEnd) break;
-      if (accum.a >= 0.99) break;   // fully opaque — early exit
+      if (accumAlpha >= 0.94) break;
+      if (hitCount >= MAX_SURFACE_HITS) break;
 
       vec3 p = ro + rd * t;
       float s = sampleField(p);
@@ -193,39 +148,40 @@ const FIELD_FRAGMENT_SHADER = `
           pHit = mix(ro + rd * prevT, p, clamp(a, 0.0, 1.0));
         }
 
-        // Section plane clipping — discard the whole ray if the first visible
-        // hit is above the section level.
         if (uSectionEnabled > 0.5 && pHit.y > uSectionLevel) {
-          // Skip past this surface and keep looking below the cut plane.
-          t += SKIP_DIST + minStep;
-          prev = sampleField(ro + rd * t);
-          hitCount++;
-          if (hitCount >= 2) break;
+          t += skipDist + minStep;
+          if (t > tEnd) {
+            break;
+          }
+          prev = sampleField(ro + rd * min(t, tEnd));
           continue;
         }
 
-        vec3 litColor = shade(pHit, voxel);
+        float travel = clamp((length(pHit - ro) - tStart) / raySpan, 0.0, 1.0);
+        float layerMix = clamp(float(hitCount) / float(MAX_SURFACE_HITS - 1), 0.0, 1.0);
+        vec3 baseColor = mix(shellColor, interiorColor, min(layerMix * 1.35, 1.0));
+        float rimStrength = mix(0.75, 0.35, layerMix);
+        vec3 litColor = shade(pHit, voxel, baseColor, rimStrength);
+        litColor *= mix(1.08, 0.92, travel);
 
         float hitAlpha;
         if (hitCount == 0) {
-          // Outer shell — ghost/transparent
           hitAlpha = SHELL_ALPHA;
         } else {
-          // Interior lattice — fully opaque
-          hitAlpha = 1.0;
+          float layerAlpha = mix(0.3, 0.16, clamp(float(hitCount - 1) / 3.0, 0.0, 1.0));
+          hitAlpha = layerAlpha * mix(1.0, 0.82, travel);
         }
 
-        // Alpha-over compositing (front-to-back)
-        float remaining = 1.0 - accum.a;
-        accum.rgb += litColor * hitAlpha * remaining;
-        accum.a   += hitAlpha * remaining;
+        float remaining = 1.0 - accumAlpha;
+        accumColor += litColor * hitAlpha * remaining;
+        accumAlpha += hitAlpha * remaining;
 
         hitCount++;
-        if (hitCount >= 2) break;
-
-        // Skip past this surface to find the next one.
-        t += SKIP_DIST;
-        prev = sampleField(ro + rd * t);
+        t += skipDist;
+        if (t > tEnd) {
+          break;
+        }
+        prev = sampleField(ro + rd * min(t, tEnd));
         continue;
       }
 
@@ -234,8 +190,8 @@ const FIELD_FRAGMENT_SHADER = `
       t += stepSize;
     }
 
-    if (accum.a < 0.01) { discard; }
-    outColor = accum;
+    if (accumAlpha < 0.02) { discard; }
+    outColor = vec4(accumColor / accumAlpha, min(accumAlpha, 0.86));
   }
 `;
 
@@ -429,8 +385,7 @@ export function Viewer({
   showAxes,
   showGrid,
   sectionEnabled,
-  sectionLevel,
-  transparentShell = false
+  sectionLevel
 }: ViewerProps) {
   const [orbitEnabled, setOrbitEnabled] = useState(true);
   const orbitRef = useRef<any>(null);
@@ -501,11 +456,11 @@ export function Viewer({
         gl.localClippingEnabled = true;
       }}
     >
-      <color attach="background" args={["#0d1721"]} />
-      <ambientLight intensity={0.35} />
-      <hemisphereLight args={["#dbeeff", "#4b5f73", 0.45]} />
-      <directionalLight position={[5, 6, 4]} intensity={0.8} />
-      <directionalLight position={[-5, -6, -4]} intensity={0.7} />
+      <color attach="background" args={["#1b3347"]} />
+      <ambientLight intensity={0.56} />
+      <hemisphereLight args={["#f4fbff", "#7190ab", 0.72]} />
+      <directionalLight position={[5, 6, 4]} intensity={1.08} />
+      <directionalLight position={[-5, -6, -4]} intensity={0.9} />
 
       {showGrid ? <gridHelper args={[12, 24, "#2f536d", "#1d2f3d"]} /> : null}
       {showAxes ? <axesHelper args={[2.5]} /> : null}
@@ -515,8 +470,8 @@ export function Viewer({
           <boxGeometry args={fieldBounds.size.toArray() as [number, number, number]} />
           <shaderMaterial
             side={THREE.FrontSide}
-            transparent={transparentShell}
-            depthWrite={!transparentShell}
+            transparent
+            depthWrite={false}
             glslVersion={THREE.GLSL3}
             vertexShader={FIELD_VERTEX_SHADER}
             fragmentShader={FIELD_FRAGMENT_SHADER}
@@ -529,8 +484,7 @@ export function Viewer({
               uSectionEnabled: { value: sectionEnabled ? 1.0 : 0.0 },
               uSectionLevel: { value: sectionLevel },
               uResolution: { value: field?.resolution ?? 64 },
-              uStepScale: { value: 1.0 },
-              uTransparentShell: { value: transparentShell ? 1.0 : 0.0 }
+              uStepScale: { value: 1.0 }
             }}
           />
         </mesh>
