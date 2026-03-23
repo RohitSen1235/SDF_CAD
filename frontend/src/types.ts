@@ -96,6 +96,8 @@ export interface PreviewStats {
   tri_count: number;
   voxel_count?: number;
   cache_hit?: boolean;
+  field_cache_hit?: boolean;
+  mesh_cache_hit?: boolean;
   compute_precision?: ComputePrecision;
   compute_backend?: "cpu" | "cuda";
   mesh_backend?: "cpu" | "cuda";
@@ -115,6 +117,27 @@ export interface PreviewMeshResponse {
 export interface PreviewFieldResponse {
   field: FieldPayload;
   stats: PreviewStats;
+}
+
+export interface UploadedFieldPreviewClientTelemetry {
+  trace_id: string;
+  client_response_wait_ms: number;
+  client_download_ms: number;
+  client_decode_ms: number;
+  client_texture_upload_and_first_frame_ms: number;
+  client_total_visible_ms: number;
+}
+
+export interface UploadedFieldPreviewTrace {
+  traceId: string;
+  clientResponseWaitMs: number;
+  clientDownloadMs: number;
+  clientDecodeMs: number;
+  fieldAssignedAtMs: number;
+}
+
+export interface UploadedPreviewFieldResponse extends PreviewFieldResponse {
+  trace?: UploadedFieldPreviewTrace | null;
 }
 
 export interface SceneProgramPayload {

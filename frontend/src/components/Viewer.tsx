@@ -4,11 +4,17 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
 import * as THREE from "three";
 
-import { FieldPayload, MeshPayload } from "../types";
+import { FieldPayload, MeshPayload, UploadedFieldPreviewTrace } from "../types";
 
 export interface ViewerProps {
   mesh: MeshPayload | null;
   field: FieldPayload | null;
+  uploadedFieldPreviewTrace?: UploadedFieldPreviewTrace | null;
+  onUploadedFieldPreviewVisible?: ((timing: {
+    traceId: string;
+    textureReadyAtMs: number;
+    firstVisibleFrameAtMs: number;
+  }) => void) | null;
   wireframe: boolean;
   transformMode: "translate" | "rotate" | "scale";
   fitSignal: number;
@@ -387,6 +393,8 @@ function FitCamera({
 export function Viewer({
   mesh,
   field,
+  uploadedFieldPreviewTrace = null,
+  onUploadedFieldPreviewVisible = null,
   wireframe,
   transformMode,
   fitSignal,
@@ -398,6 +406,7 @@ export function Viewer({
   const [orbitEnabled, setOrbitEnabled] = useState(true);
   const orbitRef = useRef<any>(null);
   const meshRef = useRef<THREE.Mesh>(null);
+  const reportedFieldTraceIdRef = useRef<string | null>(null);
 
   const geometry = useMemo(() => toGeometry(mesh), [mesh]);
   const sectionPlane = useMemo(() => {
@@ -455,6 +464,32 @@ export function Viewer({
       }
     };
   }, [fieldTexture]);
+
+  useEffect(() => {
+    if (!fieldTexture || !fieldBounds || !uploadedFieldPreviewTrace || !onUploadedFieldPreviewVisible) {
+      return;
+    }
+    if (reportedFieldTraceIdRef.current === uploadedFieldPreviewTrace.traceId) {
+      return;
+    }
+    reportedFieldTraceIdRef.current = uploadedFieldPreviewTrace.traceId;
+    const textureReadyAtMs = performance.now();
+    let cancelled = false;
+    const frameId = requestAnimationFrame(() => {
+      if (cancelled) {
+        return;
+      }
+      onUploadedFieldPreviewVisible({
+        traceId: uploadedFieldPreviewTrace.traceId,
+        textureReadyAtMs,
+        firstVisibleFrameAtMs: performance.now()
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frameId);
+    };
+  }, [fieldBounds, fieldTexture, onUploadedFieldPreviewVisible, uploadedFieldPreviewTrace]);
 
   return (
     <Canvas

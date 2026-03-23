@@ -8,7 +8,8 @@ import {
   previewField,
   previewMesh,
   previewUploadedMesh,
-  previewUploadedMeshField
+  previewUploadedMeshField,
+  submitUploadedFieldPreviewTelemetry
 } from "./lib/api";
 import { parseLocalMeshPreview } from "./lib/localMeshPreview";
 import {
@@ -23,7 +24,8 @@ import {
   MeshWorkflowParams,
   PreviewStats,
   QualityProfile,
-  SceneIR
+  SceneIR,
+  UploadedFieldPreviewTrace
 } from "./types";
 
 interface SavedFieldExpression {
@@ -186,14 +188,13 @@ export default function App() {
   const [meshLatticePitch, setMeshLatticePitch] = useState(0.45);
   const [meshLatticeThickness, setMeshLatticeThickness] = useState(0.09);
   const [meshLatticePhase, setMeshLatticePhase] = useState(0.0);
-  const [meshPreviewQuality, setMeshPreviewQuality] = useState<QualityProfile>("medium");
-  const [meshExportQuality, setMeshExportQuality] = useState<QualityProfile>("high");
   const [voxelsPerLatticePeriod, setVoxelsPerLatticePeriod] = useState(6);
   const [meshCommitted, setMeshCommitted] = useState(false);
 
   const [field, setField] = useState<FieldPayload | null>(null);
   const [mesh, setMesh] = useState<MeshPayload | null>(null);
   const [stats, setStats] = useState<PreviewStats | null>(null);
+  const [uploadedFieldPreviewTrace, setUploadedFieldPreviewTrace] = useState<UploadedFieldPreviewTrace | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isCompiling, setIsCompiling] = useState(false);
   const [isPreviewing, setIsPreviewing] = useState(false);
@@ -222,6 +223,7 @@ export default function App() {
   });
   const meshFieldPreviewRunIdRef = useRef(0);
   const meshFieldPreviewControllerRef = useRef<AbortController | null>(null);
+  const uploadedFieldTelemetrySentRef = useRef<Set<string>>(new Set());
 
   const meshWorkflowParams = useMemo<MeshWorkflowParams>(
     () => ({
@@ -278,7 +280,6 @@ export default function App() {
       const response = await previewUploadedMeshField(
         meshFile,
         meshWorkflowParams,
-        meshPreviewQuality,
         computeBackend,
         voxelsPerLatticePeriod,
         controller.signal
@@ -286,9 +287,18 @@ export default function App() {
       if (meshFieldPreviewRunIdRef.current !== runId) {
         return;
       }
+      const fieldAssignedAtMs = performance.now();
       setField(response.field);
       setMesh(null);
       setStats(response.stats);
+      setUploadedFieldPreviewTrace(
+        response.trace
+          ? {
+              ...response.trace,
+              fieldAssignedAtMs
+            }
+          : null
+      );
       setMeshCommitted(false);
       setError(null);
     } catch (previewError) {
@@ -311,7 +321,6 @@ export default function App() {
     abortActiveMeshFieldPreview,
     computeBackend,
     meshFile,
-    meshPreviewQuality,
     meshWorkflowParams,
     voxelsPerLatticePeriod
   ]);
@@ -358,6 +367,7 @@ export default function App() {
       setField(null);
       setMesh(null);
       setStats(null);
+      setUploadedFieldPreviewTrace(null);
 
       try {
         const gridBounds = inferPreviewBounds(nextDiagnostics);
@@ -387,6 +397,7 @@ export default function App() {
           fieldSucceeded = true;
           setField(fieldResponse.field);
           setStats(fieldResponse.stats);
+          setUploadedFieldPreviewTrace(null);
         } catch (previewError) {
           if ((previewError as Error).name === "AbortError") {
             return;
@@ -421,6 +432,7 @@ export default function App() {
           setField(null);
           setMesh(meshResponse.mesh);
           setStats(meshResponse.stats);
+          setUploadedFieldPreviewTrace(null);
           setError(null);
           return;
         } catch (previewError) {
@@ -571,6 +583,7 @@ export default function App() {
     setField(null);
     setMesh(null);
     setStats(null);
+    setUploadedFieldPreviewTrace(null);
     setMeshCommitted(false);
     await runMeshFieldPreview();
   };
@@ -588,7 +601,6 @@ export default function App() {
       const response = await previewUploadedMesh(
         meshFile,
         meshWorkflowParams,
-        meshExportQuality,
         computeBackend,
         meshBackend,
         meshingMode,
@@ -597,6 +609,7 @@ export default function App() {
       setField(response.field ?? null);
       setMesh(response.mesh);
       setStats(response.stats);
+      setUploadedFieldPreviewTrace(null);
       setMeshCommitted(true);
       setError(null);
     } catch (previewError) {
@@ -622,7 +635,6 @@ export default function App() {
         meshFile,
         meshWorkflowParams,
         format,
-        meshExportQuality,
         computeBackend,
         meshBackend,
         meshingMode,
@@ -638,6 +650,7 @@ export default function App() {
       return;
     }
     setMeshCommitted(false);
+    setUploadedFieldPreviewTrace(null);
   }, [
     workflow,
     meshFile,
@@ -646,13 +659,49 @@ export default function App() {
     meshLatticePitch,
     meshLatticeThickness,
     meshLatticePhase,
-    meshPreviewQuality,
-    meshExportQuality,
     computeBackend,
     meshBackend,
     meshingMode,
     voxelsPerLatticePeriod
   ]);
+
+  const onUploadedFieldPreviewVisible = useCallback(
+    async ({
+      traceId,
+      textureReadyAtMs: _textureReadyAtMs,
+      firstVisibleFrameAtMs
+    }: {
+      traceId: string;
+      textureReadyAtMs: number;
+      firstVisibleFrameAtMs: number;
+    }) => {
+      if (uploadedFieldTelemetrySentRef.current.has(traceId)) {
+        return;
+      }
+      if (!uploadedFieldPreviewTrace || uploadedFieldPreviewTrace.traceId !== traceId) {
+        return;
+      }
+      uploadedFieldTelemetrySentRef.current.add(traceId);
+      try {
+        const textureAndFirstFrameMs = Math.max(0, firstVisibleFrameAtMs - uploadedFieldPreviewTrace.fieldAssignedAtMs);
+        await submitUploadedFieldPreviewTelemetry({
+          trace_id: traceId,
+          client_response_wait_ms: uploadedFieldPreviewTrace.clientResponseWaitMs,
+          client_download_ms: uploadedFieldPreviewTrace.clientDownloadMs,
+          client_decode_ms: uploadedFieldPreviewTrace.clientDecodeMs,
+          client_texture_upload_and_first_frame_ms: textureAndFirstFrameMs,
+          client_total_visible_ms:
+            uploadedFieldPreviewTrace.clientResponseWaitMs +
+            uploadedFieldPreviewTrace.clientDownloadMs +
+            uploadedFieldPreviewTrace.clientDecodeMs +
+            textureAndFirstFrameMs
+        });
+      } catch (telemetryError) {
+        console.warn("Uploaded field preview telemetry failed", telemetryError);
+      }
+    },
+    [uploadedFieldPreviewTrace]
+  );
 
   useEffect(() => cancelPendingMeshFieldPreview, [cancelPendingMeshFieldPreview]);
 
@@ -695,8 +744,6 @@ export default function App() {
     setError(null);
   };
 
-  const statusQuality = workflow === "dsl" ? quality : meshPreviewQuality;
-
   return (
     <div className="shell">
       <header className="topbar">
@@ -706,7 +753,7 @@ export default function App() {
             {workflow === "dsl" ? (isCompiling ? "Compiling" : "Compiled") : "Mesh Workflow"}
           </span>
           <span className={isPreviewing ? "pill active" : "pill"}>{isPreviewing ? "Previewing" : "Preview Ready"}</span>
-          <span className="pill">Q: {statusQuality}</span>
+          {workflow === "dsl" ? <span className="pill">Q: {quality}</span> : null}
         </div>
       </header>
 
@@ -861,6 +908,7 @@ export default function App() {
                       setMeshFile(selected);
                       setField(null);
                       setStats(null);
+                      setUploadedFieldPreviewTrace(null);
                       setMeshCommitted(false);
                       setError(null);
                       if (!selected) {
@@ -963,36 +1011,6 @@ export default function App() {
                     {estimatedMemory > 1000 ? " ⚠️ Large — may be slow" : ""}
                   </p>
                 </div>
-
-                <label className="slider-row">
-                  <span>Preview quality</span>
-                  <select
-                    aria-label="Mesh preview quality"
-                    value={meshPreviewQuality}
-                    onChange={(event) => setMeshPreviewQuality(event.target.value as QualityProfile)}
-                  >
-                    {QUALITY_ORDER.map((item) => (
-                      <option key={item} value={item}>
-                        {item}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                <label className="slider-row">
-                  <span>Export quality</span>
-                  <select
-                    aria-label="Mesh export quality"
-                    value={meshExportQuality}
-                    onChange={(event) => setMeshExportQuality(event.target.value as QualityProfile)}
-                  >
-                    {QUALITY_ORDER.map((item) => (
-                      <option key={item} value={item}>
-                        {item}
-                      </option>
-                    ))}
-                  </select>
-                </label>
 
                 <label className="slider-row">
                   <span>Field backend</span>
@@ -1140,6 +1158,8 @@ export default function App() {
             <Viewer
               mesh={mesh}
               field={field}
+              uploadedFieldPreviewTrace={field && !mesh ? uploadedFieldPreviewTrace : null}
+              onUploadedFieldPreviewVisible={onUploadedFieldPreviewVisible}
               wireframe={wireframe}
               transformMode={transformMode}
               fitSignal={fitSignal}
@@ -1158,7 +1178,8 @@ export default function App() {
             <span>Mesh: {stats?.mesh_ms != null ? stats.mesh_ms.toFixed(1) : "n/a"} ms</span>
             <span>Eval backend: {stats?.compute_backend ?? "cpu"}</span>
             <span>Mesh backend: {stats?.mesh_backend ?? "cpu"}</span>
-            <span>Cache: {stats?.cache_hit ? "hit" : "miss"}</span>
+            <span>Field cache: {stats?.field_cache_hit ? "hit" : "miss"}</span>
+            <span>Mesh cache: {stats?.mesh_cache_hit ? "hit" : "miss"}</span>
           </div>
           {error ? <p className="error">{error}</p> : null}
         </section>

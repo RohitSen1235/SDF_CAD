@@ -13,7 +13,9 @@ import {
   PreviewFieldResponse,
   PreviewMeshResponse,
   QualityProfile,
-  SceneIR
+  SceneIR,
+  UploadedFieldPreviewClientTelemetry,
+  UploadedPreviewFieldResponse
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
@@ -114,6 +116,15 @@ function parseBoundsHeader(response: Response): [[number, number], [number, numb
   } catch {
     throw new Error("Invalid X-SDF-Bounds response header");
   }
+}
+
+function parseTraceIdHeader(response: Response): string | null {
+  const raw = response.headers.get("X-SDF-Trace-Id");
+  if (!raw) {
+    return null;
+  }
+  const value = raw.trim();
+  return value.length > 0 ? value : null;
 }
 
 function decodeBinaryMeshPacket(buffer: ArrayBuffer): MeshPayloadBinary {
@@ -392,7 +403,6 @@ function appendMeshWorkflowFormData(
   body: FormData,
   file: File,
   params: MeshWorkflowParams,
-  qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
   meshingMode: MeshingMode = "uniform",
@@ -404,7 +414,6 @@ function appendMeshWorkflowFormData(
   body.append("lattice_pitch", String(params.latticePitch));
   body.append("lattice_thickness", String(params.latticeThickness));
   body.append("lattice_phase", String(params.latticePhase));
-  body.append("quality_profile", qualityProfile);
   body.append("voxels_per_lattice_period", String(voxelsPerLatticePeriod));
   body.append("compute_backend", computeBackend);
   body.append("mesh_backend", meshBackend);
@@ -414,7 +423,6 @@ function appendMeshWorkflowFormData(
 export async function previewUploadedMesh(
   file: File,
   params: MeshWorkflowParams,
-  qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
   meshingMode: MeshingMode = "uniform",
@@ -422,7 +430,7 @@ export async function previewUploadedMesh(
 ): Promise<PreviewMeshResponse> {
   try {
     const body = new FormData();
-    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
+    appendMeshWorkflowFormData(body, file, params, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
     const response = await fetch(`${API_BASE}/api/v1/mesh/preview.binary`, {
       method: "POST",
       body
@@ -439,7 +447,7 @@ export async function previewUploadedMesh(
     }
 
     const fallbackBody = new FormData();
-    appendMeshWorkflowFormData(fallbackBody, file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
+    appendMeshWorkflowFormData(fallbackBody, file, params, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
     const fallback = await fetch(`${API_BASE}/api/v1/mesh/preview`, {
       method: "POST",
       body: fallbackBody
@@ -459,29 +467,29 @@ export async function previewUploadedMesh(
 export async function previewUploadedMeshField(
   file: File,
   params: MeshWorkflowParams,
-  qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   voxelsPerLatticePeriod: number = 6,
   signal?: AbortSignal
-): Promise<PreviewFieldResponse> {
+): Promise<UploadedPreviewFieldResponse> {
   try {
     const body = new FormData();
     appendMeshWorkflowFormData(
       body,
       file,
       params,
-      qualityProfile,
       computeBackend,
       "auto",
       "uniform",
       voxelsPerLatticePeriod
     );
+    const fetchStartedAt = performance.now();
     const response = await fetch(`${API_BASE}/api/v1/mesh/field.binary`, {
       method: "POST",
       body,
       signal
     });
     if (response.ok) {
+      const headersReceivedAt = performance.now();
       const stats = parseStatsHeader(response);
       const resolutionRaw = response.headers.get("X-SDF-Resolution");
       const resolution = resolutionRaw ? Number(resolutionRaw) : NaN;
@@ -489,10 +497,23 @@ export async function previewUploadedMeshField(
         throw new Error("Missing or invalid X-SDF-Resolution response header");
       }
       const bounds = parseBoundsHeader(response);
+      const traceId = parseTraceIdHeader(response);
       const packet = await response.arrayBuffer();
+      const arrayBufferDoneAt = performance.now();
+      const field = decodeBinaryFieldPayload(packet, resolution, bounds);
+      const decodeDoneAt = performance.now();
       return {
-        field: decodeBinaryFieldPayload(packet, resolution, bounds),
-        stats
+        field,
+        stats,
+        trace: traceId
+          ? {
+              traceId,
+              clientResponseWaitMs: headersReceivedAt - fetchStartedAt,
+              clientDownloadMs: arrayBufferDoneAt - headersReceivedAt,
+              clientDecodeMs: decodeDoneAt - arrayBufferDoneAt,
+              fieldAssignedAtMs: decodeDoneAt
+            }
+          : null
       };
     }
     if (response.status !== 404 && response.status !== 405) {
@@ -504,7 +525,6 @@ export async function previewUploadedMeshField(
       fallbackBody,
       file,
       params,
-      qualityProfile,
       computeBackend,
       "auto",
       "uniform",
@@ -527,10 +547,29 @@ export async function previewUploadedMeshField(
   }
 }
 
+export async function submitUploadedFieldPreviewTelemetry(
+  payload: UploadedFieldPreviewClientTelemetry
+): Promise<void> {
+  try {
+    const response = await fetch(`${API_BASE}/api/v1/internal/mesh/field-preview-telemetry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      await parseErrorResponse(response, "Uploaded field preview telemetry failed");
+    }
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw asNetworkError(error);
+    }
+    throw error;
+  }
+}
+
 export async function previewUploadedMeshPhased(
   file: File,
   params: MeshWorkflowParams,
-  qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
   meshingMode: MeshingMode = "uniform",
@@ -541,7 +580,7 @@ export async function previewUploadedMeshPhased(
   const wsBase = toWebSocketBase(API_BASE);
   const url = `${wsBase}/api/v1/mesh/preview/ws`;
   const fallbackToHttp = async (): Promise<PreviewMeshResponse> =>
-    previewUploadedMesh(file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
+    previewUploadedMesh(file, params, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
 
   return new Promise<PreviewMeshResponse>((resolve, reject) => {
     let settled = false;
@@ -558,7 +597,6 @@ export async function previewUploadedMeshPhased(
           lattice_pitch: params.latticePitch,
           lattice_thickness: params.latticeThickness,
           lattice_phase: params.latticePhase,
-          quality_profile: qualityProfile,
           voxels_per_lattice_period: voxelsPerLatticePeriod,
           compute_backend: computeBackend,
           mesh_backend: meshBackend,
@@ -621,7 +659,6 @@ export async function exportUploadedMesh(
   file: File,
   params: MeshWorkflowParams,
   format: "stl" | "obj",
-  qualityProfile: QualityProfile,
   computeBackend: ComputeBackend = "auto",
   meshBackend: MeshBackend = "auto",
   meshingMode: MeshingMode = "uniform",
@@ -629,7 +666,7 @@ export async function exportUploadedMesh(
 ): Promise<void> {
   try {
     const body = new FormData();
-    appendMeshWorkflowFormData(body, file, params, qualityProfile, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
+    appendMeshWorkflowFormData(body, file, params, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
     body.append("format", format);
     body.append("execution_mode", "auto");
     const response = await fetch(`${API_BASE}/api/v1/mesh/export`, {

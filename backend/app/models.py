@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 NodeType = Literal[
@@ -144,6 +144,8 @@ class PreviewStats(BaseModel):
     tri_count: int
     voxel_count: int | None = None
     cache_hit: bool = False
+    field_cache_hit: bool = False
+    mesh_cache_hit: bool = False
     compute_precision: ComputePrecision = "float32"
     compute_backend: Literal["cpu", "cuda"] = "cpu"
     mesh_backend: Literal["cpu", "cuda"] = "cpu"
@@ -172,6 +174,15 @@ class PreviewFieldRequest(BaseModel):
 class PreviewFieldResponse(BaseModel):
     field: FieldPayload
     stats: PreviewStats
+
+
+class UploadedFieldPreviewClientTelemetry(BaseModel):
+    trace_id: str
+    client_response_wait_ms: float = Field(ge=0.0)
+    client_download_ms: float = Field(ge=0.0)
+    client_decode_ms: float = Field(ge=0.0)
+    client_texture_upload_and_first_frame_ms: float = Field(ge=0.0)
+    client_total_visible_ms: float = Field(ge=0.0)
 
 
 class ExportMeshRequest(BaseModel):
@@ -220,6 +231,8 @@ class PreviewWsResponse(BaseModel):
 
 
 class UploadedMeshPreviewWsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     file_name: str
     file_data_base64: str
     shell_thickness: float
@@ -227,7 +240,6 @@ class UploadedMeshPreviewWsRequest(BaseModel):
     lattice_pitch: float
     lattice_thickness: float
     lattice_phase: float = 0.0
-    quality_profile: QualityProfile = "medium"
     voxels_per_lattice_period: int = 6
     compute_backend: ComputeBackend = "auto"
     mesh_backend: MeshBackend = "auto"
