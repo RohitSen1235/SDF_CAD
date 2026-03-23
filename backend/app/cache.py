@@ -117,6 +117,8 @@ class UploadedHostFieldCacheEntry:
     active_blocks: list[tuple[int, int, int]] | None = None
     sparse_background_value: float | None = None
     sparse_bricks: dict[tuple[int, int, int], np.ndarray] | None = None
+    host_build_strategy: str = "dense"
+    host_decision_reason: str = "dense_default"
 
 
 uploaded_host_field_cache: LruCache[UploadedHostFieldCacheEntry] = LruCache(maxsize=8)
@@ -136,6 +138,8 @@ class UploadedFieldPreviewTraceEntry:
     mesh_cache_hit: bool = False
     host_cache_hit: bool = False
     metadata_cache_hit: bool = False
+    host_build_strategy: str | None = None
+    host_decision_reason: str | None = None
     server_upload_read_ms: float | None = None
     server_metadata_resolve_ms: float | None = None
     server_host_field_ms: float | None = None

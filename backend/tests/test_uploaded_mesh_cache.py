@@ -288,6 +288,10 @@ def test_uploaded_host_cache_returns_shared_immutable_arrays() -> None:
     assert first.parsed.faces is second.parsed.faces
     assert first.host_sdf is second.host_sdf
     assert first.host_sdf.flags.writeable is False
+    assert isinstance(first.host_build_strategy, str) and first.host_build_strategy
+    assert isinstance(first.host_decision_reason, str) and first.host_decision_reason
+    assert first.host_build_strategy == second.host_build_strategy
+    assert first.host_decision_reason == second.host_decision_reason
     assert first.cache_hit is False
     assert second.cache_hit is True
 
@@ -314,8 +318,11 @@ def test_uploaded_field_preview_audit_reports_zero_compose_time_on_cache_hit() -
 
     assert first_audit.field_cache_hit is False
     assert first_audit.server_compose_field_ms > 0.0
+    assert first_audit.host_build_strategy in {"dense", "octree_sparse"}
+    assert isinstance(first_audit.host_decision_reason, str) and first_audit.host_decision_reason
     assert second_audit.field_cache_hit is True
     assert second_audit.server_compose_field_ms == 0.0
+    assert second_audit.host_build_strategy in {"dense", "octree_sparse"}
 
 
 def test_uploaded_field_preview_trace_store_expires_entries() -> None:

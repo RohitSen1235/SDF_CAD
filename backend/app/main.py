@@ -243,6 +243,8 @@ class UploadedHostFieldResult:
     block_size: int | None
     active_blocks: list[tuple[int, int, int]] | None
     field_storage_mode: UploadedFieldStorageMode
+    host_build_strategy: str
+    host_decision_reason: str
     cache_hit: bool
 
 
@@ -269,6 +271,8 @@ class UploadedFieldPreviewServerAudit:
     voxel_count: int
     payload_bytes: int
     compute_backend: Literal["cpu", "cuda"]
+    host_build_strategy: str
+    host_decision_reason: str
     server_upload_read_ms: float
     server_metadata_resolve_ms: float
     server_host_field_ms: float
@@ -295,6 +299,8 @@ def _log_uploaded_field_preview_server_trace(
                 f"voxel_count={audit.voxel_count}",
                 f"payload_bytes={audit.payload_bytes}",
                 f"compute_backend={audit.compute_backend}",
+                f"host_build_strategy={audit.host_build_strategy}",
+                f"host_decision_reason={audit.host_decision_reason}",
                 f"metadata_cache_hit={audit.metadata_cache_hit}",
                 f"host_cache_hit={audit.host_cache_hit}",
                 f"field_cache_hit={audit.field_cache_hit}",
@@ -322,6 +328,8 @@ def _log_uploaded_field_preview_consolidated_trace(entry: UploadedFieldPreviewTr
                 f"voxel_count={entry.voxel_count}",
                 f"payload_bytes={entry.payload_bytes}",
                 f"compute_backend={entry.compute_backend}",
+                f"host_build_strategy={entry.host_build_strategy}",
+                f"host_decision_reason={entry.host_decision_reason}",
                 f"metadata_cache_hit={entry.metadata_cache_hit}",
                 f"host_cache_hit={entry.host_cache_hit}",
                 f"field_cache_hit={entry.field_cache_hit}",
@@ -361,6 +369,8 @@ def _record_uploaded_field_preview_server_trace(
             voxel_count=audit.voxel_count,
             payload_bytes=audit.payload_bytes,
             compute_backend=audit.compute_backend,
+            host_build_strategy=audit.host_build_strategy,
+            host_decision_reason=audit.host_decision_reason,
             field_cache_hit=audit.field_cache_hit,
             mesh_cache_hit=False,
             host_cache_hit=audit.host_cache_hit,
@@ -984,6 +994,8 @@ def _resolve_uploaded_host_field(
             block_size=cached.block_size,
             active_blocks=active_blocks,
             field_storage_mode=cached.field_storage_mode,
+            host_build_strategy=cached.host_build_strategy,
+            host_decision_reason=cached.host_decision_reason,
             cache_hit=True,
         )
 
@@ -1004,6 +1016,8 @@ def _resolve_uploaded_host_field(
                 if host.sparse_bricks is not None
                 else None
             ),
+            host_build_strategy=host.host_build_strategy,
+            host_decision_reason=host.host_decision_reason,
         ),
     )
     return UploadedHostFieldResult(
@@ -1013,6 +1027,8 @@ def _resolve_uploaded_host_field(
         block_size=host.block_size,
         active_blocks=host.active_blocks,
         field_storage_mode=host.field_storage_mode,
+        host_build_strategy=host.host_build_strategy,
+        host_decision_reason=host.host_decision_reason,
         cache_hit=False,
     )
 
@@ -1415,6 +1431,8 @@ def _run_uploaded_mesh_field_preview_data_with_audit(
         voxel_count=int(composed.field.size),
         payload_bytes=int(composed.field.size * np.dtype(np.float32).itemsize),
         compute_backend=composed.eval_backend_used,
+        host_build_strategy=host_result.host_build_strategy,
+        host_decision_reason=host_result.host_decision_reason,
         server_upload_read_ms=0.0,
         server_metadata_resolve_ms=server_metadata_resolve_ms,
         server_host_field_ms=server_host_field_ms,

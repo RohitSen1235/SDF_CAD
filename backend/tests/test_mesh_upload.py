@@ -55,6 +55,31 @@ endsolid tetra
 """
 
 
+def _cube_obj_bytes() -> bytes:
+    return b"""
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+v 0 0 1
+v 1 0 1
+v 1 1 1
+v 0 1 1
+f 1 3 2
+f 1 4 3
+f 5 6 7
+f 5 7 8
+f 1 2 6
+f 1 6 5
+f 2 3 7
+f 2 7 6
+f 3 4 8
+f 3 8 7
+f 4 1 5
+f 4 5 8
+"""
+
+
 def _single_tri_binary_stl_bytes() -> bytes:
     header = b"binary-stl-test".ljust(80, b" ")
     count = struct.pack("<I", 1)
@@ -174,7 +199,8 @@ def test_octree_sparse_host_sdf_returns_active_blocks_for_large_sparse_volume() 
     occupancy[56:72, 56:72, 56:72] = True
     bounds = [[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
 
-    host_sdf, block_size, active_blocks, sparse_background_value = mesh_upload._build_host_sdf_octree_sparse(
+    host_sdf, block_size, active_blocks, sparse_background_value, decision_reason = mesh_upload._build_host_sdf_octree_sparse(
+        None,
         occupancy,
         bounds,
         resolution,
@@ -185,8 +211,90 @@ def test_octree_sparse_host_sdf_returns_active_blocks_for_large_sparse_volume() 
     assert active_blocks is not None
     assert len(active_blocks) > 0
     assert sparse_background_value is not None
+    assert decision_reason.startswith("sparse_selected") or decision_reason.startswith("dense_sparse")
     assert host_sdf[0, 0, 0] > 0.0
     assert host_sdf[63, 63, 63] < 0.0
+
+
+def test_octree_sparse_host_sdf_scan_conversion_matches_cube_face_distance() -> None:
+    mesh = parse_mesh_bytes(_cube_obj_bytes(), ".obj")
+    bounds = [[-2.0, 3.0], [-2.0, 3.0], [-2.0, 3.0]]
+    resolution = 128
+    occupancy = mesh_upload._voxelize_and_fill(mesh, bounds, resolution)
+    host_sdf, block_size, active_blocks, sparse_background_value, decision_reason = mesh_upload._build_host_sdf_octree_sparse(
+        mesh,
+        occupancy,
+        bounds,
+        resolution,
+    )
+
+    x_axis = np.linspace(bounds[0][0], bounds[0][1], resolution, dtype=np.float64)
+    y_axis = np.linspace(bounds[1][0], bounds[1][1], resolution, dtype=np.float64)
+    z_axis = np.linspace(bounds[2][0], bounds[2][1], resolution, dtype=np.float64)
+
+    ix_inside = int(np.argmin(np.abs(x_axis - 0.9)))
+    ix_outside = int(np.argmin(np.abs(x_axis - 1.2)))
+    iy = int(np.argmin(np.abs(y_axis - 0.5)))
+    iz = int(np.argmin(np.abs(z_axis - 0.5)))
+
+    inside_point = np.array([x_axis[ix_inside], y_axis[iy], z_axis[iz]], dtype=np.float64)
+    outside_point = np.array([x_axis[ix_outside], y_axis[iy], z_axis[iz]], dtype=np.float64)
+    spacing = float(np.max(mesh_upload._bounds_spacing(bounds, resolution)))
+
+    expected_inside = -(1.0 - inside_point[0])
+    expected_outside = outside_point[0] - 1.0
+
+    assert block_size is not None
+    assert active_blocks is not None
+    assert len(active_blocks) > 0
+    assert sparse_background_value is not None
+    assert decision_reason.startswith("sparse_selected")
+    assert host_sdf[ix_inside, iy, iz] < 0.0
+    assert host_sdf[ix_outside, iy, iz] > 0.0
+    assert abs(float(host_sdf[ix_inside, iy, iz]) - expected_inside) <= (1.5 * spacing)
+    assert abs(float(host_sdf[ix_outside, iy, iz]) - expected_outside) <= (1.5 * spacing)
+
+
+def test_build_host_field_auto_short_circuits_before_triangle_candidate_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    mesh = parse_mesh_bytes(_cube_obj_bytes(), ".obj")
+    called = {"candidates": 0}
+
+    def fail_if_called(*_args, **_kwargs):
+        called["candidates"] += 1
+        raise AssertionError("triangle candidate generation should not run for this auto-gated case")
+
+    monkeypatch.setattr(mesh_upload, "_triangle_scan_convert_candidates", fail_if_called)
+
+    host = mesh_upload.build_host_field(mesh, resolution=128, field_storage_mode="auto")
+
+    assert called["candidates"] == 0
+    assert host.field_storage_mode == "dense"
+    assert host.host_build_strategy == "dense"
+    assert host.host_decision_reason.startswith("dense_auto_gate")
+
+
+def test_build_host_field_explicit_sparse_attempts_scan_conversion_even_when_auto_gate_would_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mesh = parse_mesh_bytes(_cube_obj_bytes(), ".obj")
+    called = {"candidates": 0}
+    original = mesh_upload._triangle_scan_convert_candidates
+
+    def track_candidates(*args, **kwargs):
+        called["candidates"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(mesh_upload, "_triangle_scan_convert_candidates", track_candidates)
+    monkeypatch.setattr(
+        mesh_upload,
+        "_estimate_sparse_profitability",
+        lambda *_args, **_kwargs: (False, "dense_auto_gate_near_ratio", 1.0, 10_000_000, 9999.0),
+    )
+
+    host = mesh_upload.build_host_field(mesh, resolution=128, field_storage_mode="octree_sparse")
+
+    assert called["candidates"] > 0
+    assert host.host_decision_reason.startswith("sparse_selected") or host.host_decision_reason.startswith("dense_sparse")
 
 
 def test_build_host_field_populates_sparse_metadata_when_sparse_path_is_used(
@@ -198,6 +306,7 @@ def test_build_host_field_populates_sparse_metadata_when_sparse_path_is_used(
     synthetic[56:72, 56:72, 56:72] = True
 
     monkeypatch.setattr(mesh_upload, "_voxelize_and_fill", lambda *_args, **_kwargs: synthetic)
+    monkeypatch.setattr(mesh_upload, "_build_bounds", lambda *_args, **_kwargs: [[-2.0, 3.0], [-2.0, 3.0], [-2.0, 3.0]])
 
     host = mesh_upload.build_host_field(mesh, resolution=resolution)
 
