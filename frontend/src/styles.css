@@ -310,6 +310,13 @@ button:hover {
   font-size: 0.85rem;
 }
 
+.warning {
+  margin: 0;
+  padding: 0 0.8rem 0.7rem;
+  color: var(--accent-2);
+  font-size: 0.85rem;
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;

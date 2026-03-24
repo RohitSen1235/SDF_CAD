@@ -8,6 +8,8 @@ import {
   MeshBackend,
   MeshingMode,
   MeshPayloadBinary,
+  UploadedMeshMemoryContext,
+  UploadedMeshPreprocessResponse,
   MeshWorkflowParams,
   PreviewStats,
   PreviewFieldResponse,
@@ -125,6 +127,42 @@ function parseTraceIdHeader(response: Response): string | null {
   }
   const value = raw.trim();
   return value.length > 0 ? value : null;
+}
+
+function parseOptionalNumericHeader(response: Response, name: string): number | null {
+  const raw = response.headers.get(name);
+  if (raw == null || raw.trim() === "") {
+    return null;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return parsed;
+}
+
+function parseUploadedMeshMemoryContext(response: Response): UploadedMeshMemoryContext | null {
+  const meshSpan = parseOptionalNumericHeader(response, "X-SDF-Mesh-Span");
+  const cpuBytesPerVoxel = parseOptionalNumericHeader(response, "X-SDF-CPU-Bytes-Per-Voxel");
+  const gpuBytesPerVoxel = parseOptionalNumericHeader(response, "X-SDF-GPU-Bytes-Per-Voxel");
+  const safetyFactor = parseOptionalNumericHeader(response, "X-SDF-Memory-Safety-Factor");
+  if (
+    meshSpan == null ||
+    cpuBytesPerVoxel == null ||
+    gpuBytesPerVoxel == null ||
+    safetyFactor == null
+  ) {
+    return null;
+  }
+  return {
+    meshSpan,
+    availableCpuBytes: parseOptionalNumericHeader(response, "X-SDF-Available-CPU-Bytes"),
+    availableGpuFreeBytes: parseOptionalNumericHeader(response, "X-SDF-Available-GPU-Free-Bytes"),
+    availableGpuTotalBytes: parseOptionalNumericHeader(response, "X-SDF-Available-GPU-Total-Bytes"),
+    cpuBytesPerVoxel,
+    gpuBytesPerVoxel,
+    safetyFactor
+  };
 }
 
 export function decodeBinaryMeshPacket(buffer: ArrayBuffer): MeshPayloadBinary {
@@ -553,7 +591,7 @@ export async function preprocessUploadedMesh(
   computeBackend: ComputeBackend = "auto",
   voxelsPerLatticePeriod: number = 6,
   signal?: AbortSignal
-): Promise<MeshPayloadBinary> {
+): Promise<UploadedMeshPreprocessResponse> {
   // Preprocess only needs the upload and a few compatibility fields; the host
   // SDF is built later when the user clicks "Preview Field".
   const body = new FormData();
@@ -571,7 +609,10 @@ export async function preprocessUploadedMesh(
       await parseErrorResponse(response, "Mesh preprocess failed");
     }
     const packet = await response.arrayBuffer();
-    return decodeBinaryMeshPacket(packet);
+    return {
+      mesh: decodeBinaryMeshPacket(packet),
+      memoryContext: parseUploadedMeshMemoryContext(response)
+    };
   } catch (error) {
     if ((error as Error)?.name === "AbortError") {
       throw error;

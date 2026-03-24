@@ -69,6 +69,7 @@ class HostFieldData:
     bounds: list[list[float]]
     host_sdf: np.ndarray
     host_compute_backend: Literal["cpu", "cuda"] = "cpu"
+    fallback_reason: str | None = None
     field_storage_mode: Literal["dense", "octree_sparse"] = "dense"
     block_size: int | None = None
     active_blocks: list[tuple[int, int, int]] | None = None
@@ -87,11 +88,84 @@ _AUTO_SPARSE_MAX_EST_TRI_BLOCK_HITS = 1_200_000
 _AUTO_SPARSE_MAX_EST_TRIANGLES_PER_ACTIVE_BLOCK = 4_000.0
 _VOXEL_CLOSING_STRUCTURE = np.ones((3, 3, 3), dtype=bool)
 _VOXEL_FILL_STRUCTURE = ndimage.generate_binary_structure(3, 1)
+_GPU_FILL_BYTES_PER_VOXEL = 12.0
+_GPU_FILL_SAFETY_FACTOR = 0.80
 
 
 def _log_host_field_backend(backend: Literal["cpu", "cuda"]) -> None:
     message = f"Host field SDF computation used {backend.upper()} backend"
     print(message, flush=True)
+
+
+def _free_cupy_memory_pools() -> None:
+    if not CUPY_AVAILABLE or cp is None:
+        return
+    try:
+        cp.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+    try:
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+
+
+def _is_cupy_out_of_memory_error(exc: BaseException) -> bool:
+    if exc.__class__.__name__ != "OutOfMemoryError":
+        return False
+    module = getattr(exc.__class__, "__module__", "")
+    return module.startswith("cupy")
+
+
+def _gpu_fill_memory_estimate_bytes(resolution: int) -> int:
+    return int(math.ceil(float(resolution**3) * _GPU_FILL_BYTES_PER_VOXEL))
+
+
+def _gpu_fill_resolution_suggestion(resolution: int, free_bytes: int | None) -> int | None:
+    if free_bytes is None or free_bytes <= 0:
+        return None
+
+    usable_bytes = float(free_bytes) * _GPU_FILL_SAFETY_FACTOR
+    if usable_bytes <= 0.0:
+        return None
+
+    suggested = int(math.floor((usable_bytes / _GPU_FILL_BYTES_PER_VOXEL) ** (1.0 / 3.0)))
+    suggested = min(suggested, resolution - 1)
+    if suggested < 24:
+        return None
+    return suggested
+
+
+def _gpu_fill_fallback_reason(resolution: int, exc: BaseException) -> str:
+    estimated_bytes = _gpu_fill_memory_estimate_bytes(resolution)
+    free_bytes: int | None = None
+    total_bytes: int | None = None
+    if CUPY_AVAILABLE and cp is not None and _cuda_device_available():
+        try:
+            free_raw, total_raw = cp.cuda.runtime.memGetInfo()
+            free_bytes = int(free_raw)
+            total_bytes = int(total_raw)
+        except Exception:
+            free_bytes = None
+            total_bytes = None
+
+    suggested_resolution = _gpu_fill_resolution_suggestion(resolution, free_bytes)
+    estimated_gib = estimated_bytes / float(1024**3)
+    parts = [
+        f"GPU voxel fill ran out of memory at resolution {resolution} (estimated working set about {estimated_gib:.2f} GiB).",
+    ]
+    if free_bytes is not None:
+        parts.append(f"Free GPU memory was about {free_bytes / float(1024**3):.2f} GiB.")
+    if total_bytes is not None:
+        parts.append(f"Total GPU memory was about {total_bytes / float(1024**3):.2f} GiB.")
+    if suggested_resolution is not None:
+        parts.append(
+            f"Try lowering the preview to about resolution {suggested_resolution}, or reduce voxels_per_lattice_period / increase lattice_pitch."
+        )
+    else:
+        parts.append("Try lowering the preview resolution, or reduce voxels_per_lattice_period / increase lattice_pitch.")
+    parts.append("The preview was retried on CPU.")
+    return " ".join(parts)
 
 
 def parse_mesh_bytes(data: bytes, extension: str) -> ParsedMesh:
@@ -196,7 +270,7 @@ def build_host_field(
         raise MeshUploadError("resolution is too low for mesh workflow")
 
     bounds = _build_bounds(mesh)
-    occupancy = _voxelize_and_fill(mesh, bounds, resolution)
+    occupancy, fallback_reason = _voxelize_and_fill(mesh, bounds, resolution)
 
     if field_storage_mode == "dense":
         host_sdf, host_backend = _build_host_sdf_dense_with_backend(
@@ -211,6 +285,7 @@ def build_host_field(
             bounds=bounds,
             host_sdf=host_sdf,
             host_compute_backend=host_backend,
+            fallback_reason=fallback_reason,
             field_storage_mode="dense",
             block_size=None,
             active_blocks=None,
@@ -246,6 +321,7 @@ def build_host_field(
             bounds=bounds,
             host_sdf=host_sdf,
             host_compute_backend=host_backend,
+            fallback_reason=fallback_reason,
             field_storage_mode="octree_sparse",
             block_size=int(sparse.block_size),
             active_blocks=sparse.active_blocks(),
@@ -266,6 +342,7 @@ def build_host_field(
         bounds=bounds,
         host_sdf=host_sdf,
         host_compute_backend=host_backend,
+        fallback_reason=fallback_reason,
         field_storage_mode="dense",
         block_size=block_size,
         active_blocks=active_blocks,
@@ -1362,22 +1439,34 @@ def _fill_holes_cpu(surface: np.ndarray) -> np.ndarray:
     return np.logical_or(surface, fillable[labels])
 
 
-def _dilate_close_and_fill(surface: np.ndarray, *, closing_iterations: int = 1) -> np.ndarray:
+def _dilate_close_and_fill(surface: np.ndarray, *, closing_iterations: int = 1) -> tuple[np.ndarray, str | None]:
     if CUPYX_AVAILABLE and cp is not None and _cuda_device_available():
-        surface_gpu = cp.asarray(surface)
-        closing_structure = cp.asarray(_VOXEL_CLOSING_STRUCTURE)
-        surface_gpu = cndimage.binary_dilation(surface_gpu, iterations=1)
-        surface_gpu = cndimage.binary_closing(
-            surface_gpu,
-            structure=closing_structure,
-            iterations=closing_iterations,
-        )
-        surface_gpu = cndimage.binary_fill_holes(surface_gpu)
-        return cp.asnumpy(surface_gpu)
+        try:
+            surface_gpu = cp.asarray(surface)
+            closing_structure = cp.asarray(_VOXEL_CLOSING_STRUCTURE)
+            surface_gpu = cndimage.binary_dilation(surface_gpu, iterations=1)
+            surface_gpu = cndimage.binary_closing(
+                surface_gpu,
+                structure=closing_structure,
+                iterations=closing_iterations,
+            )
+            surface_gpu = cndimage.binary_fill_holes(surface_gpu)
+            return cp.asnumpy(surface_gpu), None
+        except Exception as exc:
+            if not _is_cupy_out_of_memory_error(exc):
+                raise
+            _free_cupy_memory_pools()
+            surface_cpu = ndimage.binary_dilation(surface, iterations=1)
+            surface_cpu = ndimage.binary_closing(
+                surface_cpu,
+                structure=_VOXEL_CLOSING_STRUCTURE,
+                iterations=closing_iterations,
+            )
+            return _fill_holes_cpu(surface_cpu), _gpu_fill_fallback_reason(surface.shape[0], exc)
 
     surface = ndimage.binary_dilation(surface, iterations=1)
     surface = ndimage.binary_closing(surface, structure=_VOXEL_CLOSING_STRUCTURE, iterations=closing_iterations)
-    return _fill_holes_cpu(surface)
+    return _fill_holes_cpu(surface), None
 
 
 def _rasterize_surface_python(verts_grid: np.ndarray, faces: np.ndarray, resolution: int) -> np.ndarray:
@@ -1485,7 +1574,7 @@ else:
         raise RuntimeError("Numba is unavailable")
 
 
-def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: int) -> np.ndarray:
+def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: int) -> tuple[np.ndarray, str | None]:
     mins = np.asarray([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
     scales = np.asarray(
         [
@@ -1509,7 +1598,7 @@ def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: 
         surface_u8 = _rasterize_surface_python(verts_grid, faces, resolution)
     surface = surface_u8.astype(bool, copy=False)
 
-    filled = _dilate_close_and_fill(surface, closing_iterations=1)
+    filled, fallback_reason = _dilate_close_and_fill(surface, closing_iterations=1)
 
     if not np.any(filled):
         raise MeshUploadError("Voxelization failed: no solid volume detected")
@@ -1528,19 +1617,20 @@ def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: 
         # has interior thickness; otherwise try a stronger sealing pass.
         solid_core = ndimage.binary_erosion(surface, iterations=1)
         if np.any(solid_core):
-            return surface
+            return surface, fallback_reason
 
-        sealed_filled = _dilate_close_and_fill(surface, closing_iterations=2)
+        sealed_filled, sealed_fallback_reason = _dilate_close_and_fill(surface, closing_iterations=2)
+        fallback_reason = fallback_reason or sealed_fallback_reason
         if np.any(sealed_filled) and not _touches_boundary(sealed_filled):
             sealed_core = ndimage.binary_erosion(sealed_filled, iterations=1)
             if np.any(sealed_core):
-                return sealed_filled
+                return sealed_filled, fallback_reason
 
         raise MeshUploadError(
             "Voxelization could not recover interior volume. Mesh may be self-intersecting or non-solid."
         )
 
-    return filled
+    return filled, fallback_reason
 
 
 def _touches_boundary(mask: np.ndarray) -> bool:

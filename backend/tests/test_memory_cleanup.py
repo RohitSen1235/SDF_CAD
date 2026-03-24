@@ -15,6 +15,10 @@ def test_clear_all_caches_empties_process_lru_caches() -> None:
         "uploaded_trace",
         cache.UploadedFieldPreviewTraceEntry(trace_id="uploaded_trace", created_at=0.0, route="/api/v1/mesh/field.binary"),
     )
+    cache.uploaded_mesh_preprocess_timing_store.set(
+        "uploaded_file",
+        cache.UploadedMeshPreprocessTimingEntry(created_at=0.0, preprocessing_ms=12.3),
+    )
 
     cache.clear_all_caches()
 
@@ -26,6 +30,7 @@ def test_clear_all_caches_empties_process_lru_caches() -> None:
     assert cache.uploaded_composed_field_cache.get("uploaded_composed") is None
     assert cache.uploaded_host_field_cache.get("uploaded_field") is None
     assert cache.uploaded_field_preview_trace_store.get("uploaded_trace") is None
+    assert cache.uploaded_mesh_preprocess_timing_store.get("uploaded_file") is None
 
 
 def test_clear_evaluator_caches_clears_lru_entries() -> None:
