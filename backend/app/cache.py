@@ -264,7 +264,7 @@ def hash_field_preview_request(
 
 def hash_uploaded_mesh_request(
     *,
-    file_bytes: bytes,
+    file_hash: str,
     extension: str,
     resolution: int,
     shell_thickness: float,
@@ -279,7 +279,7 @@ def hash_uploaded_mesh_request(
     field_storage_mode: str = "auto",
 ) -> str:
     payload: dict[str, Any] = {
-        "file_hash": hashlib.sha256(file_bytes).hexdigest(),
+        "file_hash": file_hash,
         "extension": extension.lower(),
         "resolution": int(resolution),
         "shell_thickness": float(shell_thickness),
@@ -299,11 +299,11 @@ def hash_uploaded_mesh_request(
 
 def hash_uploaded_mesh_metadata_request(
     *,
-    file_bytes: bytes,
+    file_hash: str,
     extension: str,
 ) -> str:
     payload: dict[str, Any] = {
-        "file_hash": hashlib.sha256(file_bytes).hexdigest(),
+        "file_hash": file_hash,
         "extension": extension.lower(),
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -312,14 +312,14 @@ def hash_uploaded_mesh_metadata_request(
 
 def hash_uploaded_mesh_host_request(
     *,
-    file_bytes: bytes,
+    file_hash: str,
     extension: str,
     resolution: int,
     compute_backend: str = "auto",
     field_storage_mode: str = "auto",
 ) -> str:
     payload: dict[str, Any] = {
-        "file_hash": hashlib.sha256(file_bytes).hexdigest(),
+        "file_hash": file_hash,
         "extension": extension.lower(),
         "resolution": int(resolution),
         "compute_backend": compute_backend,
@@ -331,7 +331,7 @@ def hash_uploaded_mesh_host_request(
 
 def hash_uploaded_mesh_field_request(
     *,
-    file_bytes: bytes,
+    file_hash: str,
     extension: str,
     resolution: int,
     shell_thickness: float,
@@ -344,7 +344,7 @@ def hash_uploaded_mesh_field_request(
     field_storage_mode: str = "auto",
 ) -> str:
     payload: dict[str, Any] = {
-        "file_hash": hashlib.sha256(file_bytes).hexdigest(),
+        "file_hash": file_hash,
         "extension": extension.lower(),
         "resolution": int(resolution),
         "shell_thickness": float(shell_thickness),

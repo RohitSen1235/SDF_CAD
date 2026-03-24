@@ -7,11 +7,11 @@ import {
   exportUploadedMesh,
   previewField,
   previewMesh,
+  preprocessUploadedMesh,
   previewUploadedMesh,
   previewUploadedMeshField,
   submitUploadedFieldPreviewTelemetry
 } from "./lib/api";
-import { parseLocalMeshPreview } from "./lib/localMeshPreview";
 import {
   CompileDiagnostics,
   ComputeBackend,
@@ -223,6 +223,7 @@ export default function App() {
   });
   const meshFieldPreviewRunIdRef = useRef(0);
   const meshFieldPreviewControllerRef = useRef<AbortController | null>(null);
+  const preprocessControllerRef = useRef<AbortController | null>(null);
   const uploadedFieldTelemetrySentRef = useRef<Set<string>>(new Set());
 
   const meshWorkflowParams = useMemo<MeshWorkflowParams>(
@@ -703,6 +704,13 @@ export default function App() {
     [uploadedFieldPreviewTrace]
   );
 
+  useEffect(() => {
+    return () => {
+      preprocessControllerRef.current?.abort();
+      preprocessControllerRef.current = null;
+    };
+  }, []);
+
   useEffect(() => cancelPendingMeshFieldPreview, [cancelPendingMeshFieldPreview]);
 
   const onSaveExpression = () => {
@@ -905,23 +913,60 @@ export default function App() {
                     aria-label="Mesh file upload"
                     onChange={(event) => {
                       const selected = event.target.files?.[0] ?? null;
+
+                      // Abort any in-flight preprocess for the previous file
+                      preprocessControllerRef.current?.abort();
+                      preprocessControllerRef.current = null;
+
                       setMeshFile(selected);
                       setField(null);
+                      setMesh(null);
                       setStats(null);
                       setUploadedFieldPreviewTrace(null);
                       setMeshCommitted(false);
                       setError(null);
+
                       if (!selected) {
-                        setMesh(null);
                         return;
                       }
-                      void parseLocalMeshPreview(selected)
-                        .then((payload) => {
-                          setMesh(payload);
+
+                      // Upload to backend immediately:
+                      //   1. Warms metadata cache for the subsequent "Preview Field"
+                      //   2. Returns the raw outer mesh for immediate display in the viewer
+                      const controller = new AbortController();
+                      preprocessControllerRef.current = controller;
+                      setIsPreviewing(true);
+
+                      preprocessUploadedMesh(
+                        selected,
+                        meshWorkflowParams,
+                        computeBackend,
+                        voxelsPerLatticePeriod,
+                        controller.signal
+                      )
+                        .then((outerMesh) => {
+                          if (preprocessControllerRef.current !== controller) {
+                            return; // Superseded by a newer file selection
+                          }
+                          setMesh(outerMesh);
                         })
-                        .catch((parseError) => {
+                        .catch((preprocessError: Error) => {
+                          if (preprocessError.name === "AbortError") {
+                            return;
+                          }
+                          if (preprocessControllerRef.current !== controller) {
+                            return;
+                          }
+                          // Preprocess failure is non-fatal — user can still click
+                          // "Preview Field" which will run the full pipeline inline
                           setMesh(null);
-                          setError((parseError as Error).message);
+                          setError(preprocessError.message);
+                        })
+                        .finally(() => {
+                          if (preprocessControllerRef.current === controller) {
+                            preprocessControllerRef.current = null;
+                            setIsPreviewing(false);
+                          }
                         });
                     }}
                   />

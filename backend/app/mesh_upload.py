@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import math
 import logging
+import os
 import struct
 from collections import defaultdict
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Literal
 
 import numpy as np
 from scipy import ndimage
+from scipy.sparse import coo_matrix
 from scipy.spatial import cKDTree
 
 from .sparse_field import OctreeField, SparseBrickField, detect_zero_crossing_blocks
@@ -39,6 +42,15 @@ try:
 except Exception:
     cndimage = None  # type: ignore[assignment]
     CUPYX_AVAILABLE = False
+
+
+def _cuda_device_available() -> bool:
+    if not CUPY_AVAILABLE or cp is None:
+        return False
+    try:
+        return int(cp.cuda.runtime.getDeviceCount()) > 0
+    except Exception:
+        return False
 
 
 class MeshUploadError(ValueError):
@@ -73,6 +85,8 @@ class HostFieldData:
 _AUTO_SPARSE_MAX_EST_NEAR_RATIO = 0.60
 _AUTO_SPARSE_MAX_EST_TRI_BLOCK_HITS = 1_200_000
 _AUTO_SPARSE_MAX_EST_TRIANGLES_PER_ACTIVE_BLOCK = 4_000.0
+_VOXEL_CLOSING_STRUCTURE = np.ones((3, 3, 3), dtype=bool)
+_VOXEL_FILL_STRUCTURE = ndimage.generate_binary_structure(3, 1)
 
 
 def _log_host_field_backend(backend: Literal["cpu", "cuda"]) -> None:
@@ -129,8 +143,16 @@ def validate_triangle_mesh(mesh: ParsedMesh) -> None:
         raise MeshUploadError("Mesh contains invalid zero-length edges")
 
     edges = np.sort(edges, axis=1)
-    _, counts = np.unique(edges, axis=0, return_counts=True)
-    if np.any(counts != 2):
+    edge_counts = coo_matrix(
+        (
+            np.ones(edges.shape[0], dtype=np.int32),
+            (edges[:, 0], edges[:, 1]),
+        ),
+        shape=(vertices.shape[0], vertices.shape[0]),
+        dtype=np.int32,
+    )
+    edge_counts.sum_duplicates()
+    if np.any(edge_counts.data != 2):
         raise MeshUploadError(
             "Mesh must be watertight and edge-manifold (each edge must be shared by exactly two triangles)"
         )
@@ -278,7 +300,7 @@ def _build_host_sdf_dense_cuda(
     bounds: list[list[float]],
     resolution: int,
 ) -> np.ndarray:
-    if not CUPY_AVAILABLE or cp is None or not CUPYX_AVAILABLE or cndimage is None:
+    if not CUPY_AVAILABLE or cp is None or not CUPYX_AVAILABLE or cndimage is None or not _cuda_device_available():
         raise MeshUploadError("CUDA dense EDT requires CuPy and cupyx.scipy.ndimage")
 
     spacing = _bounds_spacing(bounds, resolution)
@@ -496,6 +518,42 @@ def _scan_convert_block_distances(
     return min_dist_sq.reshape((i1 - i0, j1 - j0, k1 - k0))
 
 
+def _refine_octree_sparse_block(
+    triangles: np.ndarray,
+    block_candidates: dict[tuple[int, int, int], list[int]],
+    bounds: list[list[float]],
+    resolution: int,
+    block_size: int,
+    bx: int,
+    by: int,
+    bz: int,
+) -> tuple[tuple[int, int, int], np.ndarray] | None:
+    triangle_indices = block_candidates.get((bx, by, bz))
+    if not triangle_indices:
+        return None
+
+    i0 = bx * block_size
+    j0 = by * block_size
+    k0 = bz * block_size
+    i1 = min(resolution, i0 + block_size)
+    j1 = min(resolution, j0 + block_size)
+    k1 = min(resolution, k0 + block_size)
+
+    min_dist_sq = _scan_convert_block_distances(
+        triangles,
+        triangle_indices,
+        bounds,
+        resolution,
+        i0,
+        i1,
+        j0,
+        j1,
+        k0,
+        k1,
+    )
+    return (bx, by, bz), min_dist_sq
+
+
 def _estimate_sparse_profitability(
     mesh: ParsedMesh,
     bounds: list[list[float]],
@@ -522,6 +580,20 @@ def _estimate_sparse_profitability(
     if near_ratio_est >= _AUTO_SPARSE_MAX_EST_NEAR_RATIO:
         return False, "dense_auto_gate_near_ratio", near_ratio_est, 0, 0.0
 
+    triangles = np.ascontiguousarray(mesh.vertices[mesh.faces], dtype=np.float64)
+    tri_min = np.min(triangles, axis=1) - band_distance
+    tri_max = np.max(triangles, axis=1) + band_distance
+
+    tri_block_min = np.floor((tri_min - origin[None, :]) / spacing_vec[None, :]).astype(np.int64)
+    tri_block_max = np.ceil((tri_max - origin[None, :]) / spacing_vec[None, :]).astype(np.int64)
+    np.clip(tri_block_min, 0, resolution - 1, out=tri_block_min)
+    np.clip(tri_block_max, 0, resolution - 1, out=tri_block_max)
+
+    tri_block_min //= block_size
+    tri_block_max //= block_size
+    np.minimum(tri_block_min, blocks_per_axis - 1, out=tri_block_min)
+    np.minimum(tri_block_max, blocks_per_axis - 1, out=tri_block_max)
+
     bx0 = i0 // block_size
     by0 = j0 // block_size
     bz0 = k0 // block_size
@@ -530,35 +602,23 @@ def _estimate_sparse_profitability(
     bz1 = min(blocks_per_axis - 1, k1 // block_size)
     estimated_active_blocks = max(1, (bx1 - bx0 + 1) * (by1 - by0 + 1) * (bz1 - bz0 + 1))
 
-    tri_block_hits_est = 0
-    for f0, f1, f2 in mesh.faces:
-        triangle = mesh.vertices[[int(f0), int(f1), int(f2)]]
-        tri_min = np.min(triangle, axis=0) - band_distance
-        tri_max = np.max(triangle, axis=0) + band_distance
-        ti0 = _grid_index_floor(float(tri_min[0]), float(origin[0]), float(spacing_vec[0]), resolution)
-        tj0 = _grid_index_floor(float(tri_min[1]), float(origin[1]), float(spacing_vec[1]), resolution)
-        tk0 = _grid_index_floor(float(tri_min[2]), float(origin[2]), float(spacing_vec[2]), resolution)
-        ti1 = _grid_index_ceil(float(tri_max[0]), float(origin[0]), float(spacing_vec[0]), resolution)
-        tj1 = _grid_index_ceil(float(tri_max[1]), float(origin[1]), float(spacing_vec[1]), resolution)
-        tk1 = _grid_index_ceil(float(tri_max[2]), float(origin[2]), float(spacing_vec[2]), resolution)
+    tri_block_spans = (tri_block_max - tri_block_min + 1).astype(np.int64)
+    tri_block_hits = np.maximum(1, np.prod(tri_block_spans, axis=1))
+    tri_block_hits_cumsum = np.cumsum(tri_block_hits, dtype=np.int64)
+    exceed_mask = tri_block_hits_cumsum > _AUTO_SPARSE_MAX_EST_TRI_BLOCK_HITS
+    if np.any(exceed_mask):
+        exceed_idx = int(np.argmax(exceed_mask))
+        tri_block_hits_est = int(tri_block_hits_cumsum[exceed_idx])
+        triangles_per_active_block_est = float(tri_block_hits_est) / float(estimated_active_blocks)
+        return (
+            False,
+            "dense_auto_gate_tri_block_hits",
+            near_ratio_est,
+            tri_block_hits_est,
+            triangles_per_active_block_est,
+        )
 
-        tbx0 = ti0 // block_size
-        tby0 = tj0 // block_size
-        tbz0 = tk0 // block_size
-        tbx1 = min(blocks_per_axis - 1, ti1 // block_size)
-        tby1 = min(blocks_per_axis - 1, tj1 // block_size)
-        tbz1 = min(blocks_per_axis - 1, tk1 // block_size)
-        tri_block_hits_est += max(1, (tbx1 - tbx0 + 1) * (tby1 - tby0 + 1) * (tbz1 - tbz0 + 1))
-        if tri_block_hits_est > _AUTO_SPARSE_MAX_EST_TRI_BLOCK_HITS:
-            triangles_per_active_block_est = float(tri_block_hits_est) / float(estimated_active_blocks)
-            return (
-                False,
-                "dense_auto_gate_tri_block_hits",
-                near_ratio_est,
-                tri_block_hits_est,
-                triangles_per_active_block_est,
-            )
-
+    tri_block_hits_est = int(tri_block_hits_cumsum[-1])
     triangles_per_active_block_est = float(tri_block_hits_est) / float(estimated_active_blocks)
     if triangles_per_active_block_est > _AUTO_SPARSE_MAX_EST_TRIANGLES_PER_ACTIVE_BLOCK:
         return (
@@ -765,12 +825,64 @@ def _build_host_sdf_octree_sparse(
     host_sdf = sign * far_value
     band_distance_sq = band_distance * band_distance
     refined_blocks: list[tuple[int, int, int]] = []
+    block_tasks = [block for block in active_blocks if block_candidates.get(block)]
 
-    for bx, by, bz in active_blocks:
-        triangle_indices = block_candidates.get((bx, by, bz))
-        if not triangle_indices:
-            continue
+    if not block_tasks:
+        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+            occupancy,
+            bounds,
+            resolution,
+            compute_backend=compute_backend,
+        )
+        return host_sdf, None, None, None, "dense_sparse_no_refined_blocks", host_backend
 
+    max_workers = min(len(block_tasks), os.cpu_count() or 1)
+    block_results: list[tuple[tuple[int, int, int], np.ndarray]] = []
+    if max_workers <= 1:
+        for bx, by, bz in block_tasks:
+            result = _refine_octree_sparse_block(
+                triangles,
+                block_candidates,
+                bounds,
+                resolution,
+                block_size,
+                bx,
+                by,
+                bz,
+            )
+            if result is not None:
+                block_results.append(result)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    _refine_octree_sparse_block,
+                    triangles,
+                    block_candidates,
+                    bounds,
+                    resolution,
+                    block_size,
+                    bx,
+                    by,
+                    bz,
+                )
+                for bx, by, bz in block_tasks
+            ]
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    block_results.append(result)
+
+    if not block_results:
+        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+            occupancy,
+            bounds,
+            resolution,
+            compute_backend=compute_backend,
+        )
+        return host_sdf, None, None, None, "dense_sparse_no_refined_blocks", host_backend
+
+    for (bx, by, bz), min_dist_sq in sorted(block_results, key=lambda item: item[0]):
         i0 = bx * block_size
         j0 = by * block_size
         k0 = bz * block_size
@@ -778,18 +890,6 @@ def _build_host_sdf_octree_sparse(
         j1 = min(resolution, j0 + block_size)
         k1 = min(resolution, k0 + block_size)
 
-        min_dist_sq = _scan_convert_block_distances(
-            triangles,
-            triangle_indices,
-            bounds,
-            resolution,
-            i0,
-            i1,
-            j0,
-            j1,
-            k0,
-            k1,
-        )
         within_band = np.isfinite(min_dist_sq) & (min_dist_sq <= band_distance_sq)
         if not np.any(within_band):
             continue
@@ -801,15 +901,6 @@ def _build_host_sdf_octree_sparse(
         current[within_band] = signed_block[within_band]
         host_sdf[i0:i1, j0:j1, k0:k1] = current
         refined_blocks.append((bx, by, bz))
-
-    if not refined_blocks:
-        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
-            occupancy,
-            bounds,
-            resolution,
-            compute_backend=compute_backend,
-        )
-        return host_sdf, None, None, None, "dense_sparse_no_refined_blocks", host_backend
 
     strategy_reason = "sparse_selected_auto" if allow_dense_fallback else "sparse_selected_explicit"
     return host_sdf, block_size, refined_blocks, float(far_value), strategy_reason, "cpu"
@@ -873,8 +964,8 @@ def _resolve_compute_backend(requested: Literal["auto", "cpu", "cuda"]) -> Liter
     if requested == "cpu":
         return "cpu"
     if requested == "cuda":
-        return "cuda" if CUPY_AVAILABLE else "cpu"
-    return "cuda" if CUPY_AVAILABLE else "cpu"
+        return "cuda" if _cuda_device_available() else "cpu"
+    return "cuda" if _cuda_device_available() else "cpu"
 
 
 def compose_hollow_lattice_field_with_backend(
@@ -984,7 +1075,7 @@ def _compose_hollow_lattice_field_cuda(
     lattice_thickness: float,
     lattice_phase: float,
 ) -> np.ndarray:
-    if not CUPY_AVAILABLE or cp is None:
+    if not CUPY_AVAILABLE or cp is None or not _cuda_device_available():
         raise MeshUploadError("CUDA backend requested but CuPy is not available")
     if shell_thickness <= 0.0:
         raise MeshUploadError("shell_thickness must be > 0")
@@ -1245,6 +1336,50 @@ def _clip_round_index(value: float, resolution: int) -> int:
     return idx
 
 
+def _fill_holes_cpu(surface: np.ndarray) -> np.ndarray:
+    background = np.logical_not(surface)
+    labels, num_labels = ndimage.label(background, structure=_VOXEL_FILL_STRUCTURE)
+    if num_labels == 0:
+        return surface
+
+    boundary_labels = np.unique(
+        np.concatenate(
+            [
+                labels[0, :, :].ravel(),
+                labels[-1, :, :].ravel(),
+                labels[:, 0, :].ravel(),
+                labels[:, -1, :].ravel(),
+                labels[:, :, 0].ravel(),
+                labels[:, :, -1].ravel(),
+            ]
+        )
+    )
+    boundary_labels = boundary_labels[boundary_labels != 0]
+    fillable = np.ones(num_labels + 1, dtype=bool)
+    fillable[0] = False
+    if boundary_labels.size:
+        fillable[boundary_labels] = False
+    return np.logical_or(surface, fillable[labels])
+
+
+def _dilate_close_and_fill(surface: np.ndarray, *, closing_iterations: int = 1) -> np.ndarray:
+    if CUPYX_AVAILABLE and cp is not None and _cuda_device_available():
+        surface_gpu = cp.asarray(surface)
+        closing_structure = cp.asarray(_VOXEL_CLOSING_STRUCTURE)
+        surface_gpu = cndimage.binary_dilation(surface_gpu, iterations=1)
+        surface_gpu = cndimage.binary_closing(
+            surface_gpu,
+            structure=closing_structure,
+            iterations=closing_iterations,
+        )
+        surface_gpu = cndimage.binary_fill_holes(surface_gpu)
+        return cp.asnumpy(surface_gpu)
+
+    surface = ndimage.binary_dilation(surface, iterations=1)
+    surface = ndimage.binary_closing(surface, structure=_VOXEL_CLOSING_STRUCTURE, iterations=closing_iterations)
+    return _fill_holes_cpu(surface)
+
+
 def _rasterize_surface_python(verts_grid: np.ndarray, faces: np.ndarray, resolution: int) -> np.ndarray:
     surface = np.zeros((resolution, resolution, resolution), dtype=np.uint8)
     for f0, f1, f2 in faces:
@@ -1374,10 +1509,8 @@ def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: 
         surface_u8 = _rasterize_surface_python(verts_grid, faces, resolution)
     surface = surface_u8.astype(bool, copy=False)
 
-    surface = ndimage.binary_dilation(surface, iterations=1)
-    surface = ndimage.binary_closing(surface, structure=np.ones((3, 3, 3), dtype=bool), iterations=1)
+    filled = _dilate_close_and_fill(surface, closing_iterations=1)
 
-    filled = ndimage.binary_fill_holes(surface)
     if not np.any(filled):
         raise MeshUploadError("Voxelization failed: no solid volume detected")
 
@@ -1397,8 +1530,7 @@ def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: 
         if np.any(solid_core):
             return surface
 
-        sealed = ndimage.binary_closing(surface, structure=np.ones((3, 3, 3), dtype=bool), iterations=2)
-        sealed_filled = ndimage.binary_fill_holes(sealed)
+        sealed_filled = _dilate_close_and_fill(surface, closing_iterations=2)
         if np.any(sealed_filled) and not _touches_boundary(sealed_filled):
             sealed_core = ndimage.binary_erosion(sealed_filled, iterations=1)
             if np.any(sealed_core):

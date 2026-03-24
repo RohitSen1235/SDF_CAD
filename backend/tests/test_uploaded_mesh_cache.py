@@ -1,3 +1,4 @@
+import hashlib
 import time
 
 import pytest
@@ -15,6 +16,7 @@ f 1 2 4
 f 2 3 4
 f 3 1 4
 """
+MESH_OBJ_HASH = hashlib.sha256(MESH_OBJ).hexdigest()
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +40,7 @@ def test_uploaded_mesh_preview_reuses_composed_field_after_field_preview(monkeyp
 
     _, _, field_stats = main_module._run_uploaded_mesh_field_preview_data(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=0.08,
         lattice_type="gyroid",
@@ -49,6 +52,7 @@ def test_uploaded_mesh_preview_reuses_composed_field_after_field_preview(monkeyp
 
     _, mesh_stats, field_payload, mesh_payload = main_module._run_uploaded_mesh_preview_meshdata(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=0.08,
         lattice_type="gyroid",
@@ -78,6 +82,7 @@ def test_uploaded_mesh_preview_reuses_full_mesh_cache_on_second_commit(monkeypat
 
     _, _, field_stats = main_module._run_uploaded_mesh_field_preview_data(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=0.08,
         lattice_type="gyroid",
@@ -89,6 +94,7 @@ def test_uploaded_mesh_preview_reuses_full_mesh_cache_on_second_commit(monkeypat
 
     _, first_mesh_stats, _, _ = main_module._run_uploaded_mesh_preview_meshdata(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=0.08,
         lattice_type="gyroid",
@@ -102,6 +108,7 @@ def test_uploaded_mesh_preview_reuses_full_mesh_cache_on_second_commit(monkeypat
 
     _, second_mesh_stats, field_payload, mesh_payload = main_module._run_uploaded_mesh_preview_meshdata(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=0.08,
         lattice_type="gyroid",
@@ -131,6 +138,7 @@ def test_uploaded_binary_preview_seeds_and_reuses_full_mesh_cache(monkeypatch: p
 
     _, first_stats, field_payload, mesh_payload = main_module._run_uploaded_mesh_preview_meshdata(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=0.08,
         lattice_type="gyroid",
@@ -147,6 +155,7 @@ def test_uploaded_binary_preview_seeds_and_reuses_full_mesh_cache(monkeypatch: p
 
     mesh, second_stats, field_payload, mesh_payload = main_module._run_uploaded_mesh_preview_meshdata(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=0.08,
         lattice_type="gyroid",
@@ -181,6 +190,7 @@ def test_uploaded_composed_field_cache_ignores_mesh_settings_but_invalidates_on_
 
     _, first_stats, _, _ = main_module._run_uploaded_mesh_preview_meshdata(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=0.08,
         lattice_type="gyroid",
@@ -199,6 +209,7 @@ def test_uploaded_composed_field_cache_ignores_mesh_settings_but_invalidates_on_
 
     _, second_stats, _, _ = main_module._run_uploaded_mesh_preview_meshdata(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=0.08,
         lattice_type="gyroid",
@@ -218,6 +229,7 @@ def test_uploaded_composed_field_cache_ignores_mesh_settings_but_invalidates_on_
 
     _, third_stats, _, _ = main_module._run_uploaded_mesh_preview_meshdata(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=0.08,
         lattice_type="gyroid",
@@ -235,6 +247,7 @@ def test_uploaded_composed_field_cache_ignores_mesh_settings_but_invalidates_on_
 
     _, fourth_stats, _, _ = main_module._run_uploaded_mesh_preview_meshdata(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=0.08,
         lattice_type="gyroid",
@@ -262,23 +275,31 @@ def test_uploaded_metadata_cache_avoids_reparsing_for_resolution(monkeypatch: py
 
     monkeypatch.setattr(main_module, "parse_mesh_bytes", track_parse)
 
-    first = main_module._compute_mesh_upload_resolution(MESH_OBJ, ".obj", 0.45, 6)
-    second = main_module._compute_mesh_upload_resolution(MESH_OBJ, ".obj", 0.45, 6)
+    first = main_module._compute_mesh_upload_resolution(MESH_OBJ, MESH_OBJ_HASH, ".obj", 0.45, 6)
+    second = main_module._compute_mesh_upload_resolution(MESH_OBJ, MESH_OBJ_HASH, ".obj", 0.45, 6)
 
+    expected, _ = main_module._resolve_mesh_resolution(0.45, 1.0, 6)
+    assert first == expected
     assert first == second
     assert calls["parse"] == 1
 
 
 def test_uploaded_host_cache_returns_shared_immutable_arrays() -> None:
-    metadata = main_module._resolve_uploaded_mesh_metadata(file_bytes=MESH_OBJ, extension=".obj")
+    metadata = main_module._resolve_uploaded_mesh_metadata(
+        file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
+        extension=".obj",
+    )
     first = main_module._resolve_uploaded_host_field(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         resolution=24,
         parsed=metadata.parsed,
     )
     second = main_module._resolve_uploaded_host_field(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         resolution=24,
         parsed=metadata.parsed,
@@ -299,6 +320,7 @@ def test_uploaded_host_cache_returns_shared_immutable_arrays() -> None:
 def test_uploaded_field_preview_audit_reports_zero_compose_time_on_cache_hit() -> None:
     _, _, _, first_audit = main_module._run_uploaded_mesh_field_preview_data_with_audit(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=0.08,
         lattice_type="gyroid",
@@ -308,6 +330,7 @@ def test_uploaded_field_preview_audit_reports_zero_compose_time_on_cache_hit() -
     )
     _, _, _, second_audit = main_module._run_uploaded_mesh_field_preview_data_with_audit(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=0.08,
         lattice_type="gyroid",

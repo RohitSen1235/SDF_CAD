@@ -81,11 +81,14 @@ def export_mesh_job(payload: dict[str, Any]) -> dict[str, Any]:
 
 @celery_app.task(name="jobs.preview_uploaded_mesh")
 def preview_uploaded_mesh_job(payload: dict[str, Any]) -> dict[str, Any]:
-    from .main import _run_uploaded_mesh_preview
+    from .main import _hash_uploaded_mesh_bytes, _run_uploaded_mesh_preview
 
     try:
+        file_bytes = base64.b64decode(str(payload["file_data_b64"]))
+        file_hash = str(payload.get("file_hash") or _hash_uploaded_mesh_bytes(file_bytes))
         preview = _run_uploaded_mesh_preview(
-            file_bytes=base64.b64decode(str(payload["file_data_b64"])),
+            file_bytes=file_bytes,
+            file_hash=file_hash,
             extension=str(payload["extension"]),
             shell_thickness=float(payload["shell_thickness"]),
             lattice_type=str(payload["lattice_type"]),
@@ -105,11 +108,14 @@ def preview_uploaded_mesh_job(payload: dict[str, Any]) -> dict[str, Any]:
 
 @celery_app.task(name="jobs.export_uploaded_mesh")
 def export_uploaded_mesh_job(payload: dict[str, Any]) -> dict[str, Any]:
-    from .main import _run_uploaded_mesh_preview_meshdata
+    from .main import _hash_uploaded_mesh_bytes, _run_uploaded_mesh_preview_meshdata
 
     try:
+        file_bytes = base64.b64decode(str(payload["file_data_b64"]))
+        file_hash = str(payload.get("file_hash") or _hash_uploaded_mesh_bytes(file_bytes))
         mesh, _, _, _ = _run_uploaded_mesh_preview_meshdata(
-            file_bytes=base64.b64decode(str(payload["file_data_b64"])),
+            file_bytes=file_bytes,
+            file_hash=file_hash,
             extension=str(payload["extension"]),
             shell_thickness=float(payload["shell_thickness"]),
             lattice_type=str(payload["lattice_type"]),

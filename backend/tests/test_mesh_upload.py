@@ -1,3 +1,4 @@
+import hashlib
 import struct
 from types import SimpleNamespace
 
@@ -135,6 +136,23 @@ def test_validate_accepts_closed_obj_mesh() -> None:
     assert np.all(np.isfinite(mesh.vertices))
 
 
+def test_validate_rejects_non_manifold_edge_mesh() -> None:
+    payload = b"""
+v 0 0 0
+v 1 0 0
+v 0 1 0
+v 0 0 1
+f 1 3 2
+f 1 2 4
+f 2 3 4
+f 3 1 4
+f 1 3 2
+"""
+    mesh = parse_mesh_bytes(payload, ".obj")
+    with pytest.raises(MeshUploadError, match="watertight"):
+        validate_triangle_mesh(mesh)
+
+
 def test_numba_rasterization_topology_equivalent_to_python() -> None:
     if not mesh_upload.NUMBA_AVAILABLE:
         pytest.skip("Numba is not available in this environment")
@@ -183,6 +201,26 @@ def test_voxelize_falls_back_when_numba_kernel_fails(monkeypatch: pytest.MonkeyP
     filled = mesh_upload._voxelize_and_fill(mesh, bounds, resolution=40)
     assert called["python"] is True
     assert np.any(filled)
+
+
+def test_voxelize_cpu_fill_recovers_hollow_interior(monkeypatch: pytest.MonkeyPatch) -> None:
+    mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
+    bounds = mesh_upload._build_bounds(mesh)
+    resolution = 16
+    synthetic = np.zeros((resolution, resolution, resolution), dtype=np.uint8)
+    synthetic[3:13, 3:13, 3:13] = 1
+    synthetic[5:11, 5:11, 5:11] = 0
+
+    monkeypatch.setattr(mesh_upload, "NUMBA_AVAILABLE", False)
+    monkeypatch.setattr(mesh_upload, "CUPYX_AVAILABLE", False)
+    monkeypatch.setattr(mesh_upload, "_rasterize_surface_python", lambda *_args, **_kwargs: synthetic)
+
+    filled = mesh_upload._voxelize_and_fill(mesh, bounds, resolution=resolution)
+
+    assert filled.dtype == bool
+    assert filled.shape == synthetic.shape
+    assert filled[8, 8, 8]
+    assert np.count_nonzero(filled) > np.count_nonzero(synthetic)
 
 
 def test_build_host_field_defaults_to_dense_host_sdf_metadata() -> None:
@@ -256,6 +294,84 @@ def test_octree_sparse_host_sdf_scan_conversion_matches_cube_face_distance() -> 
     assert host_sdf[ix_outside, iy, iz] > 0.0
     assert abs(float(host_sdf[ix_inside, iy, iz]) - expected_inside) <= (1.5 * spacing)
     assert abs(float(host_sdf[ix_outside, iy, iz]) - expected_outside) <= (1.5 * spacing)
+
+
+def test_octree_sparse_host_sdf_uses_thread_pool_for_block_refinement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
+    bounds = mesh_upload._build_bounds(mesh)
+    resolution = 128
+    occupancy = np.zeros((resolution, resolution, resolution), dtype=bool)
+
+    block_size = max(8, min(32, resolution // 6))
+    active_blocks = [(0, 0, 0), (1, 0, 0)]
+    block_shape = (block_size, block_size, block_size)
+    triangles = np.zeros((1, 3, 3), dtype=np.float64)
+    block_candidates = {block: [0] for block in active_blocks}
+
+    class FakeFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+    class FakeExecutor:
+        instances = []
+
+        def __init__(self, max_workers: int):
+            self.max_workers = max_workers
+            self.submitted = []
+
+        def __enter__(self):
+            self.instances.append(self)
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            self.submitted.append((args, kwargs))
+            return FakeFuture(fn(*args, **kwargs))
+
+    monkeypatch.setattr(mesh_upload.os, "cpu_count", lambda: 4)
+    monkeypatch.setattr(mesh_upload, "ThreadPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(mesh_upload, "as_completed", lambda futures: futures)
+    monkeypatch.setattr(
+        mesh_upload,
+        "_estimate_sparse_profitability",
+        lambda *_args, **_kwargs: (True, "sparse_selected_auto", 0.1, 1, 1.0),
+    )
+    monkeypatch.setattr(
+        mesh_upload,
+        "_triangle_scan_convert_candidates",
+        lambda *_args, **_kwargs: (triangles, block_candidates, active_blocks, 0.2),
+    )
+    monkeypatch.setattr(
+        mesh_upload,
+        "_scan_convert_block_distances",
+        lambda *_args, **_kwargs: np.zeros(block_shape, dtype=np.float64),
+    )
+
+    host_sdf, block_size_out, refined_blocks, sparse_background_value, decision_reason, host_backend = (
+        mesh_upload._build_host_sdf_octree_sparse(
+            mesh,
+            occupancy,
+            bounds,
+            resolution,
+        )
+    )
+
+    assert FakeExecutor.instances
+    assert FakeExecutor.instances[0].max_workers == 2
+    assert len(FakeExecutor.instances[0].submitted) == 2
+    assert block_size_out == block_size
+    assert refined_blocks == active_blocks
+    assert sparse_background_value is not None
+    assert decision_reason.startswith("sparse_selected")
+    assert host_backend == "cpu"
+    assert host_sdf.shape == occupancy.shape
 
 
 def test_build_host_field_auto_short_circuits_before_triangle_candidate_work(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -431,6 +547,7 @@ def test_uploaded_host_field_threads_compute_backend_to_builder(
 
     result = main_module._resolve_uploaded_host_field(
         file_bytes=_tetra_obj_bytes(),
+        file_hash=hashlib.sha256(_tetra_obj_bytes()).hexdigest(),
         extension=".obj",
         resolution=48,
         compute_backend="cuda",
