@@ -365,6 +365,7 @@ def _weld_vertices(
 
     quantized = np.rint(vertices / quant).astype(np.int64)
     _, unique_idx, inverse = np.unique(quantized, axis=0, return_index=True, return_inverse=True)
+    del quantized
     welded_vertices = vertices[unique_idx]
     welded_faces = inverse[faces]
 
@@ -480,6 +481,8 @@ def _mesh_single_cuda(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
 
     vertices = cp.asnumpy(vertices_flat).reshape(-1, 3).astype(np.float64, copy=False)
     faces = cp.asnumpy(faces_flat).reshape(-1, 3).astype(np.int32, copy=False)
+    del vertices_flat, faces_flat, tri_counts, tri_offsets, volume
+    cp.get_default_memory_pool().free_all_blocks()
     vertices, faces = _weld_vertices(vertices, faces)
     normals = _compute_vertex_normals(vertices, faces)
     return MeshData(vertices=vertices, faces=faces, normals=normals)

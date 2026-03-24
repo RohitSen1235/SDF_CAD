@@ -1,5 +1,6 @@
 import json
 import base64
+import io
 import hashlib
 from types import SimpleNamespace
 
@@ -759,9 +760,9 @@ def test_preprocess_endpoint_returns_memory_context_headers(monkeypatch: pytest.
             available_cpu_bytes=1024,
             available_gpu_free_bytes=2048,
             available_gpu_total_bytes=4096,
-            cpu_bytes_per_voxel=32.0,
-            gpu_bytes_per_voxel=40.0,
-            safety_factor=1.25,
+            cpu_bytes_per_voxel=48.0,
+            gpu_bytes_per_voxel=56.0,
+            safety_factor=1.0,
         )
         estimate = main_module.UploadedMeshMemoryEstimate(
             context=context,
@@ -786,14 +787,15 @@ def test_preprocess_endpoint_returns_memory_context_headers(monkeypatch: pytest.
     assert response.headers["x-sdf-available-cpu-bytes"] == "1024"
     assert response.headers["x-sdf-available-gpu-free-bytes"] == "2048"
     assert response.headers["x-sdf-available-gpu-total-bytes"] == "4096"
-    assert response.headers["x-sdf-cpu-bytes-per-voxel"] == "32.0"
-    assert response.headers["x-sdf-gpu-bytes-per-voxel"] == "40.0"
-    assert response.headers["x-sdf-memory-safety-factor"] == "1.25"
+    assert response.headers["x-sdf-cpu-bytes-per-voxel"] == "48.0"
+    assert response.headers["x-sdf-gpu-bytes-per-voxel"] == "56.0"
+    assert response.headers["x-sdf-memory-safety-factor"] == "1.0"
 
 
 def test_available_cpu_memory_probe_graceful_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main_module.os, "sysconf", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("boom")))
     monkeypatch.setattr(main_module.os, "sysconf_names", {})
+    monkeypatch.setattr(main_module, "_read_cgroup_memory_headroom_bytes", lambda: None)
 
     import builtins
 
@@ -803,6 +805,28 @@ def test_available_cpu_memory_probe_graceful_fallback(monkeypatch: pytest.Monkey
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("boom")),
     )
     assert main_module._available_cpu_memory_bytes() is None
+
+
+def test_available_cpu_memory_probe_prefers_memavailable_over_sysconf(monkeypatch: pytest.MonkeyPatch) -> None:
+    meminfo = "MemTotal:       16198740 kB\nMemAvailable:    6895560 kB\n"
+
+    monkeypatch.setattr(main_module, "_read_cgroup_memory_headroom_bytes", lambda: None)
+    monkeypatch.setattr(main_module.os, "sysconf_names", {"SC_AVPHYS_PAGES": 1, "SC_PAGE_SIZE": 1})
+    monkeypatch.setattr(
+        main_module.os,
+        "sysconf",
+        lambda name: 1024 if name == "SC_AVPHYS_PAGES" else 4096,
+    )
+
+    import builtins
+
+    monkeypatch.setattr(
+        builtins,
+        "open",
+        lambda path, *args, **kwargs: io.StringIO(meminfo) if path == "/proc/meminfo" else (_ for _ in ()).throw(AssertionError(path)),
+    )
+
+    assert main_module._available_cpu_memory_bytes() == 6895560 * 1024
 
 
 def test_preprocess_endpoint_warms_metadata_cache(monkeypatch: pytest.MonkeyPatch) -> None:

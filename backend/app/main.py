@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import asyncio
 import base64
 import binascii
@@ -159,9 +160,9 @@ MESH_UPLOAD_MAX_RESOLUTION = 1024
 MESH_UPLOAD_MAX_BYTES = 200 * 1024 * 1024
 AUTO_QUEUE_RESOLUTION_THRESHOLD = 128
 AUTO_QUEUE_UPLOAD_BYTES_THRESHOLD = 8 * 1024 * 1024
-MEMORY_MODEL_CPU_BYTES_PER_VOXEL = 32.0
-MEMORY_MODEL_GPU_BYTES_PER_VOXEL = 40.0
-MEMORY_MODEL_SAFETY_FACTOR = 1.25
+MEMORY_MODEL_CPU_BYTES_PER_VOXEL = 48.0
+MEMORY_MODEL_GPU_BYTES_PER_VOXEL = 56.0
+MEMORY_MODEL_SAFETY_FACTOR = 1.0
 
 app = FastAPI(title="SDF CAD", version="0.2.0")
 
@@ -1049,17 +1050,7 @@ def _resolve_uploaded_mesh_metadata(
     )
 
 
-def _available_cpu_memory_bytes() -> int | None:
-    try:
-        if "SC_AVPHYS_PAGES" in os.sysconf_names and "SC_PAGE_SIZE" in os.sysconf_names:
-            pages = int(os.sysconf("SC_AVPHYS_PAGES"))
-            page_size = int(os.sysconf("SC_PAGE_SIZE"))
-            available = pages * page_size
-            if available > 0:
-                return available
-    except Exception:
-        pass
-
+def _read_linux_mem_available_bytes() -> int | None:
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as handle:
             for line in handle:
@@ -1076,6 +1067,107 @@ def _available_cpu_memory_bytes() -> int | None:
     return None
 
 
+def _read_sysconf_available_bytes() -> int | None:
+    try:
+        if "SC_AVPHYS_PAGES" in os.sysconf_names and "SC_PAGE_SIZE" in os.sysconf_names:
+            pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            available = pages * page_size
+            if available > 0:
+                return available
+    except Exception:
+        pass
+    return None
+
+
+def _read_positive_int_file(path: Path) -> int | None:
+    try:
+        raw_value = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+
+    if not raw_value or raw_value == "max":
+        return None
+
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return None
+
+    # cgroup v1 uses a very large sentinel for "unlimited" memory.
+    if value <= 0 or value >= 1 << 60:
+        return None
+    return value
+
+
+def _read_cgroup_relative_path(controller: str | None = None) -> str | None:
+    try:
+        with open("/proc/self/cgroup", "r", encoding="utf-8") as handle:
+            for line in handle:
+                parts = line.strip().split(":", 2)
+                if len(parts) != 3:
+                    continue
+                _, controllers, path = parts
+                if controller is None:
+                    if controllers == "":
+                        return path
+                elif controller in controllers.split(","):
+                    return path
+    except Exception:
+        pass
+    return None
+
+
+def _read_cgroup_memory_headroom_bytes() -> int | None:
+    candidates: list[tuple[Path, str, str]] = []
+
+    cgroup_v2_path = _read_cgroup_relative_path(None)
+    if cgroup_v2_path is not None:
+        base = Path("/sys/fs/cgroup") / cgroup_v2_path.lstrip("/")
+        candidates.append((base, "memory.max", "memory.current"))
+
+    cgroup_v1_path = _read_cgroup_relative_path("memory")
+    if cgroup_v1_path is not None:
+        base = Path("/sys/fs/cgroup/memory") / cgroup_v1_path.lstrip("/")
+        candidates.append((base, "memory.limit_in_bytes", "memory.usage_in_bytes"))
+
+    for base, limit_name, usage_name in candidates:
+        limit_bytes = _read_positive_int_file(base / limit_name)
+        usage_bytes = _read_positive_int_file(base / usage_name)
+        if limit_bytes is None or usage_bytes is None:
+            continue
+        headroom = limit_bytes - usage_bytes
+        if headroom <= 0:
+            return 0
+        return headroom
+
+    return None
+
+
+def _available_cpu_memory_bytes() -> int | None:
+    host_available = _read_linux_mem_available_bytes()
+    if host_available is None:
+        host_available = _read_sysconf_available_bytes()
+
+    cgroup_headroom = _read_cgroup_memory_headroom_bytes()
+    if host_available is None:
+        return cgroup_headroom
+    if cgroup_headroom is None:
+        return host_available
+
+    available = min(host_available, cgroup_headroom)
+    delta = abs(host_available - cgroup_headroom)
+    bigger = max(host_available, cgroup_headroom)
+    if delta >= 512 * 1024 * 1024 or delta / float(bigger) >= 0.20:
+        logger.debug(
+            "cpu_memory_probe host_memavailable=%d cgroup_headroom=%d selected=%d",
+            host_available,
+            cgroup_headroom,
+            available,
+        )
+    return available
+
+
 def _available_gpu_memory_bytes() -> tuple[int | None, int | None]:
     if not CUPY_RUNTIME_AVAILABLE or _cupy is None:
         return None, None
@@ -1090,6 +1182,26 @@ def _available_gpu_memory_bytes() -> tuple[int | None, int | None]:
         return free_bytes, total_bytes
     except Exception:
         return None, None
+
+
+def _maybe_evict_uploaded_composed_field_cache_before_meshing(field: np.ndarray) -> bool:
+    available_cpu = _available_cpu_memory_bytes()
+    if available_cpu is None:
+        return False
+    field_bytes = int(field.nbytes)
+    # Keep the cache if there is enough room for the live field plus a rough
+    # meshing working set. Otherwise drop the cached composed field copy.
+    if available_cpu >= field_bytes * 4:
+        return False
+
+    uploaded_composed_field_cache.clear()
+    gc.collect()
+    logger.debug(
+        "evicted_uploaded_composed_field_cache_before_meshing field_bytes=%d available_cpu=%d",
+        field_bytes,
+        available_cpu,
+    )
+    return True
 
 
 def _snapshot_uploaded_mesh_memory_context(mesh_span: float) -> UploadedMeshMemoryContext:
@@ -1893,6 +2005,7 @@ def _run_uploaded_mesh_preview_meshdata(
     eval_ms = composed.eval_ms
     field_cache_hit = composed.field_cache_hit
 
+    _maybe_evict_uploaded_composed_field_cache_before_meshing(field)
     mesh_start = time.perf_counter()
     mesher_start = time.perf_counter()
     generated, mesh_backend_used = build_mesh_with_backend(
@@ -2907,6 +3020,7 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
             # Phase 2: meshing — also offloaded to thread pool.
             def _compute_mesh_phase():
                 try:
+                    _maybe_evict_uploaded_composed_field_cache_before_meshing(field)
                     mesh_start = time.perf_counter()
                     generated, mesh_backend_used = build_mesh_with_backend(
                         field,

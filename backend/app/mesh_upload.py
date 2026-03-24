@@ -914,7 +914,28 @@ def _build_host_sdf_octree_sparse(
         return host_sdf, None, None, None, "dense_sparse_no_refined_blocks", host_backend
 
     max_workers = min(len(block_tasks), os.cpu_count() or 1)
-    block_results: list[tuple[tuple[int, int, int], np.ndarray]] = []
+
+    def apply_block_result(block_key: tuple[int, int, int], min_dist_sq: np.ndarray) -> None:
+        bx, by, bz = block_key
+        i0 = bx * block_size
+        j0 = by * block_size
+        k0 = bz * block_size
+        i1 = min(resolution, i0 + block_size)
+        j1 = min(resolution, j0 + block_size)
+        k1 = min(resolution, k0 + block_size)
+
+        within_band = np.isfinite(min_dist_sq) & (min_dist_sq <= band_distance_sq)
+        if not np.any(within_band):
+            return
+
+        dist_block = np.full_like(min_dist_sq, far_value, dtype=np.float64)
+        np.sqrt(min_dist_sq, out=dist_block, where=within_band)
+        signed_block = dist_block.astype(np.float32, copy=False) * sign[i0:i1, j0:j1, k0:k1]
+        current = host_sdf[i0:i1, j0:j1, k0:k1]
+        current[within_band] = signed_block[within_band]
+        host_sdf[i0:i1, j0:j1, k0:k1] = current
+        refined_blocks.append((bx, by, bz))
+
     if max_workers <= 1:
         for bx, by, bz in block_tasks:
             result = _refine_octree_sparse_block(
@@ -928,7 +949,7 @@ def _build_host_sdf_octree_sparse(
                 bz,
             )
             if result is not None:
-                block_results.append(result)
+                apply_block_result(*result)
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
@@ -948,9 +969,9 @@ def _build_host_sdf_octree_sparse(
             for future in as_completed(futures):
                 result = future.result()
                 if result is not None:
-                    block_results.append(result)
+                    apply_block_result(*result)
 
-    if not block_results:
+    if not refined_blocks:
         host_sdf, host_backend = _build_host_sdf_dense_with_backend(
             occupancy,
             bounds,
@@ -959,26 +980,7 @@ def _build_host_sdf_octree_sparse(
         )
         return host_sdf, None, None, None, "dense_sparse_no_refined_blocks", host_backend
 
-    for (bx, by, bz), min_dist_sq in sorted(block_results, key=lambda item: item[0]):
-        i0 = bx * block_size
-        j0 = by * block_size
-        k0 = bz * block_size
-        i1 = min(resolution, i0 + block_size)
-        j1 = min(resolution, j0 + block_size)
-        k1 = min(resolution, k0 + block_size)
-
-        within_band = np.isfinite(min_dist_sq) & (min_dist_sq <= band_distance_sq)
-        if not np.any(within_band):
-            continue
-
-        dist_block = np.full_like(min_dist_sq, far_value, dtype=np.float64)
-        np.sqrt(min_dist_sq, out=dist_block, where=within_band)
-        signed_block = dist_block.astype(np.float32, copy=False) * sign[i0:i1, j0:j1, k0:k1]
-        current = host_sdf[i0:i1, j0:j1, k0:k1]
-        current[within_band] = signed_block[within_band]
-        host_sdf[i0:i1, j0:j1, k0:k1] = current
-        refined_blocks.append((bx, by, bz))
-
+    refined_blocks.sort()
     strategy_reason = "sparse_selected_auto" if allow_dense_fallback else "sparse_selected_explicit"
     return host_sdf, block_size, refined_blocks, float(far_value), strategy_reason, "cpu"
 
@@ -1597,6 +1599,7 @@ def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: 
     except Exception:
         surface_u8 = _rasterize_surface_python(verts_grid, faces, resolution)
     surface = surface_u8.astype(bool, copy=False)
+    del surface_u8
 
     filled, fallback_reason = _dilate_close_and_fill(surface, closing_iterations=1)
 
@@ -1630,6 +1633,7 @@ def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: 
             "Voxelization could not recover interior volume. Mesh may be self-intersecting or non-solid."
         )
 
+    del surface
     return filled, fallback_reason
 
 

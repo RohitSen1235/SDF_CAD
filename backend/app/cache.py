@@ -53,7 +53,7 @@ class CompileCacheEntry:
     diagnostics: CompileDiagnostics
 
 
-scene_compile_cache: LruCache[CompileCacheEntry] = LruCache(maxsize=64)
+scene_compile_cache: LruCache[CompileCacheEntry] = LruCache(maxsize=1)
 
 
 @dataclass
@@ -65,8 +65,8 @@ class MeshCacheEntry:
     stats: dict[str, float | int | bool | str]
 
 
-mesh_preview_cache: LruCache[MeshCacheEntry] = LruCache(maxsize=24)
-field_preview_cache: LruCache[tuple[np.ndarray, str]] = LruCache(maxsize=8)
+mesh_preview_cache: LruCache[MeshCacheEntry] = LruCache(maxsize=1)
+field_preview_cache: LruCache[tuple[np.ndarray, str]] = LruCache(maxsize=1)
 
 
 @dataclass
@@ -81,7 +81,7 @@ class UploadedMeshCacheEntry:
     field_data: str | None = None
 
 
-uploaded_mesh_preview_cache: LruCache[UploadedMeshCacheEntry] = LruCache(maxsize=12)
+uploaded_mesh_preview_cache: LruCache[UploadedMeshCacheEntry] = LruCache(maxsize=1)
 
 
 @dataclass
@@ -92,7 +92,7 @@ class UploadedMeshMetadataCacheEntry:
     mesh_span: float
 
 
-uploaded_mesh_metadata_cache: LruCache[UploadedMeshMetadataCacheEntry] = LruCache(maxsize=12)
+uploaded_mesh_metadata_cache: LruCache[UploadedMeshMetadataCacheEntry] = LruCache(maxsize=1)
 
 
 @dataclass
@@ -105,7 +105,7 @@ class UploadedComposedFieldCacheEntry:
     active_blocks: list[tuple[int, int, int]] | None = None
 
 
-uploaded_composed_field_cache: LruCache[UploadedComposedFieldCacheEntry] = LruCache(maxsize=12)
+uploaded_composed_field_cache: LruCache[UploadedComposedFieldCacheEntry] = LruCache(maxsize=1)
 
 
 @dataclass
@@ -123,7 +123,7 @@ class UploadedHostFieldCacheEntry:
     host_decision_reason: str = "dense_default"
 
 
-uploaded_host_field_cache: LruCache[UploadedHostFieldCacheEntry] = LruCache(maxsize=8)
+uploaded_host_field_cache: LruCache[UploadedHostFieldCacheEntry] = LruCache(maxsize=1)
 
 
 @dataclass
