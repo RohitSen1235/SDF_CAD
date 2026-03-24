@@ -285,10 +285,10 @@ describe("App", () => {
     expect(previewUploadedMeshField).not.toHaveBeenCalled();
     expect(previewUploadedMesh).not.toHaveBeenCalled();
 
-    fireEvent.change(screen.getByLabelText("Lattice pitch"), { target: { value: "0.55" } });
-    fireEvent.change(screen.getByLabelText("Lattice thickness"), { target: { value: "0.12" } });
+    fireEvent.change(screen.getByLabelText("Unit cell size (mm)"), { target: { value: "0.55" } });
+    fireEvent.change(screen.getByLabelText("Lattice half-thickness (mm)"), { target: { value: "0.12" } });
     fireEvent.change(screen.getByLabelText("Lattice phase"), { target: { value: "0.35" } });
-    fireEvent.change(screen.getByLabelText("Shell thickness"), { target: { value: "0.1" } });
+    fireEvent.change(screen.getByLabelText("Shell thickness (mm)"), { target: { value: "0.1" } });
     fireEvent.change(screen.getByLabelText("Mesh field backend"), { target: { value: "cuda" } });
     fireEvent.change(screen.getByLabelText("Voxels per lattice period"), { target: { value: "8" } });
 
@@ -323,6 +323,19 @@ describe("App", () => {
     expect(screen.getByText(/Est\. required CPU memory:/i)).toBeInTheDocument();
   });
 
+  it("shows mm-scale thickness guidance for the uploaded mesh workflow", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+
+    expect(screen.getByText(/Min recommended shell thickness at current settings:/i)).toBeInTheDocument();
+    expect(
+      screen.queryAllByText((_, element) =>
+        element?.textContent?.includes("Strut total width = 2 x half-thickness = 1.00 mm") ?? false
+      ).length
+    ).toBeGreaterThan(0);
+    expect(screen.getByText(/Lattice half-thickness 0\.50 mm is below the minimum/i)).toBeInTheDocument();
+  });
+
   it("warns and blocks mesh preview actions when memory estimate is fatal", async () => {
     preprocessUploadedMesh.mockResolvedValueOnce({
       mesh: outerMeshPayload,
@@ -341,6 +354,8 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+
+    fireEvent.change(screen.getByLabelText("Unit cell size (mm)"), { target: { value: "0.5" } });
 
     expect(await screen.findByText(/Estimated memory exceeds available capacity/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Preview Field" })).toBeDisabled();
@@ -365,9 +380,10 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+    fireEvent.change(screen.getByLabelText("Unit cell size (mm)"), { target: { value: "0.5" } });
     await screen.findByText(/Estimated memory exceeds available capacity/i);
 
-    fireEvent.change(screen.getByLabelText("Lattice pitch"), { target: { value: "20" } });
+    fireEvent.change(screen.getByLabelText("Unit cell size (mm)"), { target: { value: "20" } });
 
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Preview Field" })).not.toBeDisabled();
@@ -393,8 +409,8 @@ describe("App", () => {
 
     expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     expect(previewUploadedMeshField.mock.calls[0]?.[1]).toMatchObject({
-      latticePitch: 0.45,
-      latticeThickness: 0.09,
+      latticePitch: 5.0,
+      latticeThickness: 0.5,
       latticePhase: 0
     });
   });
@@ -725,7 +741,7 @@ describe("App", () => {
     expect(lastCall?.[2]).toBe("stl");
     expect(lastCall?.[3]).toBe("auto");
 
-    fireEvent.change(screen.getByLabelText("Lattice pitch"), { target: { value: "0.55" } });
+    fireEvent.change(screen.getByLabelText("Unit cell size (mm)"), { target: { value: "0.55" } });
     expect(exportStl).toBeDisabled();
   });
 

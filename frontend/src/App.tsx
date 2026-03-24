@@ -162,6 +162,20 @@ function computeRequiredResolution(meshSpan: number, latticePitch: number, voxel
   return Math.min(1024, Math.max(24, Math.ceil((meshSpan * 1.24 / latticePitch) * voxelsPerPeriod)));
 }
 
+function computeMinShellThickness(latticePitch: number, voxelsPerPeriod: number): number {
+  if (voxelsPerPeriod <= 0) {
+    return 0;
+  }
+  return 2.0 * (latticePitch / voxelsPerPeriod);
+}
+
+function computeMinLatticeThickness(latticePitch: number, voxelsPerPeriod: number): number {
+  if (voxelsPerPeriod <= 0) {
+    return 0;
+  }
+  return latticePitch / voxelsPerPeriod;
+}
+
 function estimateRequiredBytes(
   resolution: number,
   bytesPerVoxel: number,
@@ -188,10 +202,10 @@ export default function App() {
   const [params, setParams] = useState<Record<string, number>>({});
 
   const [meshFile, setMeshFile] = useState<File | null>(null);
-  const [meshShellThickness, setMeshShellThickness] = useState(0.08);
+  const [meshShellThickness, setMeshShellThickness] = useState(2.0);
   const [meshLatticeType, setMeshLatticeType] = useState<MeshLatticeType>("gyroid");
-  const [meshLatticePitch, setMeshLatticePitch] = useState(0.45);
-  const [meshLatticeThickness, setMeshLatticeThickness] = useState(0.09);
+  const [meshLatticePitch, setMeshLatticePitch] = useState(5.0);
+  const [meshLatticeThickness, setMeshLatticeThickness] = useState(0.5);
   const [meshLatticePhase, setMeshLatticePhase] = useState(0.0);
   const [voxelsPerLatticePeriod, setVoxelsPerLatticePeriod] = useState(6);
   const [meshCommitted, setMeshCommitted] = useState(false);
@@ -292,7 +306,7 @@ export default function App() {
           }).`
         );
       }
-      parts.push("Increase lattice pitch, reduce voxels per period, or switch to CPU backend.");
+      parts.push("Increase unit cell size, reduce voxels per period, or switch to CPU backend.");
       fatalMessage = parts.join(" ");
     }
 
@@ -307,6 +321,17 @@ export default function App() {
       gpuCheckEnabled
     };
   }, [meshMemoryContext, meshLatticePitch, voxelsPerLatticePeriod, computeBackend]);
+
+  const minShellThickness = useMemo(
+    () => computeMinShellThickness(meshLatticePitch, voxelsPerLatticePeriod),
+    [meshLatticePitch, voxelsPerLatticePeriod]
+  );
+  const shellTooThin = meshShellThickness < minShellThickness;
+  const minLatticeThickness = useMemo(
+    () => computeMinLatticeThickness(meshLatticePitch, voxelsPerLatticePeriod),
+    [meshLatticePitch, voxelsPerLatticePeriod]
+  );
+  const latticeTooThin = meshLatticeThickness < minLatticeThickness;
 
   const meshMemoryFatal = Boolean(meshMemoryRisk?.fatal);
 
@@ -1049,16 +1074,27 @@ export default function App() {
                 <p className="muted">{meshFile ? `Selected: ${meshFile.name}` : "No file selected."}</p>
 
                 <label className="slider-row">
-                  <span>Shell thickness</span>
+                  <span>Shell thickness (mm)</span>
                   <input
                     type="number"
-                    step={0.01}
-                    min={0.001}
+                    step={0.5}
+                    min={0.1}
                     value={meshShellThickness}
-                    aria-label="Shell thickness"
+                    aria-label="Shell thickness (mm)"
                     onChange={(event) => setMeshShellThickness(Number(event.target.value))}
                   />
                 </label>
+                <p className="muted">
+                  Min recommended shell thickness at current settings:{" "}
+                  <strong>{minShellThickness.toFixed(2)} mm</strong> (2 x unit cell size / sampling quality)
+                </p>
+                {shellTooThin ? (
+                  <p className="warning">
+                    Shell thickness {meshShellThickness.toFixed(2)} mm is below the minimum{" "}
+                    {minShellThickness.toFixed(2)} mm. The lattice may protrude outside the shell surface.
+                    Increase shell thickness or reduce unit cell size.
+                  </p>
+                ) : null}
 
                 <label className="slider-row">
                   <span>Lattice type</span>
@@ -1074,28 +1110,42 @@ export default function App() {
                 </label>
 
                 <label className="slider-row">
-                  <span>Lattice pitch (world units)</span>
+                  <span>Unit cell size (mm)</span>
                   <input
                     type="number"
-                    step={0.01}
-                    min={0.001}
+                    step={0.5}
+                    min={0.5}
                     value={meshLatticePitch}
-                    aria-label="Lattice pitch"
+                    aria-label="Unit cell size (mm)"
                     onChange={(event) => setMeshLatticePitch(Number(event.target.value))}
                   />
                 </label>
 
                 <label className="slider-row">
-                  <span>Lattice thickness</span>
+                  <span>Lattice half-thickness (mm)</span>
                   <input
                     type="number"
-                    step={0.01}
-                    min={0.001}
+                    step={0.1}
+                    min={0.05}
                     value={meshLatticeThickness}
-                    aria-label="Lattice thickness"
+                    aria-label="Lattice half-thickness (mm)"
                     onChange={(event) => setMeshLatticeThickness(Number(event.target.value))}
                   />
                 </label>
+                <p className="muted">
+                  Strut total width = 2 x half-thickness = <strong>{(meshLatticeThickness * 2).toFixed(2)} mm</strong>
+                </p>
+                <p className="muted">
+                  Min resolvable half-thickness at current settings:{" "}
+                  <strong>{minLatticeThickness.toFixed(2)} mm</strong> (1 voxel = unit cell size / sampling quality)
+                </p>
+                {latticeTooThin ? (
+                  <p className="warning">
+                    Lattice half-thickness {meshLatticeThickness.toFixed(2)} mm is below the minimum{" "}
+                    {minLatticeThickness.toFixed(2)} mm. Strut walls may not render correctly.
+                    Increase half-thickness or reduce unit cell size.
+                  </p>
+                ) : null}
 
                 <label className="slider-row">
                   <span>Lattice phase</span>

@@ -84,6 +84,15 @@ Practical constraints and common failures:
 - Invalid field name inside expression: `Name 'name' is not valid in field expressions...`
 - Unsupported function in expression: `Function 'foo' is not allowed inside field expressions`
 
+## Mesh workflow units and lattice parameters
+
+When you are working with uploaded meshes, the lattice controls use the same world units as the mesh itself. If the mesh is in millimeters, the inputs are effectively in millimeters too.
+
+- `lattice_pitch` is the unit cell size, meaning the edge length of one repeating lattice cell.
+- `lattice_thickness` is the half-thickness of the strut walls, so total strut width is `2 x lattice_thickness`.
+- `shell_thickness` should stay above `2 x lattice_pitch / voxels_per_lattice_period` so the shell can be represented cleanly at the chosen sampling density.
+- `lattice_thickness` should stay above `lattice_pitch / voxels_per_lattice_period` so struts are at least one voxel thick.
+
 ## 4) Design-a-shape workflow
 
 Use this repeatable workflow:
