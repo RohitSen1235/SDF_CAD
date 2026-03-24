@@ -1,4 +1,7 @@
+import json
 import base64
+import hashlib
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -29,6 +32,7 @@ f 1 2 4
 f 2 3 4
 f 3 1 4
 """
+MESH_OBJ_HASH = hashlib.sha256(MESH_OBJ).hexdigest()
 
 
 def _decode_mesh_arrays(mesh_payload: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -332,6 +336,77 @@ def test_mesh_field_binary_endpoint_obj_upload() -> None:
     assert response.headers.get("x-sdf-trace-id")
 
 
+def test_mesh_field_binary_endpoint_reports_gpu_fill_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    warning = (
+        "GPU voxel fill ran out of memory at resolution 24. "
+        "Try lowering the preview resolution, or reduce voxels_per_lattice_period / increase lattice_pitch. "
+        "The preview was retried on CPU."
+    )
+
+    def fake_run_uploaded_mesh_field_preview_data_with_audit(**_kwargs):
+        field = np.zeros((2, 2, 2), dtype=np.float32)
+        bounds = [[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
+        stats = main_module.PreviewStats(
+            eval_ms=1.0,
+            mesh_ms=None,
+            tri_count=0,
+            voxel_count=int(field.size),
+            cache_hit=False,
+            field_cache_hit=False,
+            mesh_cache_hit=False,
+            compute_backend="cpu",
+            mesh_backend="cpu",
+            preview_mode="field",
+            fallback_reason=warning,
+        )
+        audit = main_module.UploadedFieldPreviewServerAudit(
+            metadata_cache_hit=False,
+            host_cache_hit=False,
+            field_cache_hit=False,
+            resolution=2,
+            voxel_count=int(field.size),
+            payload_bytes=int(field.size * np.dtype(np.float32).itemsize),
+            compute_backend="cpu",
+            host_build_strategy="dense",
+            host_decision_reason="dense_requested",
+            server_upload_read_ms=0.0,
+            server_preprocessing_ms=0.0,
+            server_metadata_resolve_ms=0.0,
+            server_host_field_ms=0.0,
+            server_compose_field_ms=0.0,
+            server_pack_binary_ms=0.0,
+            server_handler_total_ms=0.0,
+        )
+        return field, bounds, stats, audit
+
+    monkeypatch.setattr(main_module, "_run_uploaded_mesh_field_preview_data_with_audit", fake_run_uploaded_mesh_field_preview_data_with_audit)
+
+    response = client.post(
+        "/api/v1/mesh/field.binary",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    stats = json.loads(response.headers["x-sdf-stats"])
+    assert stats["fallback_reason"] == warning
+
+
+def test_mesh_field_binary_endpoint_rejects_memory_fatal_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_memory_guard(**_kwargs):
+        raise main_module.MeshUploadError(
+            "Estimated memory requirement exceeds available system memory for this mesh preview."
+        )
+
+    monkeypatch.setattr(main_module, "_enforce_uploaded_mesh_memory_guard", fail_memory_guard)
+    response = client.post(
+        "/api/v1/mesh/field.binary",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 400
+    assert "Estimated memory requirement exceeds available system memory" in response.json()["detail"]
+
+
 def test_uploaded_field_preview_telemetry_endpoint_merges_with_server_trace() -> None:
     response = client.post(
         "/api/v1/mesh/field.binary",
@@ -536,6 +611,25 @@ def test_mesh_preview_rejects_oversized_upload(monkeypatch: pytest.MonkeyPatch) 
     assert response.status_code == 413
 
 
+def test_preprocess_endpoint_does_not_build_host_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_build_host_field(*args, **kwargs):
+        raise AssertionError("build_host_field should not run during preprocess")
+
+    monkeypatch.setattr(main_module, "build_host_field", fail_build_host_field)
+    response = client.post(
+        "/api/v1/mesh/preprocess",
+        data={
+            "lattice_pitch": "0.01",
+            "voxels_per_lattice_period": "12",
+            "compute_backend": "cpu",
+            "field_storage_mode": "dense",
+        },
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    assert "x-sdf-preprocess-resolution" not in response.headers
+
+
 def test_uploaded_queueing_uses_computed_resolution_in_auto_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main_module, "REDIS_CLIENT_AVAILABLE", True)
     monkeypatch.setattr(
@@ -545,6 +639,7 @@ def test_uploaded_queueing_uses_computed_resolution_in_auto_mode(monkeypatch: py
     )
     should_queue = main_module._should_queue_uploaded_request(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         lattice_pitch=0.45,
         voxels_per_lattice_period=6,
@@ -559,6 +654,7 @@ def test_uploaded_queueing_uses_computed_resolution_in_auto_mode(monkeypatch: py
     )
     should_queue = main_module._should_queue_uploaded_request(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         lattice_pitch=0.45,
         voxels_per_lattice_period=6,
@@ -573,6 +669,7 @@ def test_uploaded_queueing_uses_file_size_threshold_in_auto_mode(monkeypatch: py
     monkeypatch.setattr(main_module, "_compute_mesh_upload_resolution", lambda *args, **kwargs: 1)
     should_queue = main_module._should_queue_uploaded_request(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         lattice_pitch=0.45,
         voxels_per_lattice_period=6,
@@ -621,3 +718,238 @@ def test_export_queued_mode_returns_streaming_result() -> None:
     assert result.status_code == 200
     assert result.headers["content-type"].startswith("model/stl")
     assert len(result.content) > 84
+
+
+def test_preprocess_endpoint_returns_binary_outer_mesh() -> None:
+    """POST /api/v1/mesh/preprocess returns a binary mesh packet for the outer geometry."""
+    response = client.post(
+        "/api/v1/mesh/preprocess",
+        data={
+            "lattice_pitch": "0.45",
+            "voxels_per_lattice_period": "6",
+            "compute_backend": "cpu",
+            "field_storage_mode": "dense",
+        },
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/octet-stream")
+    assert response.headers.get("x-sdf-vertex-count")
+    assert response.headers.get("x-sdf-face-count")
+    body = response.content
+    assert body[:8] == b"SDFMESH1"
+    import struct
+    vertex_count = struct.unpack_from("<I", body, 8)[0]
+    face_count = struct.unpack_from("<I", body, 12)[0]
+    assert vertex_count > 0
+    assert face_count > 0
+    assert int(response.headers["x-sdf-vertex-count"]) == vertex_count
+    assert int(response.headers["x-sdf-face-count"]) == face_count
+    assert response.headers.get("x-sdf-mesh-span")
+    assert response.headers.get("x-sdf-cpu-bytes-per-voxel")
+    assert response.headers.get("x-sdf-gpu-bytes-per-voxel")
+    assert response.headers.get("x-sdf-memory-safety-factor")
+
+
+def test_preprocess_endpoint_returns_memory_context_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_memory_estimate(**kwargs):
+        metadata = kwargs["metadata"]
+        context = main_module.UploadedMeshMemoryContext(
+            mesh_span=1.5,
+            available_cpu_bytes=1024,
+            available_gpu_free_bytes=2048,
+            available_gpu_total_bytes=4096,
+            cpu_bytes_per_voxel=32.0,
+            gpu_bytes_per_voxel=40.0,
+            safety_factor=1.25,
+        )
+        estimate = main_module.UploadedMeshMemoryEstimate(
+            context=context,
+            resolution=24,
+            required_cpu_bytes=512,
+            required_gpu_bytes=1024,
+            cpu_fatal=False,
+            gpu_fatal=False,
+            fatal=False,
+            gpu_check_enabled=True,
+        )
+        return estimate, metadata
+
+    monkeypatch.setattr(main_module, "_resolve_uploaded_mesh_memory_estimate", fake_memory_estimate)
+    response = client.post(
+        "/api/v1/mesh/preprocess",
+        data={"lattice_pitch": "0.45", "voxels_per_lattice_period": "6", "compute_backend": "auto"},
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-sdf-mesh-span"] == "1.5"
+    assert response.headers["x-sdf-available-cpu-bytes"] == "1024"
+    assert response.headers["x-sdf-available-gpu-free-bytes"] == "2048"
+    assert response.headers["x-sdf-available-gpu-total-bytes"] == "4096"
+    assert response.headers["x-sdf-cpu-bytes-per-voxel"] == "32.0"
+    assert response.headers["x-sdf-gpu-bytes-per-voxel"] == "40.0"
+    assert response.headers["x-sdf-memory-safety-factor"] == "1.25"
+
+
+def test_available_cpu_memory_probe_graceful_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main_module.os, "sysconf", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("boom")))
+    monkeypatch.setattr(main_module.os, "sysconf_names", {})
+
+    import builtins
+
+    monkeypatch.setattr(
+        builtins,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("boom")),
+    )
+    assert main_module._available_cpu_memory_bytes() is None
+
+
+def test_preprocess_endpoint_warms_metadata_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After preprocess, the metadata cache should be warm for the same file."""
+    from app import cache as cache_module
+
+    cache_module.clear_all_preview_caches()
+
+    def fake_build_host_field(mesh, resolution, **kwargs):
+        return SimpleNamespace(
+            mesh=mesh,
+            bounds=[[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]],
+            host_sdf=np.zeros((2, 2, 2), dtype=np.float32),
+            host_compute_backend="cpu",
+            field_storage_mode="dense",
+            block_size=None,
+            active_blocks=None,
+            sparse_background_value=None,
+            sparse_bricks=None,
+            host_build_strategy="dense",
+            host_decision_reason="dense_requested",
+        )
+
+    monkeypatch.setattr(main_module, "build_host_field", fake_build_host_field)
+
+    # First call — cold cache
+    response = client.post(
+        "/api/v1/mesh/preprocess",
+        data={"lattice_pitch": "0.45"},
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+
+    # Second call to field endpoint — should be a metadata cache hit
+    field_response = client.post(
+        "/api/v1/mesh/field",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert field_response.status_code == 200
+    # metadata_cache_hit is logged in the trace but not directly in the response;
+    # we verify the field endpoint succeeds and returns valid data
+    assert field_response.json()["field"]["encoding"] == "f32-base64"
+
+
+def test_uploaded_field_preview_trace_includes_preprocessing_time(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from app import cache as cache_module
+
+    cache_module.clear_all_preview_caches()
+
+    def fake_run_uploaded_mesh_field_preview_data_with_audit(**_kwargs):
+        field = np.zeros((2, 2, 2), dtype=np.float32)
+        bounds = [[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
+        stats = main_module.PreviewStats(
+            eval_ms=1.0,
+            mesh_ms=None,
+            tri_count=0,
+            voxel_count=int(field.size),
+            cache_hit=False,
+            field_cache_hit=False,
+            mesh_cache_hit=False,
+            compute_backend="cpu",
+            mesh_backend="cpu",
+            preview_mode="field",
+        )
+        audit = main_module.UploadedFieldPreviewServerAudit(
+            metadata_cache_hit=False,
+            host_cache_hit=False,
+            field_cache_hit=False,
+            resolution=2,
+            voxel_count=int(field.size),
+            payload_bytes=int(field.size * np.dtype(np.float32).itemsize),
+            compute_backend="cpu",
+            host_build_strategy="dense",
+            host_decision_reason="dense_requested",
+            server_upload_read_ms=0.0,
+            server_preprocessing_ms=None,
+            server_metadata_resolve_ms=0.0,
+            server_host_field_ms=0.0,
+            server_compose_field_ms=0.0,
+            server_pack_binary_ms=0.0,
+            server_handler_total_ms=0.0,
+        )
+        return field, bounds, stats, audit
+
+    monkeypatch.setattr(main_module, "_run_uploaded_mesh_field_preview_data_with_audit", fake_run_uploaded_mesh_field_preview_data_with_audit)
+
+    preprocess_response = client.post(
+        "/api/v1/mesh/preprocess",
+        data={"lattice_pitch": "0.45"},
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert preprocess_response.status_code == 200
+
+    field_response = client.post(
+        "/api/v1/mesh/field.binary",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert field_response.status_code == 200
+
+    telemetry_payload = {
+        "trace_id": field_response.headers["x-sdf-trace-id"],
+        "client_response_wait_ms": 1.0,
+        "client_download_ms": 2.0,
+        "client_decode_ms": 3.0,
+        "client_texture_upload_and_first_frame_ms": 4.0,
+        "client_total_visible_ms": 10.0,
+    }
+    telemetry_response = client.post("/api/v1/internal/mesh/field-preview-telemetry", json=telemetry_payload)
+    assert telemetry_response.status_code == 204
+
+    captured = capsys.readouterr().out
+    assert "uploaded_field_preview_trace" in captured
+    assert "server_preprocessing_ms=" in captured
+
+
+def test_preprocess_endpoint_rejects_invalid_mesh() -> None:
+    """POST /api/v1/mesh/preprocess returns 400 for invalid mesh data."""
+    response = client.post(
+        "/api/v1/mesh/preprocess",
+        data={"lattice_pitch": "0.45"},
+        files={"file": ("bad.obj", b"not a mesh at all", "text/plain")},
+    )
+    assert response.status_code == 400
+
+
+def test_preprocess_endpoint_rejects_unsupported_extension() -> None:
+    """POST /api/v1/mesh/preprocess returns 400 for unsupported file types."""
+    response = client.post(
+        "/api/v1/mesh/preprocess",
+        data={"lattice_pitch": "0.45"},
+        files={"file": ("model.ply", b"ply data", "application/octet-stream")},
+    )
+    assert response.status_code == 400
+    assert "Only .stl and .obj uploads are supported" in response.json()["detail"]
+
+
+def test_preprocess_endpoint_rejects_legacy_quality_profile() -> None:
+    """POST /api/v1/mesh/preprocess rejects the legacy quality_profile field."""
+    response = client.post(
+        "/api/v1/mesh/preprocess",
+        data={"lattice_pitch": "0.45", "quality_profile": "interactive"},
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 422
+    assert "voxels_per_lattice_period" in response.json()["detail"]

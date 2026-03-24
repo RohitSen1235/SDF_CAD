@@ -7,11 +7,11 @@ import {
   exportUploadedMesh,
   previewField,
   previewMesh,
+  preprocessUploadedMesh,
   previewUploadedMesh,
   previewUploadedMeshField,
   submitUploadedFieldPreviewTelemetry
 } from "./lib/api";
-import { parseLocalMeshPreview } from "./lib/localMeshPreview";
 import {
   CompileDiagnostics,
   ComputeBackend,
@@ -25,7 +25,8 @@ import {
   PreviewStats,
   QualityProfile,
   SceneIR,
-  UploadedFieldPreviewTrace
+  UploadedFieldPreviewTrace,
+  UploadedMeshMemoryContext
 } from "./types";
 
 interface SavedFieldExpression {
@@ -157,20 +158,24 @@ function resolutionForQuality(profile: QualityProfile): number {
   return 256;
 }
 
-/**
- * Compute the voxel resolution required to faithfully sample a lattice.
- * Mirrors the backend logic in compute_resolution_for_lattice_pitch().
- */
-function computeRequiredResolution(latticePitch: number, voxelsPerPeriod: number): number {
-  // We don't know the mesh span yet (it's only known after parsing on the backend),
-  // so we show a placeholder estimate based on a 100-unit model for display purposes.
-  // The backend will compute the exact value from the actual mesh geometry.
-  return Math.max(24, Math.ceil((100 * 1.24 / latticePitch) * voxelsPerPeriod));
+function computeRequiredResolution(meshSpan: number, latticePitch: number, voxelsPerPeriod: number): number {
+  return Math.min(1024, Math.max(24, Math.ceil((meshSpan * 1.24 / latticePitch) * voxelsPerPeriod)));
 }
 
-function estimatedMemoryMB(resolution: number): number {
-  // float32 = 4 bytes per voxel, cubic grid
-  return Math.round((resolution ** 3 * 4) / (1024 * 1024));
+function estimateRequiredBytes(
+  resolution: number,
+  bytesPerVoxel: number,
+  safetyFactor: number
+): number {
+  return Math.ceil((resolution ** 3) * bytesPerVoxel * safetyFactor);
+}
+
+function bytesToGiB(value: number): string {
+  return `${(value / (1024 ** 3)).toFixed(2)} GiB`;
+}
+
+function bytesToMiB(value: number): string {
+  return `${Math.round(value / (1024 * 1024))} MiB`;
 }
 
 export default function App() {
@@ -190,6 +195,7 @@ export default function App() {
   const [meshLatticePhase, setMeshLatticePhase] = useState(0.0);
   const [voxelsPerLatticePeriod, setVoxelsPerLatticePeriod] = useState(6);
   const [meshCommitted, setMeshCommitted] = useState(false);
+  const [meshMemoryContext, setMeshMemoryContext] = useState<UploadedMeshMemoryContext | null>(null);
 
   const [field, setField] = useState<FieldPayload | null>(null);
   const [mesh, setMesh] = useState<MeshPayload | null>(null);
@@ -223,6 +229,7 @@ export default function App() {
   });
   const meshFieldPreviewRunIdRef = useRef(0);
   const meshFieldPreviewControllerRef = useRef<AbortController | null>(null);
+  const preprocessControllerRef = useRef<AbortController | null>(null);
   const uploadedFieldTelemetrySentRef = useRef<Set<string>>(new Set());
 
   const meshWorkflowParams = useMemo<MeshWorkflowParams>(
@@ -236,14 +243,72 @@ export default function App() {
     [meshShellThickness, meshLatticeType, meshLatticePitch, meshLatticeThickness, meshLatticePhase]
   );
 
-  // Estimated resolution and memory for the current lattice pitch setting.
-  // This is a display-only estimate based on a 100-unit model; the backend
-  // computes the exact value from the actual mesh geometry.
-  const estimatedResolution = useMemo(
-    () => Math.min(1024, computeRequiredResolution(meshLatticePitch, voxelsPerLatticePeriod)),
-    [meshLatticePitch, voxelsPerLatticePeriod]
-  );
-  const estimatedMemory = useMemo(() => estimatedMemoryMB(estimatedResolution), [estimatedResolution]);
+  const meshMemoryRisk = useMemo(() => {
+    if (!meshMemoryContext) {
+      return null;
+    }
+
+    const resolution = computeRequiredResolution(
+      meshMemoryContext.meshSpan,
+      meshLatticePitch,
+      voxelsPerLatticePeriod
+    );
+    const requiredCpuBytes = estimateRequiredBytes(
+      resolution,
+      meshMemoryContext.cpuBytesPerVoxel,
+      meshMemoryContext.safetyFactor
+    );
+    const requiredGpuBytes = estimateRequiredBytes(
+      resolution,
+      meshMemoryContext.gpuBytesPerVoxel,
+      meshMemoryContext.safetyFactor
+    );
+    const cpuFatal =
+      meshMemoryContext.availableCpuBytes != null && requiredCpuBytes > meshMemoryContext.availableCpuBytes;
+    const gpuCheckEnabled =
+      computeBackend === "cuda" || (computeBackend === "auto" && meshMemoryContext.availableGpuFreeBytes != null);
+    const gpuFatal =
+      gpuCheckEnabled &&
+      meshMemoryContext.availableGpuFreeBytes != null &&
+      requiredGpuBytes > meshMemoryContext.availableGpuFreeBytes;
+    const fatal = cpuFatal || gpuFatal;
+
+    let fatalMessage: string | null = null;
+    if (fatal) {
+      const parts = [
+        `Estimated memory exceeds available capacity for resolution ${resolution}.`,
+        `Required CPU: ${bytesToGiB(requiredCpuBytes)} (available: ${
+          meshMemoryContext.availableCpuBytes != null
+            ? bytesToGiB(meshMemoryContext.availableCpuBytes)
+            : "unknown"
+        }).`
+      ];
+      if (gpuCheckEnabled) {
+        parts.push(
+          `Required GPU: ${bytesToGiB(requiredGpuBytes)} (available: ${
+            meshMemoryContext.availableGpuFreeBytes != null
+              ? bytesToGiB(meshMemoryContext.availableGpuFreeBytes)
+              : "unknown"
+          }).`
+        );
+      }
+      parts.push("Increase lattice pitch, reduce voxels per period, or switch to CPU backend.");
+      fatalMessage = parts.join(" ");
+    }
+
+    return {
+      resolution,
+      requiredCpuBytes,
+      requiredGpuBytes,
+      cpuFatal,
+      gpuFatal,
+      fatal,
+      fatalMessage,
+      gpuCheckEnabled
+    };
+  }, [meshMemoryContext, meshLatticePitch, voxelsPerLatticePeriod, computeBackend]);
+
+  const meshMemoryFatal = Boolean(meshMemoryRisk?.fatal);
 
   const abortActivePreview = useCallback(() => {
     previewControllersRef.current.field?.abort();
@@ -580,6 +645,10 @@ export default function App() {
       setError("Upload an STL or OBJ file first.");
       return;
     }
+    if (meshMemoryFatal) {
+      setError(meshMemoryRisk?.fatalMessage ?? "Estimated memory exceeds available system capacity.");
+      return;
+    }
     setField(null);
     setMesh(null);
     setStats(null);
@@ -591,6 +660,10 @@ export default function App() {
   const onCommitMesh = async () => {
     if (!meshFile) {
       setError("Upload an STL or OBJ file first.");
+      return;
+    }
+    if (meshMemoryFatal) {
+      setError(meshMemoryRisk?.fatalMessage ?? "Estimated memory exceeds available system capacity.");
       return;
     }
 
@@ -702,6 +775,13 @@ export default function App() {
     },
     [uploadedFieldPreviewTrace]
   );
+
+  useEffect(() => {
+    return () => {
+      preprocessControllerRef.current?.abort();
+      preprocessControllerRef.current = null;
+    };
+  }, []);
 
   useEffect(() => cancelPendingMeshFieldPreview, [cancelPendingMeshFieldPreview]);
 
@@ -905,23 +985,63 @@ export default function App() {
                     aria-label="Mesh file upload"
                     onChange={(event) => {
                       const selected = event.target.files?.[0] ?? null;
+
+                      // Abort any in-flight preprocess for the previous file
+                      preprocessControllerRef.current?.abort();
+                      preprocessControllerRef.current = null;
+
                       setMeshFile(selected);
                       setField(null);
+                      setMesh(null);
                       setStats(null);
                       setUploadedFieldPreviewTrace(null);
                       setMeshCommitted(false);
+                      setMeshMemoryContext(null);
                       setError(null);
+
                       if (!selected) {
-                        setMesh(null);
                         return;
                       }
-                      void parseLocalMeshPreview(selected)
-                        .then((payload) => {
-                          setMesh(payload);
+
+                      // Upload to backend immediately:
+                      //   1. Warms metadata cache for the subsequent "Preview Field"
+                      //   2. Returns the raw outer mesh for immediate display in the viewer
+                      const controller = new AbortController();
+                      preprocessControllerRef.current = controller;
+                      setIsPreviewing(true);
+
+                      preprocessUploadedMesh(
+                        selected,
+                        meshWorkflowParams,
+                        computeBackend,
+                        voxelsPerLatticePeriod,
+                        controller.signal
+                      )
+                        .then((preprocessResult) => {
+                          if (preprocessControllerRef.current !== controller) {
+                            return; // Superseded by a newer file selection
+                          }
+                          setMesh(preprocessResult.mesh);
+                          setMeshMemoryContext(preprocessResult.memoryContext);
                         })
-                        .catch((parseError) => {
+                        .catch((preprocessError: Error) => {
+                          if (preprocessError.name === "AbortError") {
+                            return;
+                          }
+                          if (preprocessControllerRef.current !== controller) {
+                            return;
+                          }
+                          // Preprocess failure is non-fatal — user can still click
+                          // "Preview Field" which will run the full pipeline inline
                           setMesh(null);
-                          setError((parseError as Error).message);
+                          setMeshMemoryContext(null);
+                          setError(preprocessError.message);
+                        })
+                        .finally(() => {
+                          if (preprocessControllerRef.current === controller) {
+                            preprocessControllerRef.current = null;
+                            setIsPreviewing(false);
+                          }
                         });
                     }}
                   />
@@ -1002,14 +1122,28 @@ export default function App() {
                 </label>
 
                 <div className="resolution-info">
-                  <p className="muted">
-                    Est. resolution for 100-unit model: <strong>{estimatedResolution}³</strong>
-                    {estimatedResolution >= 1024 ? " (clamped to 1024³ max)" : ""}
-                  </p>
-                  <p className="muted">
-                    Est. SDF grid memory: <strong>{estimatedMemory} MB</strong>
-                    {estimatedMemory > 1000 ? " ⚠️ Large — may be slow" : ""}
-                  </p>
+                  {meshMemoryRisk ? (
+                    <>
+                      <p className="muted">
+                        Est. resolution for uploaded mesh: <strong>{meshMemoryRisk.resolution}³</strong>
+                        {meshMemoryRisk.resolution >= 1024 ? " (clamped to 1024³ max)" : ""}
+                      </p>
+                      <p className="muted">
+                        Est. required CPU memory: <strong>{bytesToMiB(meshMemoryRisk.requiredCpuBytes)}</strong>
+                        {meshMemoryContext?.availableCpuBytes != null
+                          ? ` (available: ${bytesToMiB(meshMemoryContext.availableCpuBytes)})`
+                          : " (available: unknown)"}
+                      </p>
+                      <p className="muted">
+                        Est. required GPU memory: <strong>{bytesToMiB(meshMemoryRisk.requiredGpuBytes)}</strong>
+                        {meshMemoryContext?.availableGpuFreeBytes != null
+                          ? ` (available: ${bytesToMiB(meshMemoryContext.availableGpuFreeBytes)})`
+                          : " (available: unknown)"}
+                      </p>
+                    </>
+                  ) : (
+                    <p className="muted">Memory estimate will appear after mesh preprocess completes.</p>
+                  )}
                 </div>
 
                 <label className="slider-row">
@@ -1050,10 +1184,20 @@ export default function App() {
                 </label>
                 <p className="muted">Tip: `adaptive` is currently slower on CPU; use `uniform` for fastest previews.</p>
 
-                <button type="button" onClick={() => void onGenerateMesh()}>
+                {meshMemoryRisk?.fatalMessage ? <p className="warning">{meshMemoryRisk.fatalMessage}</p> : null}
+
+                <button
+                  type="button"
+                  onClick={() => void onGenerateMesh()}
+                  disabled={!meshFile || meshMemoryFatal}
+                >
                   Preview Field
                 </button>
-                <button type="button" onClick={() => void onCommitMesh()}>
+                <button
+                  type="button"
+                  onClick={() => void onCommitMesh()}
+                  disabled={!meshFile || meshMemoryFatal}
+                >
                   Commit Design & Compute Mesh
                 </button>
               </div>
@@ -1181,6 +1325,7 @@ export default function App() {
             <span>Field cache: {stats?.field_cache_hit ? "hit" : "miss"}</span>
             <span>Mesh cache: {stats?.mesh_cache_hit ? "hit" : "miss"}</span>
           </div>
+          {stats?.fallback_reason ? <p className="warning">{stats.fallback_reason}</p> : null}
           {error ? <p className="error">{error}</p> : null}
         </section>
       </main>

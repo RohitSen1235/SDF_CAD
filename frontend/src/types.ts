@@ -166,3 +166,18 @@ export interface MeshWorkflowParams {
   latticeThickness: number;
   latticePhase: number;
 }
+
+export interface UploadedMeshMemoryContext {
+  meshSpan: number;
+  availableCpuBytes: number | null;
+  availableGpuFreeBytes: number | null;
+  availableGpuTotalBytes: number | null;
+  cpuBytesPerVoxel: number;
+  gpuBytesPerVoxel: number;
+  safetyFactor: number;
+}
+
+export interface UploadedMeshPreprocessResponse {
+  mesh: MeshPayloadBinary;
+  memoryContext: UploadedMeshMemoryContext | null;
+}

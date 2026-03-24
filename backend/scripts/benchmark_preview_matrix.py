@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -20,6 +21,7 @@ f 1 2 4
 f 2 3 4
 f 3 1 4
 """
+MESH_OBJ_HASH = hashlib.sha256(MESH_OBJ).hexdigest()
 
 
 @dataclass
@@ -57,6 +59,7 @@ def run_acceptance_benchmark(
 
     _, _, first_stats = _run_uploaded_mesh_field_preview_data(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=shell_thickness,
         lattice_type="gyroid",
@@ -70,6 +73,7 @@ def run_acceptance_benchmark(
 
     _, _, second_stats = _run_uploaded_mesh_field_preview_data(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=shell_thickness,
         lattice_type="gyroid",
@@ -83,6 +87,7 @@ def run_acceptance_benchmark(
 
     _, mesh_commit_stats, _, _ = _run_uploaded_mesh_preview_meshdata(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=shell_thickness,
         lattice_type="gyroid",
@@ -98,6 +103,7 @@ def run_acceptance_benchmark(
 
     _, repeated_mesh_stats, _, _ = _run_uploaded_mesh_preview_meshdata(
         file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
         extension=".obj",
         shell_thickness=shell_thickness,
         lattice_type="gyroid",

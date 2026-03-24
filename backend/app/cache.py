@@ -113,6 +113,7 @@ class UploadedHostFieldCacheEntry:
     bounds: list[list[float]]
     host_sdf: np.ndarray
     host_compute_backend: str = "cpu"
+    fallback_reason: str | None = None
     field_storage_mode: UploadedFieldStorageMode = "dense"
     block_size: int | None = None
     active_blocks: list[tuple[int, int, int]] | None = None
@@ -142,6 +143,7 @@ class UploadedFieldPreviewTraceEntry:
     host_build_strategy: str | None = None
     host_decision_reason: str | None = None
     server_upload_read_ms: float | None = None
+    server_preprocessing_ms: float | None = None
     server_metadata_resolve_ms: float | None = None
     server_host_field_ms: float | None = None
     server_compose_field_ms: float | None = None
@@ -154,11 +156,17 @@ class UploadedFieldPreviewTraceEntry:
     client_total_visible_ms: float | None = None
 
 
-class ExpiringTraceStore:
+@dataclass
+class UploadedMeshPreprocessTimingEntry:
+    created_at: float
+    preprocessing_ms: float
+
+
+class ExpiringTraceStore(Generic[T]):
     def __init__(self, ttl_seconds: float = 300.0, maxsize: int = 256) -> None:
         self.ttl_seconds = ttl_seconds
         self.maxsize = maxsize
-        self._data: OrderedDict[str, UploadedFieldPreviewTraceEntry] = OrderedDict()
+        self._data: OrderedDict[str, T] = OrderedDict()
 
     def _purge_expired(self, now: float | None = None) -> None:
         current = now if now is not None else time.time()
@@ -170,7 +178,7 @@ class ExpiringTraceStore:
         for key in expired_keys:
             self._data.pop(key, None)
 
-    def get(self, key: str) -> UploadedFieldPreviewTraceEntry | None:
+    def get(self, key: str) -> T | None:
         self._purge_expired()
         value = self._data.get(key)
         if value is None:
@@ -178,7 +186,7 @@ class ExpiringTraceStore:
         self._data.move_to_end(key, last=True)
         return value
 
-    def set(self, key: str, value: UploadedFieldPreviewTraceEntry) -> None:
+    def set(self, key: str, value: T) -> None:
         self._purge_expired()
         if key in self._data:
             self._data.move_to_end(key, last=True)
@@ -186,7 +194,7 @@ class ExpiringTraceStore:
         while len(self._data) > self.maxsize:
             self._data.popitem(last=False)
 
-    def pop(self, key: str) -> UploadedFieldPreviewTraceEntry | None:
+    def pop(self, key: str) -> T | None:
         self._purge_expired()
         return self._data.pop(key, None)
 
@@ -194,7 +202,8 @@ class ExpiringTraceStore:
         self._data.clear()
 
 
-uploaded_field_preview_trace_store = ExpiringTraceStore()
+uploaded_field_preview_trace_store: ExpiringTraceStore[UploadedFieldPreviewTraceEntry] = ExpiringTraceStore()
+uploaded_mesh_preprocess_timing_store: ExpiringTraceStore[UploadedMeshPreprocessTimingEntry] = ExpiringTraceStore()
 
 
 def clear_all_preview_caches() -> None:
@@ -205,6 +214,7 @@ def clear_all_preview_caches() -> None:
     uploaded_composed_field_cache.clear()
     uploaded_host_field_cache.clear()
     uploaded_field_preview_trace_store.clear()
+    uploaded_mesh_preprocess_timing_store.clear()
 
 
 def clear_all_caches() -> None:
@@ -264,7 +274,7 @@ def hash_field_preview_request(
 
 def hash_uploaded_mesh_request(
     *,
-    file_bytes: bytes,
+    file_hash: str,
     extension: str,
     resolution: int,
     shell_thickness: float,
@@ -279,7 +289,7 @@ def hash_uploaded_mesh_request(
     field_storage_mode: str = "auto",
 ) -> str:
     payload: dict[str, Any] = {
-        "file_hash": hashlib.sha256(file_bytes).hexdigest(),
+        "file_hash": file_hash,
         "extension": extension.lower(),
         "resolution": int(resolution),
         "shell_thickness": float(shell_thickness),
@@ -299,11 +309,11 @@ def hash_uploaded_mesh_request(
 
 def hash_uploaded_mesh_metadata_request(
     *,
-    file_bytes: bytes,
+    file_hash: str,
     extension: str,
 ) -> str:
     payload: dict[str, Any] = {
-        "file_hash": hashlib.sha256(file_bytes).hexdigest(),
+        "file_hash": file_hash,
         "extension": extension.lower(),
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -312,14 +322,14 @@ def hash_uploaded_mesh_metadata_request(
 
 def hash_uploaded_mesh_host_request(
     *,
-    file_bytes: bytes,
+    file_hash: str,
     extension: str,
     resolution: int,
     compute_backend: str = "auto",
     field_storage_mode: str = "auto",
 ) -> str:
     payload: dict[str, Any] = {
-        "file_hash": hashlib.sha256(file_bytes).hexdigest(),
+        "file_hash": file_hash,
         "extension": extension.lower(),
         "resolution": int(resolution),
         "compute_backend": compute_backend,
@@ -331,7 +341,7 @@ def hash_uploaded_mesh_host_request(
 
 def hash_uploaded_mesh_field_request(
     *,
-    file_bytes: bytes,
+    file_hash: str,
     extension: str,
     resolution: int,
     shell_thickness: float,
@@ -344,7 +354,7 @@ def hash_uploaded_mesh_field_request(
     field_storage_mode: str = "auto",
 ) -> str:
     payload: dict[str, Any] = {
-        "file_hash": hashlib.sha256(file_bytes).hexdigest(),
+        "file_hash": file_hash,
         "extension": extension.lower(),
         "resolution": int(resolution),
         "shell_thickness": float(shell_thickness),

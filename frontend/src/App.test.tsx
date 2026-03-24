@@ -16,6 +16,7 @@ const compileScene = vi.fn();
 const previewField = vi.fn();
 const previewMesh = vi.fn();
 const exportMesh = vi.fn();
+const preprocessUploadedMesh = vi.fn();
 const previewUploadedMesh = vi.fn();
 const previewUploadedMeshField = vi.fn();
 const exportUploadedMesh = vi.fn();
@@ -26,6 +27,7 @@ vi.mock("./lib/api", () => ({
   previewField: (...args: unknown[]) => previewField(...args),
   previewMesh: (...args: unknown[]) => previewMesh(...args),
   exportMesh: (...args: unknown[]) => exportMesh(...args),
+  preprocessUploadedMesh: (...args: unknown[]) => preprocessUploadedMesh(...args),
   previewUploadedMesh: (...args: unknown[]) => previewUploadedMesh(...args),
   previewUploadedMeshField: (...args: unknown[]) => previewUploadedMeshField(...args),
   exportUploadedMesh: (...args: unknown[]) => exportUploadedMesh(...args),
@@ -89,6 +91,15 @@ const meshPreviewPayload = {
 };
 
 describe("App", () => {
+  const outerMeshPayload = {
+    encoding: "mesh-f32-u32-binary-v1" as const,
+    vertex_count: 4,
+    face_count: 4,
+    vertices: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]),
+    indices: new Uint32Array([0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3]),
+    normals: new Float32Array([0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1])
+  };
+
   beforeEach(() => {
     vi.clearAllMocks();
     viewerMock.mockClear();
@@ -100,6 +111,18 @@ describe("App", () => {
     previewField.mockResolvedValue(fieldPreviewPayload);
     previewMesh.mockResolvedValue(meshPreviewPayload);
     exportMesh.mockResolvedValue(new Blob(["ok"]));
+    preprocessUploadedMesh.mockResolvedValue({
+      mesh: outerMeshPayload,
+      memoryContext: {
+        meshSpan: 1,
+        availableCpuBytes: 16 * 1024 * 1024 * 1024,
+        availableGpuFreeBytes: 8 * 1024 * 1024 * 1024,
+        availableGpuTotalBytes: 12 * 1024 * 1024 * 1024,
+        cpuBytesPerVoxel: 32,
+        gpuBytesPerVoxel: 40,
+        safetyFactor: 1.25
+      }
+    });
     previewUploadedMesh.mockResolvedValue(meshPreviewPayload);
     previewUploadedMeshField.mockResolvedValue(fieldPreviewPayload);
     exportUploadedMesh.mockResolvedValue(new Blob(["ok"]));
@@ -245,7 +268,7 @@ describe("App", () => {
     expect(editor).toHaveValue(savedSource);
   });
 
-  it("does not auto-preview uploaded field when mesh preview parameters change", () => {
+  it("does not auto-preview uploaded field when mesh preview parameters change", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
 
@@ -255,6 +278,9 @@ describe("App", () => {
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
+
+    // Wait for preprocess to complete before checking param-change behavior
+    await waitFor(() => expect(preprocessUploadedMesh).toHaveBeenCalledTimes(1));
 
     expect(previewUploadedMeshField).not.toHaveBeenCalled();
     expect(previewUploadedMesh).not.toHaveBeenCalled();
@@ -280,6 +306,75 @@ describe("App", () => {
     expect(screen.getByLabelText("Voxels per lattice period")).toBeInTheDocument();
   });
 
+  it("hides mesh memory estimate until preprocess returns backend memory context", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    expect(screen.getByText("Memory estimate will appear after mesh preprocess completes.")).toBeInTheDocument();
+  });
+
+  it("shows mesh memory estimate after preprocess", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+
+    expect(await screen.findByText(/Est\. resolution for uploaded mesh:/i)).toBeInTheDocument();
+    expect(screen.getByText(/Est\. required CPU memory:/i)).toBeInTheDocument();
+  });
+
+  it("warns and blocks mesh preview actions when memory estimate is fatal", async () => {
+    preprocessUploadedMesh.mockResolvedValueOnce({
+      mesh: outerMeshPayload,
+      memoryContext: {
+        meshSpan: 50,
+        availableCpuBytes: 256 * 1024 * 1024,
+        availableGpuFreeBytes: 256 * 1024 * 1024,
+        availableGpuTotalBytes: 1024 * 1024 * 1024,
+        cpuBytesPerVoxel: 32,
+        gpuBytesPerVoxel: 40,
+        safetyFactor: 1.25
+      }
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+
+    expect(await screen.findByText(/Estimated memory exceeds available capacity/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Preview Field" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Commit Design & Compute Mesh" })).toBeDisabled();
+  });
+
+  it("re-enables mesh preview actions after reducing memory demand", async () => {
+    preprocessUploadedMesh.mockResolvedValueOnce({
+      mesh: outerMeshPayload,
+      memoryContext: {
+        meshSpan: 50,
+        availableCpuBytes: 256 * 1024 * 1024,
+        availableGpuFreeBytes: 256 * 1024 * 1024,
+        availableGpuTotalBytes: 1024 * 1024 * 1024,
+        cpuBytesPerVoxel: 32,
+        gpuBytesPerVoxel: 40,
+        safetyFactor: 1.25
+      }
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+    await screen.findByText(/Estimated memory exceeds available capacity/i);
+
+    fireEvent.change(screen.getByLabelText("Lattice pitch"), { target: { value: "20" } });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Preview Field" })).not.toBeDisabled();
+    });
+    expect(screen.getByRole("button", { name: "Commit Design & Compute Mesh" })).not.toBeDisabled();
+  });
+
   it("runs uploaded field preview immediately when Preview Field is clicked", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
@@ -302,6 +397,28 @@ describe("App", () => {
       latticeThickness: 0.09,
       latticePhase: 0
     });
+  });
+
+  it("shows a warning when uploaded field preview falls back from GPU memory pressure", async () => {
+    previewUploadedMeshField.mockResolvedValueOnce({
+      ...fieldPreviewPayload,
+      stats: {
+        ...fieldPreviewPayload.stats,
+        fallback_reason:
+          "GPU voxel fill ran out of memory at resolution 192. Try lowering the preview resolution, or reduce voxels_per_lattice_period / increase lattice_pitch. The preview was retried on CPU."
+      }
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+
+    expect(
+      await screen.findByText(/GPU voxel fill ran out of memory at resolution 192/i)
+    ).toBeInTheDocument();
   });
 
   it("shows separate field and mesh cache status for cached field previews", async () => {
@@ -458,7 +575,7 @@ describe("App", () => {
     expect("transparentShell" in fieldOnlyProps).toBe(false);
   });
 
-  it("renders uploaded source mesh locally right after file selection", async () => {
+  it("calls preprocessUploadedMesh and shows outer mesh after file selection", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
 
@@ -466,9 +583,36 @@ describe("App", () => {
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
 
+    // preprocessUploadedMesh should be called immediately on file selection
+    await waitFor(() => {
+      expect(preprocessUploadedMesh).toHaveBeenCalledTimes(1);
+    });
+
+    // The outer mesh returned by preprocess should be displayed in the viewer
     await waitFor(() => {
       const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
       expect(latestViewerProps.mesh).not.toBeNull();
+    });
+  });
+
+  it("shows error but allows Preview Field after preprocess failure", async () => {
+    preprocessUploadedMesh.mockRejectedValueOnce(new Error("Preprocess failed: invalid mesh"));
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+
+    await waitFor(() => {
+      expect(screen.getByText("Preprocess failed: invalid mesh")).toBeInTheDocument();
+    });
+
+    // User can still click Preview Field — it will run the full pipeline inline
+    previewUploadedMeshField.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     });
   });
 
