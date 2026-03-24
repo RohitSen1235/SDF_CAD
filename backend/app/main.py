@@ -59,6 +59,7 @@ from .mesh_upload import (
     compute_resolution_for_lattice_pitch,
     parse_mesh_bytes,
     validate_triangle_mesh,
+    _log_host_field_backend,
 )
 from .gpu_program import compile_scene_program
 from .gpu_memory import cleanup_gpu_memory
@@ -110,6 +111,21 @@ if _uvicorn_error_logger.handlers:
     logger.propagate = False
 else:
     logger.setLevel(logging.INFO)
+
+
+class _SuppressTelemetryAccessLog(logging.Filter):
+    _silenced_path = "/api/v1/internal/mesh/field-preview-telemetry"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "uvicorn.access":
+            return True
+        args = getattr(record, "args", ())
+        if isinstance(args, tuple) and len(args) >= 3 and args[2] == self._silenced_path:
+            return False
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_SuppressTelemetryAccessLog())
 
 try:
     import redis as _redis  # type: ignore
@@ -240,6 +256,7 @@ class UploadedHostFieldResult:
     parsed: ParsedMesh
     bounds: list[list[float]]
     host_sdf: np.ndarray
+    host_compute_backend: Literal["cpu", "cuda"]
     block_size: int | None
     active_blocks: list[tuple[int, int, int]] | None
     field_storage_mode: UploadedFieldStorageMode
@@ -970,6 +987,7 @@ def _resolve_uploaded_host_field(
     file_bytes: bytes,
     extension: str,
     resolution: int,
+    compute_backend: ComputeBackend = "auto",
     parsed: ParsedMesh | None = None,
     field_storage_mode: UploadedFieldStorageMode = "auto",
 ) -> UploadedHostFieldResult:
@@ -979,6 +997,7 @@ def _resolve_uploaded_host_field(
         file_bytes=file_bytes,
         extension=extension,
         resolution=resolution,
+        compute_backend=compute_backend,
         field_storage_mode=field_storage_mode,
     )
     cached = uploaded_host_field_cache.get(host_key)
@@ -987,10 +1006,12 @@ def _resolve_uploaded_host_field(
         active_blocks: list[tuple[int, int, int]] | None = None
         if cached.active_blocks:
             active_blocks = [(int(bx), int(by), int(bz)) for bx, by, bz in cached.active_blocks]
+        _log_host_field_backend(cached.host_compute_backend)
         return UploadedHostFieldResult(
             parsed=parsed,
             bounds=bounds,
             host_sdf=cached.host_sdf,
+            host_compute_backend="cuda" if cached.host_compute_backend == "cuda" else "cpu",
             block_size=cached.block_size,
             active_blocks=active_blocks,
             field_storage_mode=cached.field_storage_mode,
@@ -999,7 +1020,12 @@ def _resolve_uploaded_host_field(
             cache_hit=True,
         )
 
-    host = build_host_field(parsed, resolution=resolution, field_storage_mode=field_storage_mode)
+    host = build_host_field(
+        parsed,
+        resolution=resolution,
+        compute_backend=compute_backend,
+        field_storage_mode=field_storage_mode,
+    )
     frozen_host_sdf = _freeze_cached_array(host.host_sdf, np.float32)
 
     uploaded_host_field_cache.set(
@@ -1007,6 +1033,7 @@ def _resolve_uploaded_host_field(
         UploadedHostFieldCacheEntry(
             bounds=[[float(axis[0]), float(axis[1])] for axis in host.bounds],
             host_sdf=frozen_host_sdf,
+            host_compute_backend=host.host_compute_backend,
             field_storage_mode=host.field_storage_mode,
             block_size=host.block_size,
             active_blocks=host.active_blocks,
@@ -1024,6 +1051,7 @@ def _resolve_uploaded_host_field(
         parsed=parsed,
         bounds=host.bounds,
         host_sdf=frozen_host_sdf,
+        host_compute_backend=host.host_compute_backend,
         block_size=host.block_size,
         active_blocks=host.active_blocks,
         field_storage_mode=host.field_storage_mode,
@@ -1195,6 +1223,7 @@ def _resolve_uploaded_composed_field(
             file_bytes=file_bytes,
             extension=extension,
             resolution=resolution,
+            compute_backend=compute_backend,
             parsed=parsed,
             field_storage_mode=field_storage_mode,
         )
@@ -1386,6 +1415,7 @@ def _run_uploaded_mesh_field_preview_data_with_audit(
         file_bytes=file_bytes,
         extension=extension,
         resolution=resolution,
+        compute_backend=compute_backend,
         parsed=metadata.parsed,
         field_storage_mode=field_storage_mode,
     )

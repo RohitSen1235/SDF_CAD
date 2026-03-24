@@ -1,4 +1,5 @@
 import struct
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -199,7 +200,7 @@ def test_octree_sparse_host_sdf_returns_active_blocks_for_large_sparse_volume() 
     occupancy[56:72, 56:72, 56:72] = True
     bounds = [[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
 
-    host_sdf, block_size, active_blocks, sparse_background_value, decision_reason = mesh_upload._build_host_sdf_octree_sparse(
+    host_sdf, block_size, active_blocks, sparse_background_value, decision_reason, host_backend = mesh_upload._build_host_sdf_octree_sparse(
         None,
         occupancy,
         bounds,
@@ -212,6 +213,7 @@ def test_octree_sparse_host_sdf_returns_active_blocks_for_large_sparse_volume() 
     assert len(active_blocks) > 0
     assert sparse_background_value is not None
     assert decision_reason.startswith("sparse_selected") or decision_reason.startswith("dense_sparse")
+    assert host_backend == "cpu"
     assert host_sdf[0, 0, 0] > 0.0
     assert host_sdf[63, 63, 63] < 0.0
 
@@ -221,7 +223,7 @@ def test_octree_sparse_host_sdf_scan_conversion_matches_cube_face_distance() -> 
     bounds = [[-2.0, 3.0], [-2.0, 3.0], [-2.0, 3.0]]
     resolution = 128
     occupancy = mesh_upload._voxelize_and_fill(mesh, bounds, resolution)
-    host_sdf, block_size, active_blocks, sparse_background_value, decision_reason = mesh_upload._build_host_sdf_octree_sparse(
+    host_sdf, block_size, active_blocks, sparse_background_value, decision_reason, host_backend = mesh_upload._build_host_sdf_octree_sparse(
         mesh,
         occupancy,
         bounds,
@@ -249,6 +251,7 @@ def test_octree_sparse_host_sdf_scan_conversion_matches_cube_face_distance() -> 
     assert len(active_blocks) > 0
     assert sparse_background_value is not None
     assert decision_reason.startswith("sparse_selected")
+    assert host_backend == "cpu"
     assert host_sdf[ix_inside, iy, iz] < 0.0
     assert host_sdf[ix_outside, iy, iz] > 0.0
     assert abs(float(host_sdf[ix_inside, iy, iz]) - expected_inside) <= (1.5 * spacing)
@@ -325,6 +328,118 @@ def test_build_host_field_supports_explicit_dense_mode() -> None:
     assert host.field_storage_mode == "dense"
     assert host.block_size is None
     assert host.active_blocks is None
+
+
+def test_build_host_field_reports_gpu_backend_when_cuda_dense_path_is_selected(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
+    bounds = mesh_upload._build_bounds(mesh)
+    occupancy = mesh_upload._voxelize_and_fill(mesh, bounds, resolution=48)
+    cpu_baseline = mesh_upload._build_host_sdf_dense_cpu(occupancy, bounds, 48)
+
+    monkeypatch.setattr(mesh_upload, "_resolve_compute_backend", lambda _requested: "cuda")
+    monkeypatch.setattr(
+        mesh_upload,
+        "_build_host_sdf_dense_cuda",
+        lambda occ, bnds, res: mesh_upload._build_host_sdf_dense_cpu(occ, bnds, res),
+    )
+
+    host = mesh_upload.build_host_field(
+        mesh,
+        resolution=48,
+        compute_backend="cuda",
+        field_storage_mode="dense",
+    )
+
+    captured = capsys.readouterr().out
+    assert "Host field SDF computation used GPU backend" in captured
+    assert host.host_compute_backend == "cuda"
+    assert np.allclose(host.host_sdf, cpu_baseline)
+
+
+def test_build_host_field_reports_cpu_backend_when_cuda_dense_path_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
+    bounds = mesh_upload._build_bounds(mesh)
+    occupancy = mesh_upload._voxelize_and_fill(mesh, bounds, resolution=48)
+    cpu_baseline = mesh_upload._build_host_sdf_dense_cpu(occupancy, bounds, 48)
+
+    monkeypatch.setattr(mesh_upload, "_resolve_compute_backend", lambda _requested: "cuda")
+
+    def fail_cuda(*_args, **_kwargs) -> np.ndarray:
+        raise RuntimeError("cuda failed")
+
+    monkeypatch.setattr(
+        mesh_upload,
+        "_build_host_sdf_dense_cuda",
+        fail_cuda,
+    )
+
+    host = mesh_upload.build_host_field(
+        mesh,
+        resolution=48,
+        compute_backend="cuda",
+        field_storage_mode="dense",
+    )
+
+    captured = capsys.readouterr().out
+    assert "Host field SDF computation used CPU backend" in captured
+    assert host.host_compute_backend == "cpu"
+    assert np.allclose(host.host_sdf, cpu_baseline)
+
+
+def test_uploaded_host_field_threads_compute_backend_to_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app import main as main_module
+
+    main_module.uploaded_host_field_cache.clear()
+
+    mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
+    observed: dict[str, str] = {}
+
+    def fake_build_host_field(
+        parsed,
+        resolution: int,
+        compute_backend: str = "auto",
+        field_storage_mode: str = "auto",
+    ):
+        observed["compute_backend"] = compute_backend
+        return SimpleNamespace(
+            mesh=parsed,
+            bounds=[[-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0]],
+            host_sdf=np.zeros((resolution, resolution, resolution), dtype=np.float32),
+            host_compute_backend="cuda",
+            field_storage_mode="dense",
+            block_size=None,
+            active_blocks=None,
+            sparse_background_value=None,
+            sparse_bricks=None,
+            octree_node_min=None,
+            octree_node_max=None,
+            octree_node_depth=None,
+            octree_node_kind=None,
+            host_build_strategy="dense",
+            host_decision_reason="dense_requested",
+        )
+
+    monkeypatch.setattr(main_module, "build_host_field", fake_build_host_field)
+
+    result = main_module._resolve_uploaded_host_field(
+        file_bytes=_tetra_obj_bytes(),
+        extension=".obj",
+        resolution=48,
+        compute_backend="cuda",
+        parsed=mesh,
+        field_storage_mode="dense",
+    )
+
+    assert observed["compute_backend"] == "cuda"
+    assert result.host_compute_backend == "cuda"
 
 
 def _legacy_compose_field(

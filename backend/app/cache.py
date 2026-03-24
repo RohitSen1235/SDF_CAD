@@ -112,6 +112,7 @@ uploaded_composed_field_cache: LruCache[UploadedComposedFieldCacheEntry] = LruCa
 class UploadedHostFieldCacheEntry:
     bounds: list[list[float]]
     host_sdf: np.ndarray
+    host_compute_backend: str = "cpu"
     field_storage_mode: UploadedFieldStorageMode = "dense"
     block_size: int | None = None
     active_blocks: list[tuple[int, int, int]] | None = None
@@ -314,12 +315,14 @@ def hash_uploaded_mesh_host_request(
     file_bytes: bytes,
     extension: str,
     resolution: int,
+    compute_backend: str = "auto",
     field_storage_mode: str = "auto",
 ) -> str:
     payload: dict[str, Any] = {
         "file_hash": hashlib.sha256(file_bytes).hexdigest(),
         "extension": extension.lower(),
         "resolution": int(resolution),
+        "compute_backend": compute_backend,
         "field_storage_mode": field_storage_mode,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))

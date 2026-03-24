@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import logging
 import struct
 from collections import defaultdict
 from dataclasses import dataclass
@@ -11,6 +12,9 @@ from scipy import ndimage
 from scipy.spatial import cKDTree
 
 from .sparse_field import OctreeField, SparseBrickField, detect_zero_crossing_blocks
+
+logger = logging.getLogger(__name__)
+
 try:
     from numba import njit, prange
 
@@ -28,6 +32,14 @@ except Exception:
     cp = None  # type: ignore[assignment]
     CUPY_AVAILABLE = False
 
+try:
+    import cupyx.scipy.ndimage as cndimage
+
+    CUPYX_AVAILABLE = True
+except Exception:
+    cndimage = None  # type: ignore[assignment]
+    CUPYX_AVAILABLE = False
+
 
 class MeshUploadError(ValueError):
     pass
@@ -44,6 +56,7 @@ class HostFieldData:
     mesh: ParsedMesh
     bounds: list[list[float]]
     host_sdf: np.ndarray
+    host_compute_backend: Literal["cpu", "cuda"] = "cpu"
     field_storage_mode: Literal["dense", "octree_sparse"] = "dense"
     block_size: int | None = None
     active_blocks: list[tuple[int, int, int]] | None = None
@@ -60,6 +73,11 @@ class HostFieldData:
 _AUTO_SPARSE_MAX_EST_NEAR_RATIO = 0.60
 _AUTO_SPARSE_MAX_EST_TRI_BLOCK_HITS = 1_200_000
 _AUTO_SPARSE_MAX_EST_TRIANGLES_PER_ACTIVE_BLOCK = 4_000.0
+
+
+def _log_host_field_backend(backend: Literal["cpu", "cuda"]) -> None:
+    message = f"Host field SDF computation used {backend.upper()} backend"
+    print(message, flush=True)
 
 
 def parse_mesh_bytes(data: bytes, extension: str) -> ParsedMesh:
@@ -148,6 +166,8 @@ def compute_resolution_for_lattice_pitch(
 def build_host_field(
     mesh: ParsedMesh,
     resolution: int,
+    *,
+    compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
     field_storage_mode: Literal["auto", "dense", "octree_sparse"] = "auto",
 ) -> HostFieldData:
     if resolution < 24:
@@ -157,11 +177,18 @@ def build_host_field(
     occupancy = _voxelize_and_fill(mesh, bounds, resolution)
 
     if field_storage_mode == "dense":
-        host_sdf = np.asarray(_build_host_sdf_dense(occupancy, bounds, resolution), dtype=np.float32)
+        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+            occupancy,
+            bounds,
+            resolution,
+            compute_backend=compute_backend,
+        )
+        _log_host_field_backend(host_backend)
         return HostFieldData(
             mesh=mesh,
             bounds=bounds,
             host_sdf=host_sdf,
+            host_compute_backend=host_backend,
             field_storage_mode="dense",
             block_size=None,
             active_blocks=None,
@@ -170,14 +197,16 @@ def build_host_field(
         )
 
     allow_dense_fallback = field_storage_mode == "auto"
-    host_sdf, block_size, active_blocks, sparse_background_value, decision_reason = _build_host_sdf_octree_sparse(
+    host_sdf, block_size, active_blocks, sparse_background_value, decision_reason, host_backend = _build_host_sdf_octree_sparse(
         mesh,
         occupancy,
         bounds,
         resolution,
         allow_dense_fallback=allow_dense_fallback,
+        compute_backend=compute_backend,
     )
     host_sdf = np.asarray(host_sdf, dtype=np.float32)
+    _log_host_field_backend(host_backend)
 
     use_sparse = bool(block_size and active_blocks)
 
@@ -194,6 +223,7 @@ def build_host_field(
             mesh=mesh,
             bounds=bounds,
             host_sdf=host_sdf,
+            host_compute_backend=host_backend,
             field_storage_mode="octree_sparse",
             block_size=int(sparse.block_size),
             active_blocks=sparse.active_blocks(),
@@ -213,6 +243,7 @@ def build_host_field(
         mesh=mesh,
         bounds=bounds,
         host_sdf=host_sdf,
+        host_compute_backend=host_backend,
         field_storage_mode="dense",
         block_size=block_size,
         active_blocks=active_blocks,
@@ -222,7 +253,7 @@ def build_host_field(
     )
 
 
-def _build_host_sdf_dense(
+def _build_host_sdf_dense_cpu(
     occupancy: np.ndarray,
     bounds: list[list[float]],
     resolution: int,
@@ -231,7 +262,47 @@ def _build_host_sdf_dense(
     outside = np.logical_not(occupancy)
     dist_out = ndimage.distance_transform_edt(outside, sampling=spacing)
     dist_in = ndimage.distance_transform_edt(occupancy, sampling=spacing)
-    return dist_out - dist_in
+    return np.asarray(dist_out - dist_in, dtype=np.float32)
+
+
+def _build_host_sdf_dense(
+    occupancy: np.ndarray,
+    bounds: list[list[float]],
+    resolution: int,
+) -> np.ndarray:
+    return _build_host_sdf_dense_cpu(occupancy, bounds, resolution)
+
+
+def _build_host_sdf_dense_cuda(
+    occupancy: np.ndarray,
+    bounds: list[list[float]],
+    resolution: int,
+) -> np.ndarray:
+    if not CUPY_AVAILABLE or cp is None or not CUPYX_AVAILABLE or cndimage is None:
+        raise MeshUploadError("CUDA dense EDT requires CuPy and cupyx.scipy.ndimage")
+
+    spacing = _bounds_spacing(bounds, resolution)
+    occupancy_gpu = cp.asarray(occupancy, dtype=cp.bool_)
+    outside_gpu = cp.logical_not(occupancy_gpu)
+    dist_out = cndimage.distance_transform_edt(outside_gpu, sampling=spacing)
+    dist_in = cndimage.distance_transform_edt(occupancy_gpu, sampling=spacing)
+    return cp.asnumpy(dist_out - dist_in).astype(np.float32, copy=False)
+
+
+def _build_host_sdf_dense_with_backend(
+    occupancy: np.ndarray,
+    bounds: list[list[float]],
+    resolution: int,
+    *,
+    compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
+) -> tuple[np.ndarray, Literal["cpu", "cuda"]]:
+    resolved_backend = _resolve_compute_backend(compute_backend)
+    if resolved_backend == "cuda":
+        try:
+            return _build_host_sdf_dense_cuda(occupancy, bounds, resolution), "cuda"
+        except Exception:
+            logger.info("Dense host field CUDA path failed; falling back to CPU EDT", exc_info=True)
+    return _build_host_sdf_dense_cpu(occupancy, bounds, resolution), "cpu"
 
 
 def _octree_collect_surface_blocks(
@@ -504,13 +575,21 @@ def _build_host_sdf_from_surface_samples(
     occupancy: np.ndarray,
     bounds: list[list[float]],
     resolution: int,
-) -> tuple[np.ndarray, int | None, list[tuple[int, int, int]] | None, float | None, str]:
+    *,
+    compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
+) -> tuple[np.ndarray, int | None, list[tuple[int, int, int]] | None, float | None, str, Literal["cpu", "cuda"]]:
     spacing = _bounds_spacing(bounds, resolution)
     max_spacing = float(max(spacing))
     eroded = ndimage.binary_erosion(occupancy, iterations=1)
     surface = np.logical_xor(occupancy, eroded)
     if not np.any(surface):
-        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None, "dense_sparse_no_surface"
+        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+            occupancy,
+            bounds,
+            resolution,
+            compute_backend=compute_backend,
+        )
+        return host_sdf, None, None, None, "dense_sparse_no_surface", host_backend
 
     block_size = max(8, min(32, resolution // 6))
     band_voxels = max(12, resolution // 6)
@@ -518,7 +597,13 @@ def _build_host_sdf_from_surface_samples(
 
     surface_blocks = _octree_collect_surface_blocks(surface, block_size=block_size)
     if not surface_blocks:
-        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None, "dense_sparse_no_surface_blocks"
+        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+            occupancy,
+            bounds,
+            resolution,
+            compute_backend=compute_backend,
+        )
+        return host_sdf, None, None, None, "dense_sparse_no_surface_blocks", host_backend
 
     blocks_per_axis = int(math.ceil(resolution / float(block_size)))
     halo_blocks = max(1, int(math.ceil(float(band_voxels) / float(block_size))))
@@ -545,18 +630,24 @@ def _build_host_sdf_from_surface_samples(
 
     near_ratio = float(np.count_nonzero(near_mask)) / float(near_mask.size)
     if near_ratio >= 0.65:
-        return (
-            _build_host_sdf_dense(occupancy, bounds, resolution),
-            None,
-            None,
-            None,
-            "dense_sparse_post_near_ratio",
+        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+            occupancy,
+            bounds,
+            resolution,
+            compute_backend=compute_backend,
         )
+        return host_sdf, None, None, None, "dense_sparse_post_near_ratio", host_backend
 
     surface_idx = np.argwhere(surface)
     query_idx = np.argwhere(near_mask)
     if surface_idx.size == 0 or query_idx.size == 0:
-        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None, "dense_sparse_no_query_points"
+        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+            occupancy,
+            bounds,
+            resolution,
+            compute_backend=compute_backend,
+        )
+        return host_sdf, None, None, None, "dense_sparse_no_query_points", host_backend
 
     origin = np.asarray([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
     spacing_vec = np.asarray(spacing, dtype=np.float64)
@@ -567,7 +658,13 @@ def _build_host_sdf_from_surface_samples(
         tree = cKDTree(surface_pts)
         query_dist, _ = tree.query(query_pts, workers=-1)
     except Exception:
-        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None, "dense_sparse_kdtree_failure"
+        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+            occupancy,
+            bounds,
+            resolution,
+            compute_backend=compute_backend,
+        )
+        return host_sdf, None, None, None, "dense_sparse_kdtree_failure", host_backend
 
     sign = np.where(occupancy, -1.0, 1.0).astype(np.float32, copy=False)
     far_value = np.float32(max(band_distance + 2.0 * max_spacing, max_spacing))
@@ -576,7 +673,7 @@ def _build_host_sdf_from_surface_samples(
     signed_query = query_dist.astype(np.float32, copy=False) * sign[query_idx[:, 0], query_idx[:, 1], query_idx[:, 2]]
     host_sdf[query_idx[:, 0], query_idx[:, 1], query_idx[:, 2]] = signed_query
     active_blocks_sorted = sorted(active_blocks)
-    return host_sdf, block_size, active_blocks_sorted, float(far_value), "sparse_selected_surface_samples"
+    return host_sdf, block_size, active_blocks_sorted, float(far_value), "sparse_selected_surface_samples", "cpu"
 
 
 def _build_host_sdf_octree_sparse(
@@ -586,10 +683,24 @@ def _build_host_sdf_octree_sparse(
     resolution: int,
     *,
     allow_dense_fallback: bool = True,
-) -> tuple[np.ndarray, int | None, list[tuple[int, int, int]] | None, float | None, str]:
+    compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
+) -> tuple[
+    np.ndarray,
+    int | None,
+    list[tuple[int, int, int]] | None,
+    float | None,
+    str,
+    Literal["cpu", "cuda"],
+]:
     # For smaller grids, full EDT is typically faster and simpler.
     if resolution <= 96:
-        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None, "dense_resolution_cutoff"
+        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+            occupancy,
+            bounds,
+            resolution,
+            compute_backend=compute_backend,
+        )
+        return host_sdf, None, None, None, "dense_resolution_cutoff", host_backend
 
     spacing = _bounds_spacing(bounds, resolution)
     max_spacing = float(max(spacing))
@@ -600,7 +711,12 @@ def _build_host_sdf_octree_sparse(
     far_value = np.float32(max(band_distance + 2.0 * max_spacing, max_spacing))
 
     if mesh is None:
-        return _build_host_sdf_from_surface_samples(occupancy, bounds, resolution)
+        return _build_host_sdf_from_surface_samples(
+            occupancy,
+            bounds,
+            resolution,
+            compute_backend=compute_backend,
+        )
 
     if allow_dense_fallback:
         profitable, reason, _near_ratio, _tri_hits, _tri_per_block = _estimate_sparse_profitability(
@@ -611,7 +727,13 @@ def _build_host_sdf_octree_sparse(
             band_distance=band_distance,
         )
         if not profitable:
-            return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None, reason
+            host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+                occupancy,
+                bounds,
+                resolution,
+                compute_backend=compute_backend,
+            )
+            return host_sdf, None, None, None, reason, host_backend
 
     triangles, block_candidates, active_blocks, near_ratio = _triangle_scan_convert_candidates(
         mesh,
@@ -621,11 +743,23 @@ def _build_host_sdf_octree_sparse(
         band_distance=band_distance,
     )
     if not active_blocks:
-        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None, "dense_sparse_no_active_blocks"
+        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+            occupancy,
+            bounds,
+            resolution,
+            compute_backend=compute_backend,
+        )
+        return host_sdf, None, None, None, "dense_sparse_no_active_blocks", host_backend
 
     if allow_dense_fallback and near_ratio >= 0.65:
         # Sparse path helps only when most of the domain is pruned.
-        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None, "dense_sparse_post_near_ratio"
+        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+            occupancy,
+            bounds,
+            resolution,
+            compute_backend=compute_backend,
+        )
+        return host_sdf, None, None, None, "dense_sparse_post_near_ratio", host_backend
 
     sign = np.where(occupancy, -1.0, 1.0).astype(np.float32, copy=False)
     host_sdf = sign * far_value
@@ -669,10 +803,16 @@ def _build_host_sdf_octree_sparse(
         refined_blocks.append((bx, by, bz))
 
     if not refined_blocks:
-        return _build_host_sdf_dense(occupancy, bounds, resolution), None, None, None, "dense_sparse_no_refined_blocks"
+        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+            occupancy,
+            bounds,
+            resolution,
+            compute_backend=compute_backend,
+        )
+        return host_sdf, None, None, None, "dense_sparse_no_refined_blocks", host_backend
 
     strategy_reason = "sparse_selected_auto" if allow_dense_fallback else "sparse_selected_explicit"
-    return host_sdf, block_size, refined_blocks, float(far_value), strategy_reason
+    return host_sdf, block_size, refined_blocks, float(far_value), strategy_reason, "cpu"
 
 
 def compose_hollow_lattice_field_sparse_with_backend(
