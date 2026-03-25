@@ -8,17 +8,24 @@ services:
   backend:
     build:
       context: ./backend
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     ports:
       - "8000:8000"
 
   worker:
     build:
       context: ./backend
+    gpus: all
     profiles: ["queue"]
     depends_on:
       - redis
     environment:
       REDIS_URL: redis://redis:6379/0
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     command: ["celery", "-A", "app.worker:celery_app", "worker", "--loglevel=info", "--concurrency=1", "--pool=solo"]
 
   frontend:

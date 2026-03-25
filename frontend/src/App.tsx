@@ -3,12 +3,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Viewer } from "./components/Viewer";
 import {
   compileScene,
+  commitUploadedMesh,
   exportMesh,
   exportUploadedMesh,
   previewField,
   previewMesh,
   preprocessUploadedMesh,
-  previewUploadedMesh,
   previewUploadedMeshField,
   submitUploadedFieldPreviewTelemetry
 } from "./lib/api";
@@ -228,6 +228,7 @@ export default function App() {
   const [computeBackend, setComputeBackend] = useState<ComputeBackend>("auto");
   const [meshBackend, setMeshBackend] = useState<MeshBackend>("auto");
   const [meshingMode, setMeshingMode] = useState<MeshingMode>("uniform");
+  const [uploadedMeshFieldSignature, setUploadedMeshFieldSignature] = useState<string | null>(null);
   const [sectionEnabled, setSectionEnabled] = useState(false);
   const [sectionLevel, setSectionLevel] = useState(0);
   const [sectionYBounds, setSectionYBounds] = useState<[number, number]>([-2, 2]);
@@ -256,6 +257,33 @@ export default function App() {
     }),
     [meshShellThickness, meshLatticeType, meshLatticePitch, meshLatticeThickness, meshLatticePhase]
   );
+
+  const currentUploadedMeshFieldSignature = useMemo(() => {
+    if (!meshFile) {
+      return null;
+    }
+    return [
+      meshFile.name,
+      meshFile.size,
+      meshFile.lastModified,
+      meshShellThickness,
+      meshLatticeType,
+      meshLatticePitch,
+      meshLatticeThickness,
+      meshLatticePhase,
+      computeBackend,
+      voxelsPerLatticePeriod
+    ].join("|");
+  }, [
+    meshFile,
+    meshShellThickness,
+    meshLatticeType,
+    meshLatticePitch,
+    meshLatticeThickness,
+    meshLatticePhase,
+    computeBackend,
+    voxelsPerLatticePeriod
+  ]);
 
   const meshMemoryRisk = useMemo(() => {
     if (!meshMemoryContext) {
@@ -381,6 +409,7 @@ export default function App() {
       setField(response.field);
       setMesh(null);
       setStats(response.stats);
+      setUploadedMeshFieldSignature(currentUploadedMeshFieldSignature);
       setUploadedFieldPreviewTrace(
         response.trace
           ? {
@@ -412,6 +441,7 @@ export default function App() {
     computeBackend,
     meshFile,
     meshWorkflowParams,
+    currentUploadedMeshFieldSignature,
     voxelsPerLatticePeriod
   ]);
 
@@ -453,6 +483,7 @@ export default function App() {
       previewRunIdRef.current = runId;
       setIsPreviewing(true);
       setError(null);
+      setUploadedMeshFieldSignature(null);
       // Clear stale visuals before starting a new Generate Shape run.
       setField(null);
       setMesh(null);
@@ -687,8 +718,8 @@ export default function App() {
       setError("Upload an STL or OBJ file first.");
       return;
     }
-    if (meshMemoryFatal) {
-      setError(meshMemoryRisk?.fatalMessage ?? "Estimated memory exceeds available system capacity.");
+    if (uploadedMeshFieldSignature !== currentUploadedMeshFieldSignature) {
+      setError("Preview Field first before committing the mesh.");
       return;
     }
 
@@ -696,7 +727,7 @@ export default function App() {
     setIsPreviewing(true);
     setError(null);
     try {
-      const response = await previewUploadedMesh(
+      const response = await commitUploadedMesh(
         meshFile,
         meshWorkflowParams,
         computeBackend,
@@ -704,7 +735,6 @@ export default function App() {
         meshingMode,
         voxelsPerLatticePeriod
       );
-      setField(response.field ?? null);
       setMesh(response.mesh);
       setStats(response.stats);
       setUploadedFieldPreviewTrace(null);
@@ -747,10 +777,30 @@ export default function App() {
     if (workflow !== "mesh") {
       return;
     }
+    if (!meshFile || uploadedMeshFieldSignature !== currentUploadedMeshFieldSignature) {
+      setField(null);
+      setMesh(null);
+      setStats(null);
+      setUploadedFieldPreviewTrace(null);
+      setMeshCommitted(false);
+    }
+  }, [workflow, meshFile, uploadedMeshFieldSignature, currentUploadedMeshFieldSignature]);
+
+  useEffect(() => {
+    setMesh(null);
+    setStats(null);
     setMeshCommitted(false);
+  }, [meshBackend]);
+
+  useEffect(() => {
+    abortActiveMeshFieldPreview();
+    setUploadedMeshFieldSignature(null);
+    setField(null);
+    setMesh(null);
+    setStats(null);
     setUploadedFieldPreviewTrace(null);
+    setMeshCommitted(false);
   }, [
-    workflow,
     meshFile,
     meshShellThickness,
     meshLatticeType,
@@ -758,9 +808,8 @@ export default function App() {
     meshLatticeThickness,
     meshLatticePhase,
     computeBackend,
-    meshBackend,
-    meshingMode,
-    voxelsPerLatticePeriod
+    voxelsPerLatticePeriod,
+    abortActiveMeshFieldPreview
   ]);
 
   const onUploadedFieldPreviewVisible = useCallback(
@@ -1020,6 +1069,7 @@ export default function App() {
                       setMesh(null);
                       setStats(null);
                       setUploadedFieldPreviewTrace(null);
+                      setUploadedMeshFieldSignature(null);
                       setMeshCommitted(false);
                       setMeshMemoryContext(null);
                       setError(null);
@@ -1246,7 +1296,11 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => void onCommitMesh()}
-                  disabled={!meshFile || meshMemoryFatal}
+                  disabled={
+                    !meshFile ||
+                    uploadedMeshFieldSignature !== currentUploadedMeshFieldSignature ||
+                    isPreviewing
+                  }
                 >
                   Commit Design & Compute Mesh
                 </button>

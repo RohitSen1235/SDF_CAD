@@ -502,6 +502,58 @@ export async function previewUploadedMesh(
   }
 }
 
+export async function commitUploadedMesh(
+  file: File,
+  params: MeshWorkflowParams,
+  computeBackend: ComputeBackend = "auto",
+  meshBackend: MeshBackend = "auto",
+  meshingMode: MeshingMode = "uniform",
+  voxelsPerLatticePeriod: number = 6
+): Promise<PreviewMeshResponse> {
+  try {
+    const body = new FormData();
+    appendMeshWorkflowFormData(body, file, params, computeBackend, meshBackend, meshingMode, voxelsPerLatticePeriod);
+    const response = await fetch(`${API_BASE}/api/v1/mesh/commit.binary`, {
+      method: "POST",
+      body
+    });
+    if (response.ok) {
+      const packet = await response.arrayBuffer();
+      return {
+        mesh: decodeBinaryMeshPacket(packet),
+        stats: parseStatsHeader(response)
+      };
+    }
+    if (response.status !== 404 && response.status !== 405) {
+      await parseErrorResponse(response, "Uploaded mesh commit failed");
+    }
+
+    const fallbackBody = new FormData();
+    appendMeshWorkflowFormData(
+      fallbackBody,
+      file,
+      params,
+      computeBackend,
+      meshBackend,
+      meshingMode,
+      voxelsPerLatticePeriod
+    );
+    const fallback = await fetch(`${API_BASE}/api/v1/mesh/commit`, {
+      method: "POST",
+      body: fallbackBody
+    });
+    return parseJsonOrThrow(fallback);
+  } catch (error) {
+    if ((error as Error)?.name === "AbortError") {
+      throw error;
+    }
+    if (error instanceof TypeError) {
+      throw asNetworkError(error);
+    }
+    throw error;
+  }
+}
+
 export async function previewUploadedMeshField(
   file: File,
   params: MeshWorkflowParams,

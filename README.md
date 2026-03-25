@@ -47,6 +47,10 @@ From the repository root:
 docker compose up --build
 ```
 
+The backend container is configured to request NVIDIA GPU access, so Docker will only expose the GPU if the host has a compatible NVIDIA driver and the NVIDIA Container Toolkit installed.
+
+If Docker returns an error like `could not select device driver "" with capabilities: [[gpu]]`, the host still needs NVIDIA Container Toolkit setup. On Linux, configure Docker with `sudo nvidia-ctk runtime configure --runtime=docker` and restart Docker with `sudo systemctl restart docker`. For rootless Docker, use the user daemon config path described in the NVIDIA Container Toolkit docs.
+
 This starts:
 
 - Frontend: `http://127.0.0.1:5173`

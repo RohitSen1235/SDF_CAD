@@ -17,7 +17,7 @@ const previewField = vi.fn();
 const previewMesh = vi.fn();
 const exportMesh = vi.fn();
 const preprocessUploadedMesh = vi.fn();
-const previewUploadedMesh = vi.fn();
+const commitUploadedMesh = vi.fn();
 const previewUploadedMeshField = vi.fn();
 const exportUploadedMesh = vi.fn();
 const submitUploadedFieldPreviewTelemetry = vi.fn();
@@ -28,7 +28,7 @@ vi.mock("./lib/api", () => ({
   previewMesh: (...args: unknown[]) => previewMesh(...args),
   exportMesh: (...args: unknown[]) => exportMesh(...args),
   preprocessUploadedMesh: (...args: unknown[]) => preprocessUploadedMesh(...args),
-  previewUploadedMesh: (...args: unknown[]) => previewUploadedMesh(...args),
+  commitUploadedMesh: (...args: unknown[]) => commitUploadedMesh(...args),
   previewUploadedMeshField: (...args: unknown[]) => previewUploadedMeshField(...args),
   exportUploadedMesh: (...args: unknown[]) => exportUploadedMesh(...args),
   submitUploadedFieldPreviewTelemetry: (...args: unknown[]) => submitUploadedFieldPreviewTelemetry(...args)
@@ -110,6 +110,16 @@ describe("App", () => {
     });
     previewField.mockResolvedValue(fieldPreviewPayload);
     previewMesh.mockResolvedValue(meshPreviewPayload);
+    commitUploadedMesh.mockResolvedValue({
+      ...meshPreviewPayload,
+      stats: {
+        ...meshPreviewPayload.stats,
+        eval_ms: 0,
+        mesh_ms: 4,
+        field_cache_hit: true,
+        mesh_cache_hit: false
+      }
+    });
     exportMesh.mockResolvedValue(new Blob(["ok"]));
     preprocessUploadedMesh.mockResolvedValue({
       mesh: outerMeshPayload,
@@ -123,7 +133,6 @@ describe("App", () => {
         safetyFactor: 1.25
       }
     });
-    previewUploadedMesh.mockResolvedValue(meshPreviewPayload);
     previewUploadedMeshField.mockResolvedValue(fieldPreviewPayload);
     exportUploadedMesh.mockResolvedValue(new Blob(["ok"]));
     submitUploadedFieldPreviewTelemetry.mockResolvedValue(undefined);
@@ -272,7 +281,7 @@ describe("App", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
 
-    previewUploadedMesh.mockClear();
+    commitUploadedMesh.mockClear();
     previewUploadedMeshField.mockClear();
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
@@ -283,7 +292,7 @@ describe("App", () => {
     await waitFor(() => expect(preprocessUploadedMesh).toHaveBeenCalledTimes(1));
 
     expect(previewUploadedMeshField).not.toHaveBeenCalled();
-    expect(previewUploadedMesh).not.toHaveBeenCalled();
+    expect(commitUploadedMesh).not.toHaveBeenCalled();
 
     fireEvent.change(screen.getByLabelText("Unit cell size (mm)"), { target: { value: "0.55" } });
     fireEvent.change(screen.getByLabelText("Lattice half-thickness (mm)"), { target: { value: "0.12" } });
@@ -293,6 +302,30 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Voxels per lattice period"), { target: { value: "8" } });
 
     expect(previewUploadedMeshField).not.toHaveBeenCalled();
+  });
+
+  it("enables commit only after Preview Field succeeds and disables it again on field changes", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+
+    await waitFor(() => expect(preprocessUploadedMesh).toHaveBeenCalledTimes(1));
+
+    const commitButton = screen.getByRole("button", { name: "Commit Design & Compute Mesh" });
+    expect(commitButton).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    await waitFor(() => expect(previewUploadedMeshField).toHaveBeenCalledTimes(1));
+    expect(commitButton).not.toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("Mesh field backend"), { target: { value: "cuda" } });
+    expect(commitButton).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    await waitFor(() => expect(previewUploadedMeshField).toHaveBeenCalledTimes(2));
+    expect(commitButton).not.toBeDisabled();
   });
 
   it("removes uploaded mesh quality controls while keeping DSL quality", () => {
@@ -388,7 +421,14 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Preview Field" })).not.toBeDisabled();
     });
-    expect(screen.getByRole("button", { name: "Commit Design & Compute Mesh" })).not.toBeDisabled();
+    const commitButton = screen.getByRole("button", { name: "Commit Design & Compute Mesh" });
+    expect(commitButton).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
+    expect(commitButton).not.toBeDisabled();
   });
 
   it("runs uploaded field preview immediately when Preview Field is clicked", async () => {
@@ -553,7 +593,7 @@ describe("App", () => {
     });
   });
 
-  it("keeps the last preview visible after mesh parameter changes until re-previewed", async () => {
+  it("clears the mesh preview after parameter changes and requires re-preview", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
 
@@ -569,7 +609,7 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Lattice phase"), { target: { value: "0.35" } });
     expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
-    expect(latestViewerProps.field).toEqual(fieldPreviewPayload.field);
+    expect(latestViewerProps.field).toBeNull();
     expect(latestViewerProps.mesh).toBeNull();
   });
 
@@ -635,35 +675,50 @@ describe("App", () => {
   it("commits mesh only when commit button is clicked", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
-    previewUploadedMesh.mockClear();
+    commitUploadedMesh.mockClear();
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
 
     fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(commitUploadedMesh).toHaveBeenCalled();
     });
   });
 
   it("sends selected mesh workflow backends on commit", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
-    previewUploadedMesh.mockClear();
+    commitUploadedMesh.mockClear();
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
     fireEvent.change(screen.getByLabelText("Mesh field backend"), { target: { value: "cuda" } });
     fireEvent.change(screen.getByLabelText("Mesh mesher backend"), { target: { value: "cuda" } });
 
-    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
+    expect(screen.getByRole("button", { name: "Commit Design & Compute Mesh" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(2);
     });
 
-    const calls = previewUploadedMesh.mock.calls;
+    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
+    await waitFor(() => {
+      expect(commitUploadedMesh).toHaveBeenCalled();
+    });
+
+    const calls = commitUploadedMesh.mock.calls;
     const lastCall = calls[calls.length - 1];
     expect(lastCall?.[2]).toBe("cuda");
     expect(lastCall?.[3]).toBe("cuda");
@@ -672,19 +727,23 @@ describe("App", () => {
   it("sends selected meshing mode for mesh workflow commit", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
-    previewUploadedMesh.mockClear();
+    commitUploadedMesh.mockClear();
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
     fireEvent.change(screen.getByLabelText("Mesh meshing mode"), { target: { value: "adaptive" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(commitUploadedMesh).toHaveBeenCalled();
     });
 
-    const calls = previewUploadedMesh.mock.calls;
+    const calls = commitUploadedMesh.mock.calls;
     const lastCall = calls[calls.length - 1];
     expect(lastCall?.[4]).toBe("adaptive");
   });
@@ -693,7 +752,7 @@ describe("App", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
     previewUploadedMeshField.mockClear();
-    previewUploadedMesh.mockClear();
+    commitUploadedMesh.mockClear();
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
@@ -706,11 +765,11 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(commitUploadedMesh).toHaveBeenCalled();
     });
 
     expect(previewUploadedMeshField.mock.calls[0]).toHaveLength(5);
-    expect(previewUploadedMesh.mock.calls[0]).toHaveLength(6);
+    expect(commitUploadedMesh.mock.calls[0]).toHaveLength(6);
   });
 
   it("disables mesh export until commit completes and resets on input changes", async () => {
@@ -720,13 +779,17 @@ describe("App", () => {
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
 
     const exportStl = screen.getByRole("button", { name: "Export STL" });
     expect(exportStl).toBeDisabled();
 
     fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(commitUploadedMesh).toHaveBeenCalled();
     });
 
     expect(exportStl).not.toBeDisabled();
@@ -746,7 +809,7 @@ describe("App", () => {
   });
 
   it("shows separate field and mesh cache status for cached uploaded mesh commits", async () => {
-    previewUploadedMesh.mockResolvedValueOnce({
+    commitUploadedMesh.mockResolvedValueOnce({
       ...meshPreviewPayload,
       stats: {
         ...meshPreviewPayload.stats,
@@ -762,6 +825,10 @@ describe("App", () => {
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
     fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
     fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
 
     await waitFor(() => {

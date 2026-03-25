@@ -461,6 +461,57 @@ def test_mesh_field_endpoint_does_not_call_mesher(monkeypatch: pytest.MonkeyPatc
     assert response.json()["stats"]["preview_mode"] == "field"
 
 
+def test_mesh_commit_endpoint_requires_preview_field_first() -> None:
+    from app import cache as cache_module
+
+    cache_module.clear_all_preview_caches()
+
+    response = client.post(
+        "/api/v1/mesh/commit",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 409
+    assert "Preview Field first" in response.json()["detail"]
+
+
+def test_mesh_commit_endpoint_uses_cached_field_without_recomputing_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app import cache as cache_module
+
+    cache_module.clear_all_preview_caches()
+
+    field_response = client.post(
+        "/api/v1/mesh/field.binary",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert field_response.status_code == 200
+
+    def fail_memory_guard(**_kwargs):
+        raise AssertionError("Uploaded mesh memory guard should not run for commit-only path")
+
+    def fail_field_compute(**_kwargs):
+        raise AssertionError("Field recomputation should not run for commit-only path")
+
+    monkeypatch.setattr(main_module, "_enforce_uploaded_mesh_memory_guard", fail_memory_guard)
+    monkeypatch.setattr(main_module, "_resolve_uploaded_composed_field", fail_field_compute)
+
+    response = client.post(
+        "/api/v1/mesh/commit.binary",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/octet-stream")
+    stats = json.loads(response.headers["x-sdf-stats"])
+    assert stats["preview_mode"] == "mesh"
+    assert stats["field_cache_hit"] is True
+    assert stats["mesh_cache_hit"] is False
+    assert stats["eval_ms"] == 0.0
+
+
 def test_mesh_preview_preserves_original_outer_vertices() -> None:
     response = client.post(
         "/api/v1/mesh/preview",

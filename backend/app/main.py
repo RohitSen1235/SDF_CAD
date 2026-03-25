@@ -1692,6 +1692,218 @@ def _resolve_uploaded_composed_field(
     )
 
 
+def _resolve_cached_uploaded_mesh_commit_inputs(
+    *,
+    file_bytes: bytes,
+    file_hash: str,
+    extension: str,
+    shell_thickness: float,
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"],
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+    voxels_per_lattice_period: int = 6,
+    compute_backend: ComputeBackend = "auto",
+    field_storage_mode: UploadedFieldStorageMode = "auto",
+) -> tuple[
+    UploadedMeshMetadata,
+    int,
+    UploadedHostFieldCacheEntry,
+    UploadedComposedFieldCacheEntry,
+]:
+    metadata = _resolve_uploaded_mesh_metadata(
+        file_bytes=file_bytes,
+        file_hash=file_hash,
+        extension=extension,
+    )
+    resolution, _ = _resolve_mesh_resolution(
+        lattice_pitch,
+        metadata.mesh_span,
+        voxels_per_lattice_period,
+    )
+    host_key = hash_uploaded_mesh_host_request(
+        file_hash=file_hash,
+        extension=extension,
+        resolution=resolution,
+        compute_backend=compute_backend,
+        field_storage_mode=field_storage_mode,
+    )
+    field_key = _uploaded_mesh_field_payload_key(
+        file_hash=file_hash,
+        extension=extension,
+        resolution=resolution,
+        shell_thickness=shell_thickness,
+        lattice_type=lattice_type,
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+        voxels_per_lattice_period=voxels_per_lattice_period,
+        compute_backend=compute_backend,
+        field_storage_mode=field_storage_mode,
+    )
+    host_cached = uploaded_host_field_cache.get(host_key)
+    field_cached = uploaded_composed_field_cache.get(field_key)
+    if host_cached is None or field_cached is None:
+        raise MeshUploadError("Preview Field first before committing the mesh.")
+    return metadata, resolution, host_cached, field_cached
+
+
+def _run_uploaded_mesh_commit_meshdata(
+    *,
+    file_bytes: bytes,
+    file_hash: str,
+    extension: str,
+    shell_thickness: float,
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"],
+    lattice_pitch: float,
+    lattice_thickness: float,
+    lattice_phase: float,
+    voxels_per_lattice_period: int = 6,
+    compute_backend: ComputeBackend = "auto",
+    mesh_backend: MeshBackend = "auto",
+    meshing_mode: MeshingMode = "uniform",
+    field_storage_mode: UploadedFieldStorageMode = "auto",
+    encode_response_payloads: bool = True,
+) -> tuple[MeshData, PreviewStats, MeshPayload | None]:
+    metadata, resolution, host_cached, field_cached = _resolve_cached_uploaded_mesh_commit_inputs(
+        file_bytes=file_bytes,
+        file_hash=file_hash,
+        extension=extension,
+        shell_thickness=shell_thickness,
+        lattice_type=lattice_type,
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+        voxels_per_lattice_period=voxels_per_lattice_period,
+        compute_backend=compute_backend,
+        field_storage_mode=field_storage_mode,
+    )
+    cache_key = hash_uploaded_mesh_request(
+        file_hash=file_hash,
+        extension=extension,
+        resolution=resolution,
+        shell_thickness=shell_thickness,
+        lattice_type=lattice_type,
+        lattice_pitch=lattice_pitch,
+        lattice_thickness=lattice_thickness,
+        lattice_phase=lattice_phase,
+        voxels_per_lattice_period=voxels_per_lattice_period,
+        compute_backend=compute_backend,
+        mesh_backend=mesh_backend,
+        meshing_mode=meshing_mode,
+        field_storage_mode=field_storage_mode,
+    )
+    cached_mesh = uploaded_mesh_preview_cache.get(cache_key)
+    if (
+        cached_mesh is not None
+        and mesh_backend != "cpu"
+        and str(cached_mesh.stats.get("mesh_backend", "cpu")) == "cpu"
+        and is_cuda_meshing_available()
+    ):
+        cached_mesh = None
+
+    if cached_mesh is not None:
+        cached_stats = copy.deepcopy(cached_mesh.stats)
+        cached_stats["cache_hit"] = True
+        cached_stats["field_cache_hit"] = True
+        cached_stats["mesh_cache_hit"] = True
+        cached_stats["eval_ms"] = 0.0
+        cached_stats["mesh_ms"] = 0.0
+        cached_field = _build_uploaded_field_payload_from_cache_entry(
+            cache_entry=cached_mesh,
+            file_hash=file_hash,
+            extension=extension,
+            resolution=resolution,
+            shell_thickness=shell_thickness,
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+            voxels_per_lattice_period=voxels_per_lattice_period,
+            compute_backend=compute_backend,
+            field_storage_mode=field_storage_mode,
+        )
+        cached_mesh_payload = cached_mesh.mesh
+        if encode_response_payloads and cached_mesh_payload is None:
+            cached_mesh_payload = _encode_mesh_payload(
+                MeshData(
+                    vertices=cached_mesh.vertices,
+                    faces=cached_mesh.faces,
+                    normals=cached_mesh.normals,
+                )
+            )
+        uploaded_mesh_preview_cache.set(
+            cache_key,
+            UploadedMeshCacheEntry(
+                mesh=cached_mesh_payload if encode_response_payloads else cached_mesh.mesh,
+                vertices=cached_mesh.vertices,
+                faces=cached_mesh.faces,
+                normals=cached_mesh.normals,
+                stats=cached_stats,
+                field_resolution=int(cached_field.resolution),
+                field_bounds=[[float(axis[0]), float(axis[1])] for axis in cached_field.bounds],
+                field_data=cached_field.data,
+            )
+        )
+        return (
+            MeshData(
+                vertices=cached_mesh.vertices,
+                faces=cached_mesh.faces,
+                normals=cached_mesh.normals,
+            ),
+            PreviewStats.model_validate(cached_stats),
+            cached_mesh_payload if encode_response_payloads else None,
+        )
+
+    field = field_cached.field
+    bounds = [[float(axis[0]), float(axis[1])] for axis in field_cached.bounds]
+    active_blocks: list[tuple[int, int, int]] | None = None
+    if field_cached.active_blocks:
+        active_blocks = [(int(bx), int(by), int(bz)) for bx, by, bz in field_cached.active_blocks]
+
+    mesh_start = time.perf_counter()
+    generated, mesh_backend_used = build_mesh_with_backend(
+        field,
+        bounds,
+        backend=mesh_backend,
+        meshing_mode=meshing_mode,
+        active_blocks=active_blocks,
+        block_size=host_cached.block_size or field_cached.block_size,
+    )
+    interior = _strip_outer_surface(generated, host_cached.host_sdf, bounds)
+    mesh = _merge_meshes(metadata.outer_mesh, interior)
+    mesh_ms = (time.perf_counter() - mesh_start) * 1000.0
+
+    stats = PreviewStats(
+        eval_ms=0.0,
+        mesh_ms=mesh_ms,
+        tri_count=int(mesh.faces.shape[0]),
+        cache_hit=False,
+        field_cache_hit=True,
+        mesh_cache_hit=False,
+        compute_backend="cuda" if field_cached.eval_backend == "cuda" else "cpu",
+        mesh_backend=mesh_backend_used,
+        preview_mode="mesh",
+    )
+
+    mesh_payload = _encode_mesh_payload(mesh) if encode_response_payloads else None
+    if encode_response_payloads:
+        uploaded_mesh_preview_cache.set(
+            cache_key,
+            UploadedMeshCacheEntry(
+                mesh=mesh_payload,
+                vertices=_freeze_cached_array(mesh.vertices, np.float64),
+                faces=_freeze_cached_array(mesh.faces, np.int32),
+                normals=_freeze_cached_array(mesh.normals, np.float64),
+                stats=stats.model_dump(),
+                field_resolution=int(field.shape[0]),
+                field_bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
+                field_data=_build_uploaded_field_payload(field, bounds).data,
+            ),
+        )
+    return mesh, stats, mesh_payload
+
+
 def _run_uploaded_mesh_preview(
     *,
     file_bytes: bytes,
@@ -2477,6 +2689,101 @@ async def preview_uploaded_mesh_binary(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         cleanup_gpu_memory(reason="preview_uploaded_mesh_binary_inline")
+
+
+@app.post("/api/v1/mesh/commit", response_model=PreviewMeshResponse)
+async def commit_uploaded_mesh(
+    request: Request,
+    file: UploadFile = File(...),
+    shell_thickness: float = Form(...),
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"] = Form(...),
+    lattice_pitch: float = Form(...),
+    lattice_thickness: float = Form(...),
+    lattice_phase: float = Form(0.0),
+    voxels_per_lattice_period: int = Form(6),
+    compute_backend: ComputeBackend = Form("auto"),
+    mesh_backend: MeshBackend = Form("auto"),
+    meshing_mode: MeshingMode = Form("uniform"),
+    field_storage_mode: UploadedFieldStorageMode = Form("auto"),
+) -> PreviewMeshResponse:
+    await _reject_legacy_uploaded_mesh_quality_profile(request)
+    file_bytes, extension = await _read_uploaded_mesh(file)
+    file_hash = _hash_uploaded_mesh_bytes(file_bytes)
+    try:
+        mesh, stats, _ = await asyncio.to_thread(
+            _run_uploaded_mesh_commit_meshdata,
+            file_bytes=file_bytes,
+            file_hash=file_hash,
+            extension=extension,
+            shell_thickness=shell_thickness,
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+            voxels_per_lattice_period=voxels_per_lattice_period,
+            compute_backend=compute_backend,
+            mesh_backend=mesh_backend,
+            meshing_mode=meshing_mode,
+            field_storage_mode=field_storage_mode,
+            encode_response_payloads=True,
+        )
+        return PreviewMeshResponse(mesh=_encode_mesh_payload(mesh), stats=stats)
+    except MeshUploadError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except MeshingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        cleanup_gpu_memory(reason="commit_uploaded_mesh_inline")
+
+
+@app.post("/api/v1/mesh/commit.binary", response_model=None)
+async def commit_uploaded_mesh_binary(
+    request: Request,
+    file: UploadFile = File(...),
+    shell_thickness: float = Form(...),
+    lattice_type: Literal["gyroid", "schwarz_p", "diamond"] = Form(...),
+    lattice_pitch: float = Form(...),
+    lattice_thickness: float = Form(...),
+    lattice_phase: float = Form(0.0),
+    voxels_per_lattice_period: int = Form(6),
+    compute_backend: ComputeBackend = Form("auto"),
+    mesh_backend: MeshBackend = Form("auto"),
+    meshing_mode: MeshingMode = Form("uniform"),
+    field_storage_mode: UploadedFieldStorageMode = Form("auto"),
+) -> Response:
+    await _reject_legacy_uploaded_mesh_quality_profile(request)
+    file_bytes, extension = await _read_uploaded_mesh(file)
+    file_hash = _hash_uploaded_mesh_bytes(file_bytes)
+    try:
+        mesh, stats, _ = await asyncio.to_thread(
+            _run_uploaded_mesh_commit_meshdata,
+            file_bytes=file_bytes,
+            file_hash=file_hash,
+            extension=extension,
+            shell_thickness=shell_thickness,
+            lattice_type=lattice_type,
+            lattice_pitch=lattice_pitch,
+            lattice_thickness=lattice_thickness,
+            lattice_phase=lattice_phase,
+            voxels_per_lattice_period=voxels_per_lattice_period,
+            compute_backend=compute_backend,
+            mesh_backend=mesh_backend,
+            meshing_mode=meshing_mode,
+            field_storage_mode=field_storage_mode,
+            encode_response_payloads=False,
+        )
+        headers = {
+            "X-SDF-Stats": _stats_header_value(stats),
+            "X-SDF-Vertex-Count": str(int(mesh.vertices.shape[0])),
+            "X-SDF-Face-Count": str(int(mesh.faces.shape[0])),
+        }
+        return Response(content=_pack_mesh_binary(mesh), media_type="application/octet-stream", headers=headers)
+    except MeshUploadError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except MeshingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        cleanup_gpu_memory(reason="commit_uploaded_mesh_binary_inline")
 
 
 @app.post("/api/v1/mesh/field", response_model=PreviewFieldResponse)

@@ -559,6 +559,71 @@ def test_uploaded_host_field_threads_compute_backend_to_builder(
     assert result.host_compute_backend == "cuda"
 
 
+def test_dilate_close_and_fill_falls_back_to_cpu_on_gpu_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    surface = np.zeros((16, 16, 16), dtype=bool)
+    surface[5:11, 5:11, 5:11] = True
+
+    class _FakeCp:
+        @staticmethod
+        def asarray(value):
+            return value
+
+    class _FailingNdimage:
+        @staticmethod
+        def binary_dilation(*_args, **_kwargs):
+            raise RuntimeError("Failure finding libnvrtc.so")
+
+    monkeypatch.setattr(mesh_upload, "CUPYX_AVAILABLE", True)
+    monkeypatch.setattr(mesh_upload, "cp", _FakeCp())
+    monkeypatch.setattr(mesh_upload, "cndimage", _FailingNdimage())
+    monkeypatch.setattr(mesh_upload, "_cuda_device_available", lambda: True)
+
+    filled, fallback_reason = mesh_upload._dilate_close_and_fill(surface, closing_iterations=1)
+
+    expected = mesh_upload._fill_holes_cpu(
+        mesh_upload.ndimage.binary_closing(
+            mesh_upload.ndimage.binary_dilation(surface, iterations=1),
+            structure=mesh_upload._VOXEL_CLOSING_STRUCTURE,
+            iterations=1,
+        )
+    )
+    assert np.array_equal(filled, expected)
+    assert fallback_reason is not None
+    assert "GPU voxel fill backend failed at runtime" in fallback_reason
+
+
+def test_dilate_close_and_fill_preserves_oom_fallback_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    surface = np.zeros((16, 16, 16), dtype=bool)
+    surface[5:11, 5:11, 5:11] = True
+
+    class _FakeCp:
+        @staticmethod
+        def asarray(value):
+            return value
+
+    OutOfMemoryError = type("OutOfMemoryError", (Exception,), {})
+    OutOfMemoryError.__module__ = "cupy.cuda.memory"
+
+    class _FailingNdimage:
+        @staticmethod
+        def binary_dilation(*_args, **_kwargs):
+            raise OutOfMemoryError("mock oom")
+
+    monkeypatch.setattr(mesh_upload, "CUPYX_AVAILABLE", True)
+    monkeypatch.setattr(mesh_upload, "cp", _FakeCp())
+    monkeypatch.setattr(mesh_upload, "cndimage", _FailingNdimage())
+    monkeypatch.setattr(mesh_upload, "_cuda_device_available", lambda: True)
+
+    _filled, fallback_reason = mesh_upload._dilate_close_and_fill(surface, closing_iterations=1)
+
+    assert fallback_reason is not None
+    assert "GPU voxel fill ran out of memory" in fallback_reason
+
+
 def _legacy_compose_field(
     host_sdf: np.ndarray,
     bounds: list[list[float]],

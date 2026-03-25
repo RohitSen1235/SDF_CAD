@@ -168,6 +168,16 @@ def _gpu_fill_fallback_reason(resolution: int, exc: BaseException) -> str:
     return " ".join(parts)
 
 
+def _gpu_runtime_fallback_reason(exc: BaseException) -> str:
+    detail = str(exc).strip().splitlines()
+    summary = detail[0] if detail else exc.__class__.__name__
+    summary = summary[:240]
+    return (
+        f"GPU voxel fill backend failed at runtime ({exc.__class__.__name__}: {summary}). "
+        "The preview was retried on CPU."
+    )
+
+
 def parse_mesh_bytes(data: bytes, extension: str) -> ParsedMesh:
     ext = extension.lower()
     if ext == ".obj":
@@ -1455,8 +1465,6 @@ def _dilate_close_and_fill(surface: np.ndarray, *, closing_iterations: int = 1) 
             surface_gpu = cndimage.binary_fill_holes(surface_gpu)
             return cp.asnumpy(surface_gpu), None
         except Exception as exc:
-            if not _is_cupy_out_of_memory_error(exc):
-                raise
             _free_cupy_memory_pools()
             surface_cpu = ndimage.binary_dilation(surface, iterations=1)
             surface_cpu = ndimage.binary_closing(
@@ -1464,7 +1472,10 @@ def _dilate_close_and_fill(surface: np.ndarray, *, closing_iterations: int = 1) 
                 structure=_VOXEL_CLOSING_STRUCTURE,
                 iterations=closing_iterations,
             )
-            return _fill_holes_cpu(surface_cpu), _gpu_fill_fallback_reason(surface.shape[0], exc)
+            if _is_cupy_out_of_memory_error(exc):
+                return _fill_holes_cpu(surface_cpu), _gpu_fill_fallback_reason(surface.shape[0], exc)
+            logger.warning("GPU voxel fill failed; falling back to CPU.", exc_info=True)
+            return _fill_holes_cpu(surface_cpu), _gpu_runtime_fallback_reason(exc)
 
     surface = ndimage.binary_dilation(surface, iterations=1)
     surface = ndimage.binary_closing(surface, structure=_VOXEL_CLOSING_STRUCTURE, iterations=closing_iterations)
