@@ -9,6 +9,7 @@ import { FieldPayload, MeshPayload, UploadedFieldPreviewTrace } from "../types";
 export interface ViewerProps {
   mesh: MeshPayload | null;
   field: FieldPayload | null;
+  uploadedMeshPreviewActive?: boolean;
   uploadedFieldPreviewTrace?: UploadedFieldPreviewTrace | null;
   onUploadedFieldPreviewVisible?: ((timing: {
     traceId: string;
@@ -23,6 +24,10 @@ export interface ViewerProps {
   sectionEnabled: boolean;
   sectionLevel: number;
 }
+
+export const HARD_EDGE_MESH_MATERIAL_PROPS = {
+  flatShading: true
+} as const;
 
 const FIELD_VERTEX_SHADER = `
   out vec3 vWorldPos;
@@ -51,6 +56,7 @@ const FIELD_FRAGMENT_SHADER = `
   uniform float uSectionLevel;
   uniform float uResolution;
   uniform float uStepScale;
+  uniform float uAlphaScale;
 
   in vec3 vWorldPos;
   out vec4 outColor;
@@ -205,7 +211,7 @@ const FIELD_FRAGMENT_SHADER = `
     }
 
     if (accumAlpha < 0.02) { discard; }
-    outColor = vec4(accumColor / accumAlpha, min(accumAlpha, 0.88));
+    outColor = vec4(accumColor / accumAlpha, min(accumAlpha * uAlphaScale, 0.88));
   }
 `;
 
@@ -393,6 +399,7 @@ function FitCamera({
 export function Viewer({
   mesh,
   field,
+  uploadedMeshPreviewActive = false,
   uploadedFieldPreviewTrace = null,
   onUploadedFieldPreviewVisible = null,
   wireframe,
@@ -438,15 +445,24 @@ export function Viewer({
 
   const hasField = fieldTexture !== null && fieldBounds !== null;
   const fieldOnly = hasField && !geometry;
+  const layeredUploadedMeshPreview = uploadedMeshPreviewActive && Boolean(geometry && fieldTexture);
 
   const targetBox = useMemo(() => {
-    if (fieldBounds) {
-      return new THREE.Box3(fieldBounds.min.clone(), fieldBounds.max.clone());
-    }
+    const boxes: THREE.Box3[] = [];
     if (geometry?.boundingBox) {
-      return geometry.boundingBox.clone();
+      boxes.push(geometry.boundingBox.clone());
     }
-    return null;
+    if (fieldBounds) {
+      boxes.push(new THREE.Box3(fieldBounds.min.clone(), fieldBounds.max.clone()));
+    }
+    if (!boxes.length) {
+      return null;
+    }
+    const merged = boxes[0].clone();
+    for (let i = 1; i < boxes.length; i += 1) {
+      merged.union(boxes[i]);
+    }
+    return merged;
   }, [fieldBounds, geometry]);
 
   useEffect(() => {
@@ -528,7 +544,8 @@ export function Viewer({
               uSectionEnabled: { value: sectionEnabled ? 1.0 : 0.0 },
               uSectionLevel: { value: sectionLevel },
               uResolution: { value: field?.resolution ?? 64 },
-              uStepScale: { value: 1.0 }
+              uStepScale: { value: 1.0 },
+              uAlphaScale: { value: 1.0 }
             }}
           />
         </mesh>
@@ -574,34 +591,80 @@ export function Viewer({
                 </mesh>
               </>
             ) : null}
-            <mesh ref={meshRef} geometry={geometry} castShadow receiveShadow renderOrder={3}>
+            <mesh
+              ref={meshRef}
+              geometry={geometry}
+              castShadow
+              receiveShadow
+              renderOrder={layeredUploadedMeshPreview ? 1 : 3}
+            >
               <meshStandardMaterial
                 color="#8be9fd"
                 roughness={0.2}
                 metalness={0.05}
+                transparent={layeredUploadedMeshPreview}
+                opacity={layeredUploadedMeshPreview ? 0.18 : 1.0}
+                depthWrite={!layeredUploadedMeshPreview}
                 wireframe={wireframe}
                 clippingPlanes={clippingPlanes}
                 clipShadows
+                {...HARD_EDGE_MESH_MATERIAL_PROPS}
               />
             </mesh>
+            {layeredUploadedMeshPreview && fieldTexture && fieldBounds ? (
+              <mesh
+                position={fieldBounds.center.toArray() as [number, number, number]}
+                renderOrder={3}
+              >
+                <boxGeometry args={fieldBounds.size.toArray() as [number, number, number]} />
+                <shaderMaterial
+                  side={THREE.FrontSide}
+                  transparent
+                  depthWrite={false}
+                  glslVersion={THREE.GLSL3}
+                  vertexShader={FIELD_VERTEX_SHADER}
+                  fragmentShader={FIELD_FRAGMENT_SHADER}
+                  toneMapped={false}
+                  uniforms={{
+                    uField: { value: fieldTexture },
+                    uBoundsMin: { value: fieldBounds.min },
+                    uBoundsMax: { value: fieldBounds.max },
+                    uColor: { value: new THREE.Color("#ffcf6e") },
+                    uSectionEnabled: { value: sectionEnabled ? 1.0 : 0.0 },
+                    uSectionLevel: { value: sectionLevel },
+                    uResolution: { value: field?.resolution ?? 64 },
+                    uStepScale: { value: 1.0 },
+                    uAlphaScale: { value: 0.86 }
+                  }}
+                />
+              </mesh>
+            ) : null}
           </group>
         </TransformControls>
       ) : null}
 
       {geometry && sectionEnabled && sectionPlane ? (
-        <mesh position={[0, sectionLevel, 0]} rotation={[-Math.PI * 0.5, 0, 0]} renderOrder={2}>
+        <mesh
+          position={[0, sectionLevel, 0]}
+          rotation={[-Math.PI * 0.5, 0, 0]}
+          renderOrder={layeredUploadedMeshPreview ? 4 : 2}
+        >
           <planeGeometry args={[capSize, capSize]} />
           <meshStandardMaterial
-            color="#ff3b30"
+            color={layeredUploadedMeshPreview ? "#8be9fd" : "#ff3b30"}
             roughness={0.5}
             metalness={0.05}
             side={THREE.DoubleSide}
+            transparent={layeredUploadedMeshPreview}
+            opacity={layeredUploadedMeshPreview ? 0.2 : 1.0}
+            depthWrite={!layeredUploadedMeshPreview}
             stencilWrite
             stencilRef={0}
             stencilFunc={THREE.NotEqualStencilFunc}
             stencilFail={THREE.ReplaceStencilOp}
             stencilZFail={THREE.ReplaceStencilOp}
             stencilZPass={THREE.ReplaceStencilOp}
+            {...HARD_EDGE_MESH_MATERIAL_PROPS}
           />
         </mesh>
       ) : null}

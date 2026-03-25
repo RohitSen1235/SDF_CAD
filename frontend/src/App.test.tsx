@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 
+const WORKSPACE_DRAFT_KEY = "sdfcad.workspaceDraft.v1";
 const viewerMock = vi.fn();
 
 vi.mock("./components/Viewer", () => ({
@@ -17,7 +18,7 @@ const previewField = vi.fn();
 const previewMesh = vi.fn();
 const exportMesh = vi.fn();
 const preprocessUploadedMesh = vi.fn();
-const previewUploadedMesh = vi.fn();
+const commitUploadedMesh = vi.fn();
 const previewUploadedMeshField = vi.fn();
 const exportUploadedMesh = vi.fn();
 const submitUploadedFieldPreviewTelemetry = vi.fn();
@@ -28,7 +29,7 @@ vi.mock("./lib/api", () => ({
   previewMesh: (...args: unknown[]) => previewMesh(...args),
   exportMesh: (...args: unknown[]) => exportMesh(...args),
   preprocessUploadedMesh: (...args: unknown[]) => preprocessUploadedMesh(...args),
-  previewUploadedMesh: (...args: unknown[]) => previewUploadedMesh(...args),
+  commitUploadedMesh: (...args: unknown[]) => commitUploadedMesh(...args),
   previewUploadedMeshField: (...args: unknown[]) => previewUploadedMeshField(...args),
   exportUploadedMesh: (...args: unknown[]) => exportUploadedMesh(...args),
   submitUploadedFieldPreviewTelemetry: (...args: unknown[]) => submitUploadedFieldPreviewTelemetry(...args)
@@ -110,6 +111,16 @@ describe("App", () => {
     });
     previewField.mockResolvedValue(fieldPreviewPayload);
     previewMesh.mockResolvedValue(meshPreviewPayload);
+    commitUploadedMesh.mockResolvedValue({
+      ...meshPreviewPayload,
+      stats: {
+        ...meshPreviewPayload.stats,
+        eval_ms: 0,
+        mesh_ms: 4,
+        field_cache_hit: true,
+        mesh_cache_hit: false
+      }
+    });
     exportMesh.mockResolvedValue(new Blob(["ok"]));
     preprocessUploadedMesh.mockResolvedValue({
       mesh: outerMeshPayload,
@@ -123,7 +134,6 @@ describe("App", () => {
         safetyFactor: 1.25
       }
     });
-    previewUploadedMesh.mockResolvedValue(meshPreviewPayload);
     previewUploadedMeshField.mockResolvedValue(fieldPreviewPayload);
     exportUploadedMesh.mockResolvedValue(new Blob(["ok"]));
     submitUploadedFieldPreviewTelemetry.mockResolvedValue(undefined);
@@ -133,11 +143,72 @@ describe("App", () => {
     vi.useRealTimers();
   });
 
-  it("renders DSL workflow with manual compile controls", () => {
+  it("renders DSL workflow with header module tabs", () => {
     render(<App />);
     expect(screen.getByRole("tab", { name: "DSL" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Lattice Infill" })).toHaveAttribute("aria-selected", "false");
     expect(screen.getByRole("button", { name: "Compile now" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Generate Shape" })).toBeInTheDocument();
+  });
+
+  it("restores workspace draft from localStorage after refresh", () => {
+    window.localStorage.setItem(
+      WORKSPACE_DRAFT_KEY,
+      JSON.stringify({
+        version: 1,
+        workflow: "mesh",
+        source: "root = sphere(r=2.5)",
+        quality: "ultra",
+        computePrecision: "float16",
+        computeBackend: "cuda",
+        meshBackend: "cpu",
+        meshingMode: "adaptive",
+        meshShellThickness: 1.5,
+        meshLatticeType: "diamond",
+        meshLatticePitch: 6.5,
+        meshLatticeThickness: 0.7,
+        meshLatticePhase: 0.15,
+        voxelsPerLatticePeriod: 8,
+        wireframe: true,
+        showGrid: false,
+        showAxes: false,
+        transformMode: "rotate",
+        sectionEnabled: true,
+        sectionLevel: 0.25
+      })
+    );
+
+    render(<App />);
+
+    expect(screen.getByRole("tab", { name: "Lattice Infill" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByLabelText("Shell thickness (mm)")).toHaveValue(1.5);
+    expect(screen.getByLabelText("Lattice type")).toHaveValue("diamond");
+    expect(screen.getByLabelText("Voxels per lattice period")).toHaveValue("8");
+    expect(screen.getByRole("button", { name: "Section Off" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Solid" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Grid" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "DSL" }));
+    expect(screen.getByLabelText("DSL source editor")).toHaveValue("root = sphere(r=2.5)");
+    expect(screen.getByLabelText("Quality")).toHaveValue("ultra");
+  });
+
+  it("autosaves workspace draft as settings change", () => {
+    render(<App />);
+
+    fireEvent.change(screen.getByLabelText("DSL source editor"), { target: { value: "root = sphere(r=1.2)" } });
+    fireEvent.click(screen.getByRole("button", { name: "Wire" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
+    fireEvent.change(screen.getByLabelText("Shell thickness (mm)"), { target: { value: "1.25" } });
+
+    const raw = window.localStorage.getItem(WORKSPACE_DRAFT_KEY);
+    expect(raw).not.toBeNull();
+
+    const parsed = JSON.parse(raw ?? "{}");
+    expect(parsed.workflow).toBe("mesh");
+    expect(parsed.source).toBe("root = sphere(r=1.2)");
+    expect(parsed.wireframe).toBe(true);
+    expect(parsed.meshShellThickness).toBe(1.25);
   });
 
   it("does not auto-compile or auto-preview when source changes", () => {
@@ -268,64 +339,88 @@ describe("App", () => {
     expect(editor).toHaveValue(savedSource);
   });
 
-  it("does not auto-preview uploaded field when mesh preview parameters change", async () => {
+  it("does not auto-preview uploaded field when lattice infill parameters change", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
-    previewUploadedMesh.mockClear();
+    commitUploadedMesh.mockClear();
     previewUploadedMeshField.mockClear();
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    const fileInput = screen.getByLabelText("Lattice infill file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
 
     // Wait for preprocess to complete before checking param-change behavior
     await waitFor(() => expect(preprocessUploadedMesh).toHaveBeenCalledTimes(1));
 
     expect(previewUploadedMeshField).not.toHaveBeenCalled();
-    expect(previewUploadedMesh).not.toHaveBeenCalled();
+    expect(commitUploadedMesh).not.toHaveBeenCalled();
 
     fireEvent.change(screen.getByLabelText("Unit cell size (mm)"), { target: { value: "0.55" } });
     fireEvent.change(screen.getByLabelText("Lattice half-thickness (mm)"), { target: { value: "0.12" } });
     fireEvent.change(screen.getByLabelText("Lattice phase"), { target: { value: "0.35" } });
     fireEvent.change(screen.getByLabelText("Shell thickness (mm)"), { target: { value: "0.1" } });
-    fireEvent.change(screen.getByLabelText("Mesh field backend"), { target: { value: "cuda" } });
+    fireEvent.change(screen.getByLabelText("Lattice infill field backend"), { target: { value: "cuda" } });
     fireEvent.change(screen.getByLabelText("Voxels per lattice period"), { target: { value: "8" } });
 
     expect(previewUploadedMeshField).not.toHaveBeenCalled();
+  });
+
+  it("enables commit only after Generate Field succeeds and disables it again on field changes", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Lattice infill file upload"), { target: { files: [file] } });
+
+    await waitFor(() => expect(preprocessUploadedMesh).toHaveBeenCalledTimes(1));
+
+    const commitButton = screen.getByRole("button", { name: "Generate Final Mesh" });
+    expect(commitButton).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
+    await waitFor(() => expect(previewUploadedMeshField).toHaveBeenCalledTimes(1));
+    expect(commitButton).not.toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("Lattice infill field backend"), { target: { value: "cuda" } });
+    expect(commitButton).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
+    await waitFor(() => expect(previewUploadedMeshField).toHaveBeenCalledTimes(2));
+    expect(commitButton).not.toBeDisabled();
   });
 
   it("removes uploaded mesh quality controls while keeping DSL quality", () => {
     render(<App />);
 
     expect(screen.getByLabelText("Quality")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
-    expect(screen.queryByLabelText("Mesh preview quality")).not.toBeInTheDocument();
-    expect(screen.queryByLabelText("Mesh export quality")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Lattice infill preview quality")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Lattice infill export quality")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Voxels per lattice period")).toBeInTheDocument();
   });
 
   it("hides mesh memory estimate until preprocess returns backend memory context", () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
     expect(screen.getByText("Memory estimate will appear after mesh preprocess completes.")).toBeInTheDocument();
   });
 
   it("shows mesh memory estimate after preprocess", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+    fireEvent.change(screen.getByLabelText("Lattice infill file upload"), { target: { files: [file] } });
 
     expect(await screen.findByText(/Est\. resolution for uploaded mesh:/i)).toBeInTheDocument();
     expect(screen.getByText(/Est\. required CPU memory:/i)).toBeInTheDocument();
   });
 
-  it("shows mm-scale thickness guidance for the uploaded mesh workflow", () => {
+  it("shows mm-scale thickness guidance for the lattice infill workflow", () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
     expect(screen.getByText(/Min recommended shell thickness at current settings:/i)).toBeInTheDocument();
     expect(
@@ -336,7 +431,7 @@ describe("App", () => {
     expect(screen.getByText(/Lattice half-thickness 0\.50 mm is below the minimum/i)).toBeInTheDocument();
   });
 
-  it("warns and blocks mesh preview actions when memory estimate is fatal", async () => {
+  it("warns and blocks lattice infill preview actions when memory estimate is fatal", async () => {
     preprocessUploadedMesh.mockResolvedValueOnce({
       mesh: outerMeshPayload,
       memoryContext: {
@@ -351,18 +446,18 @@ describe("App", () => {
     });
 
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+    fireEvent.change(screen.getByLabelText("Lattice infill file upload"), { target: { files: [file] } });
 
     fireEvent.change(screen.getByLabelText("Unit cell size (mm)"), { target: { value: "0.5" } });
 
     expect(await screen.findByText(/Estimated memory exceeds available capacity/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Preview Field" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Commit Design & Compute Mesh" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Generate Field" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Generate Final Mesh" })).toBeDisabled();
   });
 
-  it("re-enables mesh preview actions after reducing memory demand", async () => {
+  it("re-enables lattice infill preview actions after reducing memory demand", async () => {
     preprocessUploadedMesh.mockResolvedValueOnce({
       mesh: outerMeshPayload,
       memoryContext: {
@@ -377,31 +472,38 @@ describe("App", () => {
     });
 
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+    fireEvent.change(screen.getByLabelText("Lattice infill file upload"), { target: { files: [file] } });
     fireEvent.change(screen.getByLabelText("Unit cell size (mm)"), { target: { value: "0.5" } });
     await screen.findByText(/Estimated memory exceeds available capacity/i);
 
     fireEvent.change(screen.getByLabelText("Unit cell size (mm)"), { target: { value: "20" } });
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Preview Field" })).not.toBeDisabled();
+      expect(screen.getByRole("button", { name: "Generate Field" })).not.toBeDisabled();
     });
-    expect(screen.getByRole("button", { name: "Commit Design & Compute Mesh" })).not.toBeDisabled();
+    const commitButton = screen.getByRole("button", { name: "Generate Final Mesh" });
+    expect(commitButton).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
+    expect(commitButton).not.toBeDisabled();
   });
 
-  it("runs uploaded field preview immediately when Preview Field is clicked", async () => {
+  it("runs uploaded field preview immediately when Generate Field is clicked", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
     previewUploadedMeshField.mockClear();
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    const fileInput = screen.getByLabelText("Lattice infill file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
 
-    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
 
     await waitFor(() => {
       expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
@@ -426,11 +528,11 @@ describe("App", () => {
     });
 
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    fireEvent.change(screen.getByLabelText("Lattice infill file upload"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
 
     expect(
       await screen.findByText(/GPU voxel fill ran out of memory at resolution 192/i)
@@ -449,11 +551,11 @@ describe("App", () => {
     });
 
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    fireEvent.change(screen.getByLabelText("Lattice infill file upload"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
 
     await waitFor(() => {
       expect(screen.getByText("Eval: 0.0 ms")).toBeInTheDocument();
@@ -476,11 +578,11 @@ describe("App", () => {
     });
 
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    fireEvent.change(screen.getByLabelText("Lattice infill file upload"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
 
     await waitFor(() => {
       expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
@@ -510,7 +612,7 @@ describe("App", () => {
     });
   });
 
-  it("clears the previous preview immediately when Preview Field is clicked", async () => {
+  it("clears the old layered preview when Generate Field is clicked again", async () => {
     let resolvePreview: ((value: typeof fieldPreviewPayload) => void) | null = null;
     previewUploadedMeshField.mockImplementationOnce(
       () =>
@@ -520,28 +622,20 @@ describe("App", () => {
     );
 
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    const fileInput = screen.getByLabelText("Lattice infill file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
 
-    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
     await waitFor(() => {
       expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     });
 
-    const clearedViewerCall = await waitFor(() => {
-      const found = viewerMock.mock.calls.find(([props]) => {
-        const viewerProps = props as Record<string, unknown>;
-        return viewerProps.field == null && viewerProps.mesh == null;
-      });
-      expect(found).toBeDefined();
-      return found;
-    });
-    const clearedViewerProps = clearedViewerCall?.[0] as Record<string, unknown>;
-    expect(clearedViewerProps.field).toBeNull();
-    expect(clearedViewerProps.mesh).toBeNull();
+    const inFlightViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
+    expect(inFlightViewerProps.field).toBeNull();
+    expect(inFlightViewerProps.mesh).toEqual(outerMeshPayload);
 
     expect(resolvePreview).not.toBeNull();
     resolvePreview!(fieldPreviewPayload);
@@ -549,19 +643,45 @@ describe("App", () => {
     await waitFor(() => {
       const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
       expect(latestViewerProps.field).toEqual(fieldPreviewPayload.field);
-      expect(latestViewerProps.mesh).toBeNull();
+      expect(latestViewerProps.mesh).toEqual(outerMeshPayload);
+    });
+
+    let resolveSecondPreview: ((value: typeof fieldPreviewPayload) => void) | null = null;
+    previewUploadedMeshField.mockImplementationOnce(
+      () =>
+        new Promise<typeof fieldPreviewPayload>((resolve) => {
+          resolveSecondPreview = resolve;
+        })
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(2);
+    });
+
+    const rerunViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
+    expect(rerunViewerProps.field).toBeNull();
+    expect(rerunViewerProps.mesh).toEqual(outerMeshPayload);
+
+    expect(resolveSecondPreview).not.toBeNull();
+    resolveSecondPreview!(fieldPreviewPayload);
+
+    await waitFor(() => {
+      const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
+      expect(latestViewerProps.field).toEqual(fieldPreviewPayload.field);
+      expect(latestViewerProps.mesh).toEqual(outerMeshPayload);
     });
   });
 
-  it("keeps the last preview visible after mesh parameter changes until re-previewed", async () => {
+  it("keeps the field preview visible after parameter changes and requires re-preview", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    const fileInput = screen.getByLabelText("Lattice infill file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
 
-    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
     await waitFor(() => {
       expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     });
@@ -570,33 +690,37 @@ describe("App", () => {
     expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
     expect(latestViewerProps.field).toEqual(fieldPreviewPayload.field);
-    expect(latestViewerProps.mesh).toBeNull();
+    expect(latestViewerProps.mesh).toEqual(outerMeshPayload);
   });
 
-  it("does not pass transparentShell to Viewer for field previews", async () => {
+  it("passes the layered field preview to Viewer without host-field rendering", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "Generate Shape" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Lattice infill file upload"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
 
     await waitFor(() => {
-      expect(previewField).toHaveBeenCalledTimes(1);
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     });
 
     const fieldOnlyCall = viewerMock.mock.calls.find(([props]) => {
       const viewerProps = props as Record<string, unknown>;
-      return viewerProps.field != null && viewerProps.mesh == null;
+      return viewerProps.field != null && viewerProps.mesh != null;
     });
 
     expect(fieldOnlyCall).toBeDefined();
     const fieldOnlyProps = fieldOnlyCall?.[0] as Record<string, unknown>;
-    expect("transparentShell" in fieldOnlyProps).toBe(false);
+    expect("hostField" in fieldOnlyProps).toBe(false);
   });
 
   it("calls preprocessUploadedMesh and shows outer mesh after file selection", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    const fileInput = screen.getByLabelText("Lattice infill file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
 
     // preprocessUploadedMesh should be called immediately on file selection
@@ -611,22 +735,22 @@ describe("App", () => {
     });
   });
 
-  it("shows error but allows Preview Field after preprocess failure", async () => {
+  it("shows error but allows Generate Field after preprocess failure", async () => {
     preprocessUploadedMesh.mockRejectedValueOnce(new Error("Preprocess failed: invalid mesh"));
 
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
+    fireEvent.change(screen.getByLabelText("Lattice infill file upload"), { target: { files: [file] } });
 
     await waitFor(() => {
       expect(screen.getByText("Preprocess failed: invalid mesh")).toBeInTheDocument();
     });
 
-    // User can still click Preview Field — it will run the full pipeline inline
+    // User can still click Generate Field — it will run the full pipeline inline
     previewUploadedMeshField.mockClear();
-    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
     await waitFor(() => {
       expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     });
@@ -634,99 +758,122 @@ describe("App", () => {
 
   it("commits mesh only when commit button is clicked", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
-    previewUploadedMesh.mockClear();
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
+    commitUploadedMesh.mockClear();
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    const fileInput = screen.getByLabelText("Lattice infill file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
-
-    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate Final Mesh" }));
+    await waitFor(() => {
+      expect(commitUploadedMesh).toHaveBeenCalled();
     });
   });
 
-  it("sends selected mesh workflow backends on commit", async () => {
+  it("sends selected lattice infill backends on commit", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
-    previewUploadedMesh.mockClear();
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
+    commitUploadedMesh.mockClear();
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    const fileInput = screen.getByLabelText("Lattice infill file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
-    fireEvent.change(screen.getByLabelText("Mesh field backend"), { target: { value: "cuda" } });
-    fireEvent.change(screen.getByLabelText("Mesh mesher backend"), { target: { value: "cuda" } });
-
-    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
+    fireEvent.change(screen.getByLabelText("Lattice infill field backend"), { target: { value: "cuda" } });
+    fireEvent.change(screen.getByLabelText("Lattice infill mesher backend"), { target: { value: "cuda" } });
+
+    expect(screen.getByRole("button", { name: "Generate Final Mesh" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(2);
     });
 
-    const calls = previewUploadedMesh.mock.calls;
+    fireEvent.click(screen.getByRole("button", { name: "Generate Final Mesh" }));
+    await waitFor(() => {
+      expect(commitUploadedMesh).toHaveBeenCalled();
+    });
+
+    const calls = commitUploadedMesh.mock.calls;
     const lastCall = calls[calls.length - 1];
     expect(lastCall?.[2]).toBe("cuda");
     expect(lastCall?.[3]).toBe("cuda");
   });
 
-  it("sends selected meshing mode for mesh workflow commit", async () => {
+  it("sends selected meshing mode for lattice infill commit", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
-    previewUploadedMesh.mockClear();
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
+    commitUploadedMesh.mockClear();
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    const fileInput = screen.getByLabelText("Lattice infill file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
-    fireEvent.change(screen.getByLabelText("Mesh meshing mode"), { target: { value: "adaptive" } });
-
-    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
+    fireEvent.change(screen.getByLabelText("Lattice infill meshing mode"), { target: { value: "adaptive" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate Final Mesh" }));
+    await waitFor(() => {
+      expect(commitUploadedMesh).toHaveBeenCalled();
     });
 
-    const calls = previewUploadedMesh.mock.calls;
+    const calls = commitUploadedMesh.mock.calls;
     const lastCall = calls[calls.length - 1];
     expect(lastCall?.[4]).toBe("adaptive");
   });
 
-  it("does not pass a quality argument in mesh workflow preview or commit calls", async () => {
+  it("does not pass a quality argument in lattice infill preview or commit calls", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
     previewUploadedMeshField.mockClear();
-    previewUploadedMesh.mockClear();
+    commitUploadedMesh.mockClear();
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    const fileInput = screen.getByLabelText("Lattice infill file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
 
-    fireEvent.click(screen.getByRole("button", { name: "Preview Field" }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
     await waitFor(() => {
       expect(previewUploadedMeshField).toHaveBeenCalled();
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate Final Mesh" }));
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(commitUploadedMesh).toHaveBeenCalled();
     });
 
     expect(previewUploadedMeshField.mock.calls[0]).toHaveLength(5);
-    expect(previewUploadedMesh.mock.calls[0]).toHaveLength(6);
+    expect(commitUploadedMesh.mock.calls[0]).toHaveLength(6);
   });
 
   it("disables mesh export until commit completes and resets on input changes", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    const fileInput = screen.getByLabelText("Mesh file upload") as HTMLInputElement;
+    const fileInput = screen.getByLabelText("Lattice infill file upload") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
 
     const exportStl = screen.getByRole("button", { name: "Export STL" });
     expect(exportStl).toBeDisabled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate Final Mesh" }));
     await waitFor(() => {
-      expect(previewUploadedMesh).toHaveBeenCalled();
+      expect(commitUploadedMesh).toHaveBeenCalled();
     });
 
     expect(exportStl).not.toBeDisabled();
@@ -746,7 +893,7 @@ describe("App", () => {
   });
 
   it("shows separate field and mesh cache status for cached uploaded mesh commits", async () => {
-    previewUploadedMesh.mockResolvedValueOnce({
+    commitUploadedMesh.mockResolvedValueOnce({
       ...meshPreviewPayload,
       stats: {
         ...meshPreviewPayload.stats,
@@ -758,11 +905,15 @@ describe("App", () => {
     });
 
     render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "Mesh" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
     const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
-    fireEvent.change(screen.getByLabelText("Mesh file upload"), { target: { files: [file] } });
-    fireEvent.click(screen.getByRole("button", { name: "Commit Design & Compute Mesh" }));
+    fireEvent.change(screen.getByLabelText("Lattice infill file upload"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Generate Final Mesh" }));
 
     await waitFor(() => {
       expect(screen.getByText("Mesh: 0.0 ms")).toBeInTheDocument();

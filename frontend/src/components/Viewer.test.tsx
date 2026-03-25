@@ -4,7 +4,7 @@ import type { ComponentProps, ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import * as THREE from "three";
 
-import { Viewer } from "./Viewer";
+import { HARD_EDGE_MESH_MATERIAL_PROPS, Viewer } from "./Viewer";
 
 vi.mock("@react-three/fiber", () => ({
   Canvas: ({ children, onCreated }: { children: ReactNode; onCreated?: (state: any) => void }) => {
@@ -68,6 +68,7 @@ function renderViewer(overrides?: Partial<ComponentProps<typeof Viewer>>) {
     <Viewer
       mesh={sampleMesh}
       field={sampleField}
+      uploadedMeshPreviewActive={true}
       wireframe={false}
       transformMode="translate"
       fitSignal={0}
@@ -81,12 +82,17 @@ function renderViewer(overrides?: Partial<ComponentProps<typeof Viewer>>) {
 }
 
 describe("Viewer section capping", () => {
-  it("uses mesh stencil cap when mesh and field are both present", () => {
+  it("enables flat shading for lit mesh materials by default", () => {
+    expect(HARD_EDGE_MESH_MATERIAL_PROPS.flatShading).toBe(true);
+  });
+
+  it("uses layered translucent rendering when uploaded mesh preview is active", () => {
     const { container } = renderViewer();
 
     expect(container.querySelectorAll("meshbasicmaterial").length).toBe(2);
     expect(container.querySelectorAll("meshstandardmaterial").length).toBe(2);
-    expect(container.querySelectorAll("shadermaterial").length).toBe(0);
+    expect(container.querySelectorAll("shadermaterial").length).toBe(1);
+    expect(container.querySelectorAll("boxgeometry").length).toBe(1);
   });
 
   it("uses a translucent shader path for field-only rendering", () => {

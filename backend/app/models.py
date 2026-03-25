@@ -176,6 +176,10 @@ class PreviewFieldResponse(BaseModel):
     stats: PreviewStats
 
 
+class UploadedPreviewFieldResponse(PreviewFieldResponse):
+    host_field: FieldPayload | None = None
+
+
 class UploadedFieldPreviewClientTelemetry(BaseModel):
     trace_id: str
     client_response_wait_ms: float = Field(ge=0.0)

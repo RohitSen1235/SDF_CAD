@@ -3,12 +3,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Viewer } from "./components/Viewer";
 import {
   compileScene,
+  commitUploadedMesh,
   exportMesh,
   exportUploadedMesh,
   previewField,
   previewMesh,
   preprocessUploadedMesh,
-  previewUploadedMesh,
   previewUploadedMeshField,
   submitUploadedFieldPreviewTelemetry
 } from "./lib/api";
@@ -33,6 +33,32 @@ interface SavedFieldExpression {
   name: string;
   source: string;
   updatedAt: number;
+}
+
+type WorkflowMode = "dsl" | "mesh";
+type TransformMode = "translate" | "rotate" | "scale";
+
+interface WorkspaceDraft {
+  version: 1;
+  workflow: WorkflowMode;
+  source: string;
+  quality: QualityProfile;
+  computePrecision: ComputePrecision;
+  computeBackend: ComputeBackend;
+  meshBackend: MeshBackend;
+  meshingMode: MeshingMode;
+  meshShellThickness: number;
+  meshLatticeType: MeshLatticeType;
+  meshLatticePitch: number;
+  meshLatticeThickness: number;
+  meshLatticePhase: number;
+  voxelsPerLatticePeriod: number;
+  wireframe: boolean;
+  showGrid: boolean;
+  showAxes: boolean;
+  transformMode: TransformMode;
+  sectionEnabled: boolean;
+  sectionLevel: number;
 }
 
 const GYROID_FILL_SOURCE = `# Gyroid conformal fill
@@ -79,7 +105,12 @@ const FUNCTION_SIGNATURES = [
 ];
 
 const QUALITY_ORDER: QualityProfile[] = ["interactive", "medium", "high", "ultra"];
+const MODULE_TABS: Array<{ mode: WorkflowMode; label: string }> = [
+  { mode: "dsl", label: "DSL" },
+  { mode: "mesh", label: "Lattice Infill" }
+];
 const SAVED_EXPRESSIONS_KEY = "sdfcad.savedFieldExpressions.v1";
+const WORKSPACE_DRAFT_KEY = "sdfcad.workspaceDraft.v1";
 const BUILTIN_SAVED_EXPRESSIONS: SavedFieldExpression[] = [
   {
     name: "Gyroid Fill",
@@ -92,8 +123,6 @@ const BUILTIN_SAVED_EXPRESSIONS: SavedFieldExpression[] = [
     updatedAt: 0
   }
 ];
-
-type WorkflowMode = "dsl" | "mesh";
 
 function loadSavedExpressions(): SavedFieldExpression[] {
   if (typeof window === "undefined") {
@@ -127,6 +156,108 @@ function loadSavedExpressions(): SavedFieldExpression[] {
     return [...mergedByName.values()].sort((a, b) => b.updatedAt - a.updatedAt);
   } catch {
     return BUILTIN_SAVED_EXPRESSIONS;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function asFiniteNumber(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  return value;
+}
+
+function loadWorkspaceDraft(): Partial<WorkspaceDraft> {
+  if (typeof window === "undefined") {
+    return {};
+  }
+  try {
+    const raw = window.localStorage.getItem(WORKSPACE_DRAFT_KEY);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw);
+    if (!isRecord(parsed) || parsed.version !== 1) {
+      return {};
+    }
+
+    const draft: Partial<WorkspaceDraft> = {};
+
+    if (parsed.workflow === "dsl" || parsed.workflow === "mesh") {
+      draft.workflow = parsed.workflow;
+    }
+    if (typeof parsed.source === "string") {
+      draft.source = parsed.source;
+    }
+    if (
+      parsed.quality === "interactive" ||
+      parsed.quality === "medium" ||
+      parsed.quality === "high" ||
+      parsed.quality === "ultra"
+    ) {
+      draft.quality = parsed.quality;
+    }
+    if (parsed.computePrecision === "float32" || parsed.computePrecision === "float16") {
+      draft.computePrecision = parsed.computePrecision;
+    }
+    if (parsed.computeBackend === "auto" || parsed.computeBackend === "cpu" || parsed.computeBackend === "cuda") {
+      draft.computeBackend = parsed.computeBackend;
+    }
+    if (parsed.meshBackend === "auto" || parsed.meshBackend === "cpu" || parsed.meshBackend === "cuda") {
+      draft.meshBackend = parsed.meshBackend;
+    }
+    if (parsed.meshingMode === "uniform" || parsed.meshingMode === "adaptive") {
+      draft.meshingMode = parsed.meshingMode;
+    }
+    if (parsed.meshLatticeType === "gyroid" || parsed.meshLatticeType === "schwarz_p" || parsed.meshLatticeType === "diamond") {
+      draft.meshLatticeType = parsed.meshLatticeType;
+    }
+    if (parsed.transformMode === "translate" || parsed.transformMode === "rotate" || parsed.transformMode === "scale") {
+      draft.transformMode = parsed.transformMode;
+    }
+    if (typeof parsed.wireframe === "boolean") {
+      draft.wireframe = parsed.wireframe;
+    }
+    if (typeof parsed.showGrid === "boolean") {
+      draft.showGrid = parsed.showGrid;
+    }
+    if (typeof parsed.showAxes === "boolean") {
+      draft.showAxes = parsed.showAxes;
+    }
+    if (typeof parsed.sectionEnabled === "boolean") {
+      draft.sectionEnabled = parsed.sectionEnabled;
+    }
+
+    const meshShellThickness = asFiniteNumber(parsed.meshShellThickness);
+    if (meshShellThickness !== null) {
+      draft.meshShellThickness = meshShellThickness;
+    }
+    const meshLatticePitch = asFiniteNumber(parsed.meshLatticePitch);
+    if (meshLatticePitch !== null) {
+      draft.meshLatticePitch = meshLatticePitch;
+    }
+    const meshLatticeThickness = asFiniteNumber(parsed.meshLatticeThickness);
+    if (meshLatticeThickness !== null) {
+      draft.meshLatticeThickness = meshLatticeThickness;
+    }
+    const meshLatticePhase = asFiniteNumber(parsed.meshLatticePhase);
+    if (meshLatticePhase !== null) {
+      draft.meshLatticePhase = meshLatticePhase;
+    }
+    const sectionLevel = asFiniteNumber(parsed.sectionLevel);
+    if (sectionLevel !== null) {
+      draft.sectionLevel = sectionLevel;
+    }
+    if (parsed.voxelsPerLatticePeriod === 4 || parsed.voxelsPerLatticePeriod === 6 || parsed.voxelsPerLatticePeriod === 8) {
+      draft.voxelsPerLatticePeriod = parsed.voxelsPerLatticePeriod;
+    }
+
+    return draft;
+  } catch {
+    return {};
   }
 }
 
@@ -193,21 +324,22 @@ function bytesToMiB(value: number): string {
 }
 
 export default function App() {
-  const [workflow, setWorkflow] = useState<WorkflowMode>("dsl");
+  const [workspaceDraft] = useState<Partial<WorkspaceDraft>>(() => loadWorkspaceDraft());
+  const [workflow, setWorkflow] = useState<WorkflowMode>(workspaceDraft.workflow ?? "dsl");
 
-  const [source, setSource] = useState(EXAMPLES["Field Expression"]);
+  const [source, setSource] = useState(workspaceDraft.source ?? EXAMPLES["Field Expression"]);
   const [sourceDirty, setSourceDirty] = useState(true);
   const [sceneIr, setSceneIr] = useState<SceneIR | null>(null);
   const [diagnostics, setDiagnostics] = useState<CompileDiagnostics | null>(null);
   const [params, setParams] = useState<Record<string, number>>({});
 
   const [meshFile, setMeshFile] = useState<File | null>(null);
-  const [meshShellThickness, setMeshShellThickness] = useState(2.0);
-  const [meshLatticeType, setMeshLatticeType] = useState<MeshLatticeType>("gyroid");
-  const [meshLatticePitch, setMeshLatticePitch] = useState(5.0);
-  const [meshLatticeThickness, setMeshLatticeThickness] = useState(0.5);
-  const [meshLatticePhase, setMeshLatticePhase] = useState(0.0);
-  const [voxelsPerLatticePeriod, setVoxelsPerLatticePeriod] = useState(6);
+  const [meshShellThickness, setMeshShellThickness] = useState(workspaceDraft.meshShellThickness ?? 2.0);
+  const [meshLatticeType, setMeshLatticeType] = useState<MeshLatticeType>(workspaceDraft.meshLatticeType ?? "gyroid");
+  const [meshLatticePitch, setMeshLatticePitch] = useState(workspaceDraft.meshLatticePitch ?? 5.0);
+  const [meshLatticeThickness, setMeshLatticeThickness] = useState(workspaceDraft.meshLatticeThickness ?? 0.5);
+  const [meshLatticePhase, setMeshLatticePhase] = useState(workspaceDraft.meshLatticePhase ?? 0.0);
+  const [voxelsPerLatticePeriod, setVoxelsPerLatticePeriod] = useState(workspaceDraft.voxelsPerLatticePeriod ?? 6);
   const [meshCommitted, setMeshCommitted] = useState(false);
   const [meshMemoryContext, setMeshMemoryContext] = useState<UploadedMeshMemoryContext | null>(null);
 
@@ -218,18 +350,19 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [isCompiling, setIsCompiling] = useState(false);
   const [isPreviewing, setIsPreviewing] = useState(false);
-  const [wireframe, setWireframe] = useState(false);
-  const [showGrid, setShowGrid] = useState(true);
-  const [showAxes, setShowAxes] = useState(true);
-  const [transformMode, setTransformMode] = useState<"translate" | "rotate" | "scale">("translate");
+  const [wireframe, setWireframe] = useState(workspaceDraft.wireframe ?? false);
+  const [showGrid, setShowGrid] = useState(workspaceDraft.showGrid ?? true);
+  const [showAxes, setShowAxes] = useState(workspaceDraft.showAxes ?? true);
+  const [transformMode, setTransformMode] = useState<TransformMode>(workspaceDraft.transformMode ?? "translate");
   const [fitSignal, setFitSignal] = useState(0);
-  const [quality, setQuality] = useState<QualityProfile>("high");
-  const [computePrecision, setComputePrecision] = useState<ComputePrecision>("float32");
-  const [computeBackend, setComputeBackend] = useState<ComputeBackend>("auto");
-  const [meshBackend, setMeshBackend] = useState<MeshBackend>("auto");
-  const [meshingMode, setMeshingMode] = useState<MeshingMode>("uniform");
-  const [sectionEnabled, setSectionEnabled] = useState(false);
-  const [sectionLevel, setSectionLevel] = useState(0);
+  const [quality, setQuality] = useState<QualityProfile>(workspaceDraft.quality ?? "high");
+  const [computePrecision, setComputePrecision] = useState<ComputePrecision>(workspaceDraft.computePrecision ?? "float32");
+  const [computeBackend, setComputeBackend] = useState<ComputeBackend>(workspaceDraft.computeBackend ?? "auto");
+  const [meshBackend, setMeshBackend] = useState<MeshBackend>(workspaceDraft.meshBackend ?? "auto");
+  const [meshingMode, setMeshingMode] = useState<MeshingMode>(workspaceDraft.meshingMode ?? "uniform");
+  const [uploadedMeshFieldSignature, setUploadedMeshFieldSignature] = useState<string | null>(null);
+  const [sectionEnabled, setSectionEnabled] = useState(workspaceDraft.sectionEnabled ?? false);
+  const [sectionLevel, setSectionLevel] = useState(workspaceDraft.sectionLevel ?? 0);
   const [sectionYBounds, setSectionYBounds] = useState<[number, number]>([-2, 2]);
   const [isSignatureHelpOpen, setIsSignatureHelpOpen] = useState(false);
   const [savedExpressions, setSavedExpressions] = useState<SavedFieldExpression[]>(() => loadSavedExpressions());
@@ -256,6 +389,33 @@ export default function App() {
     }),
     [meshShellThickness, meshLatticeType, meshLatticePitch, meshLatticeThickness, meshLatticePhase]
   );
+
+  const currentUploadedMeshFieldSignature = useMemo(() => {
+    if (!meshFile) {
+      return null;
+    }
+    return [
+      meshFile.name,
+      meshFile.size,
+      meshFile.lastModified,
+      meshShellThickness,
+      meshLatticeType,
+      meshLatticePitch,
+      meshLatticeThickness,
+      meshLatticePhase,
+      computeBackend,
+      voxelsPerLatticePeriod
+    ].join("|");
+  }, [
+    meshFile,
+    meshShellThickness,
+    meshLatticeType,
+    meshLatticePitch,
+    meshLatticeThickness,
+    meshLatticePhase,
+    computeBackend,
+    voxelsPerLatticePeriod
+  ]);
 
   const meshMemoryRisk = useMemo(() => {
     if (!meshMemoryContext) {
@@ -334,6 +494,40 @@ export default function App() {
   const latticeTooThin = meshLatticeThickness < minLatticeThickness;
 
   const meshMemoryFatal = Boolean(meshMemoryRisk?.fatal);
+  const meshWarnings = useMemo(() => {
+    const warnings: string[] = [];
+    if (shellTooThin) {
+      warnings.push(
+        `Shell thickness ${meshShellThickness.toFixed(2)} mm is below the minimum ${minShellThickness.toFixed(
+          2
+        )} mm. The lattice may protrude outside the shell surface. Increase shell thickness or reduce unit cell size.`
+      );
+    }
+    if (latticeTooThin) {
+      warnings.push(
+        `Lattice half-thickness ${meshLatticeThickness.toFixed(2)} mm is below the minimum ${minLatticeThickness.toFixed(
+          2
+        )} mm. Strut walls may not render correctly. Increase half-thickness or reduce unit cell size.`
+      );
+    }
+    if (meshMemoryRisk?.fatalMessage) {
+      warnings.push(meshMemoryRisk.fatalMessage);
+    }
+    if (workflow === "mesh" && stats?.fallback_reason) {
+      warnings.push(stats.fallback_reason);
+    }
+    return warnings;
+  }, [
+    shellTooThin,
+    latticeTooThin,
+    meshShellThickness,
+    minShellThickness,
+    meshLatticeThickness,
+    minLatticeThickness,
+    meshMemoryRisk?.fatalMessage,
+    workflow,
+    stats?.fallback_reason
+  ]);
 
   const abortActivePreview = useCallback(() => {
     previewControllersRef.current.field?.abort();
@@ -357,6 +551,9 @@ export default function App() {
     }
 
     abortActiveMeshFieldPreview();
+    setField(null);
+    setStats(null);
+    setUploadedFieldPreviewTrace(null);
 
     const runId = meshFieldPreviewRunIdRef.current + 1;
     meshFieldPreviewRunIdRef.current = runId;
@@ -379,8 +576,8 @@ export default function App() {
       }
       const fieldAssignedAtMs = performance.now();
       setField(response.field);
-      setMesh(null);
       setStats(response.stats);
+      setUploadedMeshFieldSignature(currentUploadedMeshFieldSignature);
       setUploadedFieldPreviewTrace(
         response.trace
           ? {
@@ -412,6 +609,7 @@ export default function App() {
     computeBackend,
     meshFile,
     meshWorkflowParams,
+    currentUploadedMeshFieldSignature,
     voxelsPerLatticePeriod
   ]);
 
@@ -453,6 +651,7 @@ export default function App() {
       previewRunIdRef.current = runId;
       setIsPreviewing(true);
       setError(null);
+      setUploadedMeshFieldSignature(null);
       // Clear stale visuals before starting a new Generate Shape run.
       setField(null);
       setMesh(null);
@@ -562,7 +761,7 @@ export default function App() {
   }, [abortActivePreview]);
 
   // Update section Y bounds whenever the active field or DSL diagnostics change.
-  // For the Mesh Workflow the field payload carries the actual part bounds;
+  // For the lattice infill workflow the field payload carries the actual part bounds;
   // for the DSL workflow we fall back to the compiler-inferred bounds.
   useEffect(() => {
     let yMin: number | null = null;
@@ -592,12 +791,60 @@ export default function App() {
     if (typeof window === "undefined") {
       return;
     }
+    const draft: WorkspaceDraft = {
+      version: 1,
+      workflow,
+      source,
+      quality,
+      computePrecision,
+      computeBackend,
+      meshBackend,
+      meshingMode,
+      meshShellThickness,
+      meshLatticeType,
+      meshLatticePitch,
+      meshLatticeThickness,
+      meshLatticePhase,
+      voxelsPerLatticePeriod,
+      wireframe,
+      showGrid,
+      showAxes,
+      transformMode,
+      sectionEnabled,
+      sectionLevel
+    };
+    try {
+      window.localStorage.setItem(WORKSPACE_DRAFT_KEY, JSON.stringify(draft));
+    } catch {
+      // Ignore storage failures (private mode/quota), keep UI responsive.
+    }
     try {
       window.localStorage.setItem(SAVED_EXPRESSIONS_KEY, JSON.stringify(savedExpressions));
     } catch {
       // Ignore storage failures (private mode/quota), keep UI responsive.
     }
-  }, [savedExpressions]);
+  }, [
+    savedExpressions,
+    workflow,
+    source,
+    quality,
+    computePrecision,
+    computeBackend,
+    meshBackend,
+    meshingMode,
+    meshShellThickness,
+    meshLatticeType,
+    meshLatticePitch,
+    meshLatticeThickness,
+    meshLatticePhase,
+    voxelsPerLatticePeriod,
+    wireframe,
+    showGrid,
+    showAxes,
+    transformMode,
+    sectionEnabled,
+    sectionLevel
+  ]);
 
   useEffect(() => {
     if (!selectedExpressionName) {
@@ -674,10 +921,6 @@ export default function App() {
       setError(meshMemoryRisk?.fatalMessage ?? "Estimated memory exceeds available system capacity.");
       return;
     }
-    setField(null);
-    setMesh(null);
-    setStats(null);
-    setUploadedFieldPreviewTrace(null);
     setMeshCommitted(false);
     await runMeshFieldPreview();
   };
@@ -687,8 +930,8 @@ export default function App() {
       setError("Upload an STL or OBJ file first.");
       return;
     }
-    if (meshMemoryFatal) {
-      setError(meshMemoryRisk?.fatalMessage ?? "Estimated memory exceeds available system capacity.");
+    if (uploadedMeshFieldSignature !== currentUploadedMeshFieldSignature) {
+      setError("Generate Field first before generating the final mesh.");
       return;
     }
 
@@ -696,7 +939,7 @@ export default function App() {
     setIsPreviewing(true);
     setError(null);
     try {
-      const response = await previewUploadedMesh(
+      const response = await commitUploadedMesh(
         meshFile,
         meshWorkflowParams,
         computeBackend,
@@ -704,7 +947,6 @@ export default function App() {
         meshingMode,
         voxelsPerLatticePeriod
       );
-      setField(response.field ?? null);
       setMesh(response.mesh);
       setStats(response.stats);
       setUploadedFieldPreviewTrace(null);
@@ -747,20 +989,29 @@ export default function App() {
     if (workflow !== "mesh") {
       return;
     }
+    if (!meshFile || uploadedMeshFieldSignature !== currentUploadedMeshFieldSignature) {
+      setMeshCommitted(false);
+    }
+  }, [workflow, meshFile, uploadedMeshFieldSignature, currentUploadedMeshFieldSignature]);
+
+  useEffect(() => {
+    setMesh(null);
+    setStats(null);
     setMeshCommitted(false);
-    setUploadedFieldPreviewTrace(null);
+  }, [meshBackend]);
+
+  useEffect(() => {
+    abortActiveMeshFieldPreview();
+    setMeshCommitted(false);
   }, [
-    workflow,
-    meshFile,
     meshShellThickness,
     meshLatticeType,
     meshLatticePitch,
     meshLatticeThickness,
     meshLatticePhase,
     computeBackend,
-    meshBackend,
-    meshingMode,
-    voxelsPerLatticePeriod
+    voxelsPerLatticePeriod,
+    abortActiveMeshFieldPreview
   ]);
 
   const onUploadedFieldPreviewVisible = useCallback(
@@ -849,42 +1100,46 @@ export default function App() {
     setError(null);
   };
 
+  const isBusy = isCompiling || isPreviewing;
+  const busyLabel = isCompiling ? "Compiling..." : isPreviewing ? "Computing..." : "";
+
   return (
     <div className="shell">
       <header className="topbar">
-        <h1>SDF CAD Studio</h1>
-        <div className="status-pills">
-          <span className={workflow === "dsl" && isCompiling ? "pill active" : "pill"}>
-            {workflow === "dsl" ? (isCompiling ? "Compiling" : "Compiled") : "Mesh Workflow"}
-          </span>
-          <span className={isPreviewing ? "pill active" : "pill"}>{isPreviewing ? "Previewing" : "Preview Ready"}</span>
+        <div className="topbar-brand">
+          <h1>SDF CAD Studio</h1>
+        </div>
+        <div className="topbar-center">
+          <div className="workflow-toggle workflow-toggle-prominent" role="tablist" aria-label="Module tabs">
+            {MODULE_TABS.map((tab) => (
+              <button
+                key={tab.mode}
+                type="button"
+                className={workflow === tab.mode ? "active" : ""}
+                onClick={() => setWorkflow(tab.mode)}
+                role="tab"
+                aria-selected={workflow === tab.mode}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="topbar-side">
           {workflow === "dsl" ? <span className="pill">Q: {quality}</span> : null}
+          {isBusy ? (
+            <div className="busy-indicator" role="status" aria-live="polite" aria-label={busyLabel}>
+              <span className="busy-label">{busyLabel}</span>
+              <div className="busy-bar" aria-hidden="true">
+                <span />
+              </div>
+            </div>
+          ) : null}
         </div>
       </header>
 
       <main className="layout">
         <section className="panel editor-panel">
-          <div className="workflow-toggle" role="tablist" aria-label="Workflow mode">
-            <button
-              type="button"
-              className={workflow === "dsl" ? "active" : ""}
-              onClick={() => setWorkflow("dsl")}
-              role="tab"
-              aria-selected={workflow === "dsl"}
-            >
-              DSL
-            </button>
-            <button
-              type="button"
-              className={workflow === "mesh" ? "active" : ""}
-              onClick={() => setWorkflow("mesh")}
-              role="tab"
-              aria-selected={workflow === "mesh"}
-            >
-              Mesh
-            </button>
-          </div>
-
           {workflow === "dsl" ? (
             <>
               <div className="panel-title-row">
@@ -909,6 +1164,12 @@ export default function App() {
                   <button onClick={() => void onCompileDsl()}>Compile now</button>
                   <button type="button" onClick={() => void onGenerateDsl()}>
                     Generate Shape
+                  </button>
+                  <button type="button" onClick={() => void onExportDsl("stl")}>
+                    Export STL
+                  </button>
+                  <button type="button" onClick={() => void onExportDsl("obj")}>
+                    Export OBJ
                   </button>
                 </div>
               </div>
@@ -997,259 +1258,294 @@ export default function App() {
             </>
           ) : (
             <>
-              <div className="panel-title-row">
-                <h2>Mesh Workflow</h2>
-              </div>
+              <div className="mesh-workflow-grid">
+                <div className="mesh-control-stack">
+                  <section className="mesh-card">
+                    <h3>Input & Geometry</h3>
+                    <div className="mesh-detail-grid">
+                      <label className="slider-row mesh-file-row">
+                        <span>Input mesh (.stl/.obj)</span>
+                        <input
+                          type="file"
+                          accept=".stl,.obj"
+                          aria-label="Lattice infill file upload"
+                          onChange={(event) => {
+                            const selected = event.target.files?.[0] ?? null;
 
-              <div className="mesh-controls">
-                <label className="slider-row">
-                  <span>Input mesh (.stl/.obj)</span>
-                  <input
-                    type="file"
-                    accept=".stl,.obj"
-                    aria-label="Mesh file upload"
-                    onChange={(event) => {
-                      const selected = event.target.files?.[0] ?? null;
-
-                      // Abort any in-flight preprocess for the previous file
-                      preprocessControllerRef.current?.abort();
-                      preprocessControllerRef.current = null;
-
-                      setMeshFile(selected);
-                      setField(null);
-                      setMesh(null);
-                      setStats(null);
-                      setUploadedFieldPreviewTrace(null);
-                      setMeshCommitted(false);
-                      setMeshMemoryContext(null);
-                      setError(null);
-
-                      if (!selected) {
-                        return;
-                      }
-
-                      // Upload to backend immediately:
-                      //   1. Warms metadata cache for the subsequent "Preview Field"
-                      //   2. Returns the raw outer mesh for immediate display in the viewer
-                      const controller = new AbortController();
-                      preprocessControllerRef.current = controller;
-                      setIsPreviewing(true);
-
-                      preprocessUploadedMesh(
-                        selected,
-                        meshWorkflowParams,
-                        computeBackend,
-                        voxelsPerLatticePeriod,
-                        controller.signal
-                      )
-                        .then((preprocessResult) => {
-                          if (preprocessControllerRef.current !== controller) {
-                            return; // Superseded by a newer file selection
-                          }
-                          setMesh(preprocessResult.mesh);
-                          setMeshMemoryContext(preprocessResult.memoryContext);
-                        })
-                        .catch((preprocessError: Error) => {
-                          if (preprocessError.name === "AbortError") {
-                            return;
-                          }
-                          if (preprocessControllerRef.current !== controller) {
-                            return;
-                          }
-                          // Preprocess failure is non-fatal — user can still click
-                          // "Preview Field" which will run the full pipeline inline
-                          setMesh(null);
-                          setMeshMemoryContext(null);
-                          setError(preprocessError.message);
-                        })
-                        .finally(() => {
-                          if (preprocessControllerRef.current === controller) {
+                            // Abort any in-flight preprocess for the previous file
+                            preprocessControllerRef.current?.abort();
                             preprocessControllerRef.current = null;
-                            setIsPreviewing(false);
-                          }
-                        });
-                    }}
-                  />
-                </label>
-                <p className="muted">{meshFile ? `Selected: ${meshFile.name}` : "No file selected."}</p>
+                            abortActiveMeshFieldPreview();
 
-                <label className="slider-row">
-                  <span>Shell thickness (mm)</span>
-                  <input
-                    type="number"
-                    step={0.5}
-                    min={0.1}
-                    value={meshShellThickness}
-                    aria-label="Shell thickness (mm)"
-                    onChange={(event) => setMeshShellThickness(Number(event.target.value))}
-                  />
-                </label>
-                <p className="muted">
-                  Min recommended shell thickness at current settings:{" "}
-                  <strong>{minShellThickness.toFixed(2)} mm</strong> (2 x unit cell size / sampling quality)
-                </p>
-                {shellTooThin ? (
-                  <p className="warning">
-                    Shell thickness {meshShellThickness.toFixed(2)} mm is below the minimum{" "}
-                    {minShellThickness.toFixed(2)} mm. The lattice may protrude outside the shell surface.
-                    Increase shell thickness or reduce unit cell size.
-                  </p>
-                ) : null}
+                            setMeshFile(selected);
+                            setField(null);
+                            setMesh(null);
+                            setStats(null);
+                            setUploadedFieldPreviewTrace(null);
+                            setUploadedMeshFieldSignature(null);
+                            setMeshCommitted(false);
+                            setMeshMemoryContext(null);
+                            setError(null);
 
-                <label className="slider-row">
-                  <span>Lattice type</span>
-                  <select
-                    aria-label="Lattice type"
-                    value={meshLatticeType}
-                    onChange={(event) => setMeshLatticeType(event.target.value as MeshLatticeType)}
-                  >
-                    <option value="gyroid">gyroid</option>
-                    <option value="schwarz_p">schwarz_p</option>
-                    <option value="diamond">diamond</option>
-                  </select>
-                </label>
+                            if (!selected) {
+                              return;
+                            }
 
-                <label className="slider-row">
-                  <span>Unit cell size (mm)</span>
-                  <input
-                    type="number"
-                    step={0.5}
-                    min={0.5}
-                    value={meshLatticePitch}
-                    aria-label="Unit cell size (mm)"
-                    onChange={(event) => setMeshLatticePitch(Number(event.target.value))}
-                  />
-                </label>
+                            // Upload to backend immediately:
+                            //   1. Warms metadata cache for the subsequent "Generate Field"
+                            //   2. Returns the raw outer mesh for immediate display in the viewer
+                            const controller = new AbortController();
+                            preprocessControllerRef.current = controller;
+                            setIsPreviewing(true);
 
-                <label className="slider-row">
-                  <span>Lattice half-thickness (mm)</span>
-                  <input
-                    type="number"
-                    step={0.1}
-                    min={0.05}
-                    value={meshLatticeThickness}
-                    aria-label="Lattice half-thickness (mm)"
-                    onChange={(event) => setMeshLatticeThickness(Number(event.target.value))}
-                  />
-                </label>
-                <p className="muted">
-                  Strut total width = 2 x half-thickness = <strong>{(meshLatticeThickness * 2).toFixed(2)} mm</strong>
-                </p>
-                <p className="muted">
-                  Min resolvable half-thickness at current settings:{" "}
-                  <strong>{minLatticeThickness.toFixed(2)} mm</strong> (1 voxel = unit cell size / sampling quality)
-                </p>
-                {latticeTooThin ? (
-                  <p className="warning">
-                    Lattice half-thickness {meshLatticeThickness.toFixed(2)} mm is below the minimum{" "}
-                    {minLatticeThickness.toFixed(2)} mm. Strut walls may not render correctly.
-                    Increase half-thickness or reduce unit cell size.
-                  </p>
-                ) : null}
+                            preprocessUploadedMesh(
+                              selected,
+                              meshWorkflowParams,
+                              computeBackend,
+                              voxelsPerLatticePeriod,
+                              controller.signal
+                            )
+                              .then((preprocessResult) => {
+                                if (preprocessControllerRef.current !== controller) {
+                                  return; // Superseded by a newer file selection
+                                }
+                                setMesh(preprocessResult.mesh);
+                                setMeshMemoryContext(preprocessResult.memoryContext);
+                              })
+                              .catch((preprocessError: Error) => {
+                                if (preprocessError.name === "AbortError") {
+                                  return;
+                                }
+                                if (preprocessControllerRef.current !== controller) {
+                                  return;
+                                }
+                                // Preprocess failure is non-fatal — user can still click
+                                // "Generate Field" which will run the full pipeline inline
+                                setMesh(null);
+                                setMeshMemoryContext(null);
+                                setError(preprocessError.message);
+                              })
+                              .finally(() => {
+                                if (preprocessControllerRef.current === controller) {
+                                  preprocessControllerRef.current = null;
+                                  setIsPreviewing(false);
+                                }
+                              });
+                          }}
+                        />
+                      </label>
 
-                <label className="slider-row">
-                  <span>Lattice phase</span>
-                  <input
-                    type="number"
-                    step={0.05}
-                    value={meshLatticePhase}
-                    aria-label="Lattice phase"
-                    onChange={(event) => setMeshLatticePhase(Number(event.target.value))}
-                  />
-                </label>
+                      <label className="slider-row">
+                        <span>Shell thickness (mm)</span>
+                        <input
+                          type="number"
+                          step={0.5}
+                          min={0.1}
+                          value={meshShellThickness}
+                          aria-label="Shell thickness (mm)"
+                          onChange={(event) => setMeshShellThickness(Number(event.target.value))}
+                        />
+                      </label>
 
-                <label className="slider-row">
-                  <span>Sampling quality (voxels/period)</span>
-                  <select
-                    aria-label="Voxels per lattice period"
-                    value={voxelsPerLatticePeriod}
-                    onChange={(event) => setVoxelsPerLatticePeriod(Number(event.target.value))}
-                  >
-                    <option value={4}>4 — Draft (fast)</option>
-                    <option value={6}>6 — Standard (default)</option>
-                    <option value={8}>8 — Fine (slow)</option>
-                  </select>
-                </label>
+                      <label className="slider-row">
+                        <span>Lattice type</span>
+                        <select
+                          aria-label="Lattice type"
+                          value={meshLatticeType}
+                          onChange={(event) => setMeshLatticeType(event.target.value as MeshLatticeType)}
+                        >
+                          <option value="gyroid">gyroid</option>
+                          <option value="schwarz_p">schwarz_p</option>
+                          <option value="diamond">diamond</option>
+                        </select>
+                      </label>
 
-                <div className="resolution-info">
-                  {meshMemoryRisk ? (
-                    <>
-                      <p className="muted">
-                        Est. resolution for uploaded mesh: <strong>{meshMemoryRisk.resolution}³</strong>
-                        {meshMemoryRisk.resolution >= 1024 ? " (clamped to 1024³ max)" : ""}
-                      </p>
-                      <p className="muted">
-                        Est. required CPU memory: <strong>{bytesToMiB(meshMemoryRisk.requiredCpuBytes)}</strong>
-                        {meshMemoryContext?.availableCpuBytes != null
-                          ? ` (available: ${bytesToMiB(meshMemoryContext.availableCpuBytes)})`
-                          : " (available: unknown)"}
-                      </p>
-                      <p className="muted">
-                        Est. required GPU memory: <strong>{bytesToMiB(meshMemoryRisk.requiredGpuBytes)}</strong>
-                        {meshMemoryContext?.availableGpuFreeBytes != null
-                          ? ` (available: ${bytesToMiB(meshMemoryContext.availableGpuFreeBytes)})`
-                          : " (available: unknown)"}
-                      </p>
-                    </>
-                  ) : (
-                    <p className="muted">Memory estimate will appear after mesh preprocess completes.</p>
-                  )}
+                      <label className="slider-row">
+                        <span>Unit cell size (mm)</span>
+                        <input
+                          type="number"
+                          step={0.5}
+                          min={0.5}
+                          value={meshLatticePitch}
+                          aria-label="Unit cell size (mm)"
+                          onChange={(event) => setMeshLatticePitch(Number(event.target.value))}
+                        />
+                      </label>
+
+                      <label className="slider-row">
+                        <span>Lattice half-thickness (mm)</span>
+                        <input
+                          type="number"
+                          step={0.1}
+                          min={0.05}
+                          value={meshLatticeThickness}
+                          aria-label="Lattice half-thickness (mm)"
+                          onChange={(event) => setMeshLatticeThickness(Number(event.target.value))}
+                        />
+                      </label>
+
+                      <label className="slider-row">
+                        <span>Lattice phase</span>
+                        <input
+                          type="number"
+                          step={0.05}
+                          value={meshLatticePhase}
+                          aria-label="Lattice phase"
+                          onChange={(event) => setMeshLatticePhase(Number(event.target.value))}
+                        />
+                      </label>
+                    </div>
+
+                    <p className="muted">{meshFile ? `Selected: ${meshFile.name}` : "No file selected."}</p>
+                    <p className="muted">
+                      Min recommended shell thickness at current settings:{" "}
+                      <strong>{minShellThickness.toFixed(2)} mm</strong> (2 x unit cell size / sampling quality)
+                    </p>
+                    <p className="muted">
+                      Strut total width = 2 x half-thickness = <strong>{(meshLatticeThickness * 2).toFixed(2)} mm</strong>
+                    </p>
+                    <p className="muted">
+                      Min resolvable half-thickness at current settings:{" "}
+                      <strong>{minLatticeThickness.toFixed(2)} mm</strong> (1 voxel = unit cell size / sampling quality)
+                    </p>
+                  </section>
+
+                  <section className="mesh-card">
+                    <h3>Sampling & Compute</h3>
+                    <div className="mesh-detail-grid">
+                      <label className="slider-row">
+                        <span>Sampling quality (voxels/period)</span>
+                        <select
+                          aria-label="Voxels per lattice period"
+                          value={voxelsPerLatticePeriod}
+                          onChange={(event) => setVoxelsPerLatticePeriod(Number(event.target.value))}
+                        >
+                          <option value={4}>4 — Draft (fast)</option>
+                          <option value={6}>6 — Standard (default)</option>
+                          <option value={8}>8 — Fine (slow)</option>
+                        </select>
+                      </label>
+
+                      <label className="slider-row">
+                        <span>Field backend</span>
+                        <select
+                          aria-label="Lattice infill field backend"
+                          value={computeBackend}
+                          onChange={(event) => setComputeBackend(event.target.value as ComputeBackend)}
+                        >
+                          <option value="auto">auto</option>
+                          <option value="cpu">cpu</option>
+                          <option value="cuda">cuda</option>
+                        </select>
+                      </label>
+
+                      <label className="slider-row">
+                        <span>Mesher backend</span>
+                        <select
+                          aria-label="Lattice infill mesher backend"
+                          value={meshBackend}
+                          onChange={(event) => setMeshBackend(event.target.value as MeshBackend)}
+                        >
+                          <option value="auto">auto</option>
+                          <option value="cpu">cpu</option>
+                          <option value="cuda">cuda</option>
+                        </select>
+                      </label>
+
+                      <label className="slider-row">
+                        <span>Meshing mode</span>
+                        <select
+                          aria-label="Lattice infill meshing mode"
+                          value={meshingMode}
+                          onChange={(event) => setMeshingMode(event.target.value as MeshingMode)}
+                        >
+                          <option value="uniform">uniform</option>
+                          <option value="adaptive">adaptive</option>
+                        </select>
+                      </label>
+                    </div>
+
+                    <div className="resolution-info">
+                      {meshMemoryRisk ? (
+                        <>
+                          <p className="muted">
+                            Est. resolution for uploaded mesh: <strong>{meshMemoryRisk.resolution}³</strong>
+                            {meshMemoryRisk.resolution >= 1024 ? " (clamped to 1024³ max)" : ""}
+                          </p>
+                          <p className="muted">
+                            Est. required CPU memory: <strong>{bytesToMiB(meshMemoryRisk.requiredCpuBytes)}</strong>
+                            {meshMemoryContext?.availableCpuBytes != null
+                              ? ` (available: ${bytesToMiB(meshMemoryContext.availableCpuBytes)})`
+                              : " (available: unknown)"}
+                          </p>
+                          <p className="muted">
+                            Est. required GPU memory: <strong>{bytesToMiB(meshMemoryRisk.requiredGpuBytes)}</strong>
+                            {meshMemoryContext?.availableGpuFreeBytes != null
+                              ? ` (available: ${bytesToMiB(meshMemoryContext.availableGpuFreeBytes)})`
+                              : " (available: unknown)"}
+                          </p>
+                        </>
+                      ) : (
+                        <p className="muted">Memory estimate will appear after mesh preprocess completes.</p>
+                      )}
+                    </div>
+
+                    <p className="muted">Tip: `adaptive` is currently slower on CPU; use `uniform` for fastest previews.</p>
+
+                    <div className="mesh-actions">
+                      <button
+                        type="button"
+                        onClick={() => void onGenerateMesh()}
+                        disabled={!meshFile || meshMemoryFatal}
+                      >
+                        Generate Field
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void onCommitMesh()}
+                        disabled={
+                          !meshFile ||
+                          uploadedMeshFieldSignature !== currentUploadedMeshFieldSignature ||
+                          isPreviewing
+                        }
+                      >
+                        Generate Final Mesh
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void onExportUploaded("stl")}
+                        disabled={!meshCommitted}
+                      >
+                        Export STL
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void onExportUploaded("obj")}
+                        disabled={!meshCommitted}
+                      >
+                        Export OBJ
+                      </button>
+                    </div>
+                  </section>
                 </div>
 
-                <label className="slider-row">
-                  <span>Field backend</span>
-                  <select
-                    aria-label="Mesh field backend"
-                    value={computeBackend}
-                    onChange={(event) => setComputeBackend(event.target.value as ComputeBackend)}
-                  >
-                    <option value="auto">auto</option>
-                    <option value="cpu">cpu</option>
-                    <option value="cuda">cuda</option>
-                  </select>
-                </label>
-
-                <label className="slider-row">
-                  <span>Mesher backend</span>
-                  <select
-                    aria-label="Mesh mesher backend"
-                    value={meshBackend}
-                    onChange={(event) => setMeshBackend(event.target.value as MeshBackend)}
-                  >
-                    <option value="auto">auto</option>
-                    <option value="cpu">cpu</option>
-                    <option value="cuda">cuda</option>
-                  </select>
-                </label>
-                <label className="slider-row">
-                  <span>Meshing mode</span>
-                  <select
-                    aria-label="Mesh meshing mode"
-                    value={meshingMode}
-                    onChange={(event) => setMeshingMode(event.target.value as MeshingMode)}
-                  >
-                    <option value="uniform">uniform</option>
-                    <option value="adaptive">adaptive</option>
-                  </select>
-                </label>
-                <p className="muted">Tip: `adaptive` is currently slower on CPU; use `uniform` for fastest previews.</p>
-
-                {meshMemoryRisk?.fatalMessage ? <p className="warning">{meshMemoryRisk.fatalMessage}</p> : null}
-
-                <button
-                  type="button"
-                  onClick={() => void onGenerateMesh()}
-                  disabled={!meshFile || meshMemoryFatal}
-                >
-                  Preview Field
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void onCommitMesh()}
-                  disabled={!meshFile || meshMemoryFatal}
-                >
-                  Commit Design & Compute Mesh
-                </button>
+                <aside className="warning-panel">
+                  <div className="warning-panel-head">
+                    <h3>Warning Display Area</h3>
+                    <span className="pill">{meshWarnings.length ? `${meshWarnings.length} active` : "Clear"}</span>
+                  </div>
+                  {meshWarnings.length ? (
+                    <div className="warning-stack">
+                      {meshWarnings.map((warning, index) => (
+                        <p key={`${index}-${warning}`} className="warning">
+                          {warning}
+                        </p>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="muted">No active warnings.</p>
+                  )}
+                </aside>
               </div>
             </>
           )}
@@ -1320,18 +1616,6 @@ export default function App() {
                 </select>
               </label>
             ) : null}
-            <button
-              onClick={() => void (workflow === "dsl" ? onExportDsl("stl") : onExportUploaded("stl"))}
-              disabled={workflow === "mesh" && !meshCommitted}
-            >
-              Export STL
-            </button>
-            <button
-              onClick={() => void (workflow === "dsl" ? onExportDsl("obj") : onExportUploaded("obj"))}
-              disabled={workflow === "mesh" && !meshCommitted}
-            >
-              Export OBJ
-            </button>
           </div>
 
           {sectionEnabled ? (
@@ -1352,7 +1636,8 @@ export default function App() {
             <Viewer
               mesh={mesh}
               field={field}
-              uploadedFieldPreviewTrace={field && !mesh ? uploadedFieldPreviewTrace : null}
+              uploadedMeshPreviewActive={workflow === "mesh" && !meshCommitted && field != null}
+              uploadedFieldPreviewTrace={workflow === "mesh" ? uploadedFieldPreviewTrace : null}
               onUploadedFieldPreviewVisible={onUploadedFieldPreviewVisible}
               wireframe={wireframe}
               transformMode={transformMode}
@@ -1375,7 +1660,7 @@ export default function App() {
             <span>Field cache: {stats?.field_cache_hit ? "hit" : "miss"}</span>
             <span>Mesh cache: {stats?.mesh_cache_hit ? "hit" : "miss"}</span>
           </div>
-          {stats?.fallback_reason ? <p className="warning">{stats.fallback_reason}</p> : null}
+          {workflow === "dsl" && stats?.fallback_reason ? <p className="warning">{stats.fallback_reason}</p> : null}
           {error ? <p className="error">{error}</p> : null}
         </section>
       </main>

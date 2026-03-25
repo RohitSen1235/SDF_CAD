@@ -318,6 +318,9 @@ def test_mesh_field_endpoint_obj_upload() -> None:
     assert payload["field"]["encoding"] == "f32-base64"
     assert payload["field"]["resolution"] == 24
     assert payload["field"]["data"]
+    assert payload["host_field"]["encoding"] == "f32-base64"
+    assert payload["host_field"]["resolution"] == 24
+    assert payload["host_field"]["data"]
     assert payload["stats"]["preview_mode"] == "field"
     assert payload["stats"]["mesh_ms"] is None
     assert payload["stats"]["tri_count"] == 0
@@ -335,6 +338,7 @@ def test_mesh_field_binary_endpoint_obj_upload() -> None:
     assert response.headers.get("x-sdf-stats")
     assert response.headers.get("x-sdf-resolution") == "24"
     assert response.headers.get("x-sdf-trace-id")
+    assert len(response.content) == 24 * 24 * 24 * 4 * 2
 
 
 def test_mesh_field_binary_endpoint_reports_gpu_fill_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -345,6 +349,7 @@ def test_mesh_field_binary_endpoint_reports_gpu_fill_fallback(monkeypatch: pytes
     )
 
     def fake_run_uploaded_mesh_field_preview_data_with_audit(**_kwargs):
+        host_sdf = np.zeros((2, 2, 2), dtype=np.float32)
         field = np.zeros((2, 2, 2), dtype=np.float32)
         bounds = [[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
         stats = main_module.PreviewStats(
@@ -378,7 +383,7 @@ def test_mesh_field_binary_endpoint_reports_gpu_fill_fallback(monkeypatch: pytes
             server_pack_binary_ms=0.0,
             server_handler_total_ms=0.0,
         )
-        return field, bounds, stats, audit
+        return host_sdf, field, bounds, stats, audit
 
     monkeypatch.setattr(main_module, "_run_uploaded_mesh_field_preview_data_with_audit", fake_run_uploaded_mesh_field_preview_data_with_audit)
 
@@ -459,6 +464,57 @@ def test_mesh_field_endpoint_does_not_call_mesher(monkeypatch: pytest.MonkeyPatc
     )
     assert response.status_code == 200
     assert response.json()["stats"]["preview_mode"] == "field"
+
+
+def test_mesh_commit_endpoint_requires_preview_field_first() -> None:
+    from app import cache as cache_module
+
+    cache_module.clear_all_preview_caches()
+
+    response = client.post(
+        "/api/v1/mesh/commit",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 409
+    assert "Preview Field first" in response.json()["detail"]
+
+
+def test_mesh_commit_endpoint_uses_cached_field_without_recomputing_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app import cache as cache_module
+
+    cache_module.clear_all_preview_caches()
+
+    field_response = client.post(
+        "/api/v1/mesh/field.binary",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert field_response.status_code == 200
+
+    def fail_memory_guard(**_kwargs):
+        raise AssertionError("Uploaded mesh memory guard should not run for commit-only path")
+
+    def fail_field_compute(**_kwargs):
+        raise AssertionError("Field recomputation should not run for commit-only path")
+
+    monkeypatch.setattr(main_module, "_enforce_uploaded_mesh_memory_guard", fail_memory_guard)
+    monkeypatch.setattr(main_module, "_resolve_uploaded_composed_field", fail_field_compute)
+
+    response = client.post(
+        "/api/v1/mesh/commit.binary",
+        data=_mesh_form(),
+        files={"file": ("tetra.obj", MESH_OBJ, "text/plain")},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/octet-stream")
+    stats = json.loads(response.headers["x-sdf-stats"])
+    assert stats["preview_mode"] == "mesh"
+    assert stats["field_cache_hit"] is True
+    assert stats["mesh_cache_hit"] is False
+    assert stats["eval_ms"] == 0.0
 
 
 def test_mesh_preview_preserves_original_outer_vertices() -> None:
@@ -881,6 +937,7 @@ def test_uploaded_field_preview_trace_includes_preprocessing_time(
     cache_module.clear_all_preview_caches()
 
     def fake_run_uploaded_mesh_field_preview_data_with_audit(**_kwargs):
+        host_sdf = np.zeros((2, 2, 2), dtype=np.float32)
         field = np.zeros((2, 2, 2), dtype=np.float32)
         bounds = [[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
         stats = main_module.PreviewStats(
@@ -913,7 +970,7 @@ def test_uploaded_field_preview_trace_includes_preprocessing_time(
             server_pack_binary_ms=0.0,
             server_handler_total_ms=0.0,
         )
-        return field, bounds, stats, audit
+        return host_sdf, field, bounds, stats, audit
 
     monkeypatch.setattr(main_module, "_run_uploaded_mesh_field_preview_data_with_audit", fake_run_uploaded_mesh_field_preview_data_with_audit)
 
