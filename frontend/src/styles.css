@@ -39,9 +39,10 @@ body {
 }
 
 .topbar {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto minmax(220px, 1fr);
   align-items: center;
+  gap: 1rem;
   padding: 0.9rem 1.25rem;
   background: rgba(7, 17, 28, 0.65);
   border-bottom: 1px solid var(--panel-border);
@@ -55,9 +56,55 @@ body {
   letter-spacing: 0.04em;
 }
 
-.status-pills {
+.topbar-brand {
+  justify-self: start;
+}
+
+.topbar-center {
+  justify-self: center;
   display: flex;
-  gap: 0.5rem;
+  justify-content: center;
+}
+
+.topbar-side {
+  justify-self: end;
+  display: flex;
+  align-items: center;
+  min-width: 210px;
+  justify-content: flex-end;
+  gap: 0.75rem;
+}
+
+.busy-indicator {
+  display: grid;
+  gap: 0.3rem;
+  min-width: 180px;
+}
+
+.busy-label {
+  color: var(--accent);
+  font-size: 0.77rem;
+  letter-spacing: 0.02em;
+}
+
+.busy-bar {
+  position: relative;
+  height: 6px;
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid rgba(139, 233, 253, 0.3);
+  background: rgba(8, 18, 30, 0.95);
+}
+
+.busy-bar span {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 42%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, rgba(139, 233, 253, 0), rgba(139, 233, 253, 0.95), rgba(127, 255, 207, 0.95));
+  animation: busy-slide 1.25s ease-in-out infinite;
 }
 
 .pill {
@@ -108,12 +155,45 @@ body {
 
 .workflow-toggle {
   display: inline-flex;
-  gap: 0.4rem;
+  gap: 0.25rem;
+  padding: 0.2rem;
+  border: 1px solid rgba(139, 233, 253, 0.18);
+  border-radius: 999px;
+  background: rgba(6, 16, 27, 0.62);
+  backdrop-filter: blur(8px);
+}
+
+.workflow-toggle button {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 0.34rem 0.75rem;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.workflow-toggle button:hover {
+  transform: none;
+  background: rgba(30, 57, 82, 0.52);
 }
 
 .workflow-toggle button.active {
-  background: linear-gradient(120deg, rgba(139, 233, 253, 0.28), rgba(255, 205, 112, 0.24));
-  border-color: rgba(139, 233, 253, 0.55);
+  color: #061422;
+  background: linear-gradient(120deg, var(--accent), #7fffcf);
+  border-color: transparent;
+}
+
+.workflow-toggle-prominent {
+  border-color: rgba(139, 233, 253, 0.48);
+  background: rgba(6, 16, 27, 0.92);
+  box-shadow: 0 0 0 1px rgba(139, 233, 253, 0.18), 0 0 24px rgba(139, 233, 253, 0.18);
+}
+
+.workflow-toggle-prominent button {
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding: 0.48rem 1.05rem;
 }
 
 .inline-actions {
@@ -220,17 +300,82 @@ button:hover {
   background: rgba(8, 18, 30, 0.95);
 }
 
-.mesh-controls {
+.mesh-workflow-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 0.38fr);
+  gap: 0.85rem;
+  align-items: start;
+}
+
+.mesh-control-stack {
+  display: grid;
+  gap: 0.85rem;
+  min-width: 0;
+}
+
+.mesh-card,
+.warning-panel {
+  min-width: 0;
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  background: rgba(6, 15, 25, 0.72);
+  padding: 0.8rem;
   display: grid;
   gap: 0.6rem;
 }
 
-.mesh-controls input[type="file"] {
+.mesh-card h3,
+.warning-panel h3 {
+  color: var(--accent-2);
+}
+
+.mesh-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem 0.8rem;
+}
+
+.mesh-file-row {
+  grid-column: 1 / -1;
+}
+
+.mesh-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.mesh-actions button {
+  flex: 1 1 180px;
+}
+
+.mesh-card input[type="file"] {
   border: 1px dashed var(--panel-border);
   border-radius: 8px;
   padding: 0.45rem;
   background: rgba(8, 18, 30, 0.92);
   color: var(--muted);
+}
+
+.resolution-info {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.warning-panel {
+  background: linear-gradient(180deg, rgba(63, 41, 0, 0.16), rgba(6, 15, 25, 0.82));
+}
+
+.warning-panel-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.warning-stack {
+  display: grid;
+  gap: 0.5rem;
 }
 
 .composition {
@@ -317,6 +462,14 @@ button:hover {
   font-size: 0.85rem;
 }
 
+.warning-panel .warning {
+  padding: 0.65rem 0.7rem;
+  border-left: 3px solid var(--accent-2);
+  border-radius: 10px;
+  background: rgba(255, 205, 112, 0.08);
+  color: var(--text);
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -359,12 +512,53 @@ button:hover {
     grid-template-rows: 0.48fr 0.52fr;
   }
 
+  .mesh-workflow-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .mesh-detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .mesh-file-row {
+    grid-column: auto;
+  }
+
   .editor-panel {
     gap: 0.7rem;
   }
 
+  .topbar {
+    grid-template-columns: 1fr;
+    justify-items: stretch;
+    align-items: start;
+  }
+
+  .topbar-brand {
+    justify-self: start;
+  }
+
+  .topbar-center {
+    justify-self: stretch;
+  }
+
+  .topbar-side {
+    justify-self: stretch;
+    justify-content: center;
+    min-width: 0;
+  }
+
   .saved-expr-row {
     grid-template-columns: 1fr 1fr;
+  }
+}
+
+@keyframes busy-slide {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(250%);
   }
 }
 
