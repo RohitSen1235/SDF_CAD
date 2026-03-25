@@ -35,6 +35,32 @@ interface SavedFieldExpression {
   updatedAt: number;
 }
 
+type WorkflowMode = "dsl" | "mesh";
+type TransformMode = "translate" | "rotate" | "scale";
+
+interface WorkspaceDraft {
+  version: 1;
+  workflow: WorkflowMode;
+  source: string;
+  quality: QualityProfile;
+  computePrecision: ComputePrecision;
+  computeBackend: ComputeBackend;
+  meshBackend: MeshBackend;
+  meshingMode: MeshingMode;
+  meshShellThickness: number;
+  meshLatticeType: MeshLatticeType;
+  meshLatticePitch: number;
+  meshLatticeThickness: number;
+  meshLatticePhase: number;
+  voxelsPerLatticePeriod: number;
+  wireframe: boolean;
+  showGrid: boolean;
+  showAxes: boolean;
+  transformMode: TransformMode;
+  sectionEnabled: boolean;
+  sectionLevel: number;
+}
+
 const GYROID_FILL_SOURCE = `# Gyroid conformal fill
 param shell default=0.08 min=0.03 max=0.2 step=0.01
 host = sphere(r=1.0)
@@ -84,6 +110,7 @@ const MODULE_TABS: Array<{ mode: WorkflowMode; label: string }> = [
   { mode: "mesh", label: "Lattice Infill" }
 ];
 const SAVED_EXPRESSIONS_KEY = "sdfcad.savedFieldExpressions.v1";
+const WORKSPACE_DRAFT_KEY = "sdfcad.workspaceDraft.v1";
 const BUILTIN_SAVED_EXPRESSIONS: SavedFieldExpression[] = [
   {
     name: "Gyroid Fill",
@@ -96,8 +123,6 @@ const BUILTIN_SAVED_EXPRESSIONS: SavedFieldExpression[] = [
     updatedAt: 0
   }
 ];
-
-type WorkflowMode = "dsl" | "mesh";
 
 function loadSavedExpressions(): SavedFieldExpression[] {
   if (typeof window === "undefined") {
@@ -131,6 +156,108 @@ function loadSavedExpressions(): SavedFieldExpression[] {
     return [...mergedByName.values()].sort((a, b) => b.updatedAt - a.updatedAt);
   } catch {
     return BUILTIN_SAVED_EXPRESSIONS;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function asFiniteNumber(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  return value;
+}
+
+function loadWorkspaceDraft(): Partial<WorkspaceDraft> {
+  if (typeof window === "undefined") {
+    return {};
+  }
+  try {
+    const raw = window.localStorage.getItem(WORKSPACE_DRAFT_KEY);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw);
+    if (!isRecord(parsed) || parsed.version !== 1) {
+      return {};
+    }
+
+    const draft: Partial<WorkspaceDraft> = {};
+
+    if (parsed.workflow === "dsl" || parsed.workflow === "mesh") {
+      draft.workflow = parsed.workflow;
+    }
+    if (typeof parsed.source === "string") {
+      draft.source = parsed.source;
+    }
+    if (
+      parsed.quality === "interactive" ||
+      parsed.quality === "medium" ||
+      parsed.quality === "high" ||
+      parsed.quality === "ultra"
+    ) {
+      draft.quality = parsed.quality;
+    }
+    if (parsed.computePrecision === "float32" || parsed.computePrecision === "float16") {
+      draft.computePrecision = parsed.computePrecision;
+    }
+    if (parsed.computeBackend === "auto" || parsed.computeBackend === "cpu" || parsed.computeBackend === "cuda") {
+      draft.computeBackend = parsed.computeBackend;
+    }
+    if (parsed.meshBackend === "auto" || parsed.meshBackend === "cpu" || parsed.meshBackend === "cuda") {
+      draft.meshBackend = parsed.meshBackend;
+    }
+    if (parsed.meshingMode === "uniform" || parsed.meshingMode === "adaptive") {
+      draft.meshingMode = parsed.meshingMode;
+    }
+    if (parsed.meshLatticeType === "gyroid" || parsed.meshLatticeType === "schwarz_p" || parsed.meshLatticeType === "diamond") {
+      draft.meshLatticeType = parsed.meshLatticeType;
+    }
+    if (parsed.transformMode === "translate" || parsed.transformMode === "rotate" || parsed.transformMode === "scale") {
+      draft.transformMode = parsed.transformMode;
+    }
+    if (typeof parsed.wireframe === "boolean") {
+      draft.wireframe = parsed.wireframe;
+    }
+    if (typeof parsed.showGrid === "boolean") {
+      draft.showGrid = parsed.showGrid;
+    }
+    if (typeof parsed.showAxes === "boolean") {
+      draft.showAxes = parsed.showAxes;
+    }
+    if (typeof parsed.sectionEnabled === "boolean") {
+      draft.sectionEnabled = parsed.sectionEnabled;
+    }
+
+    const meshShellThickness = asFiniteNumber(parsed.meshShellThickness);
+    if (meshShellThickness !== null) {
+      draft.meshShellThickness = meshShellThickness;
+    }
+    const meshLatticePitch = asFiniteNumber(parsed.meshLatticePitch);
+    if (meshLatticePitch !== null) {
+      draft.meshLatticePitch = meshLatticePitch;
+    }
+    const meshLatticeThickness = asFiniteNumber(parsed.meshLatticeThickness);
+    if (meshLatticeThickness !== null) {
+      draft.meshLatticeThickness = meshLatticeThickness;
+    }
+    const meshLatticePhase = asFiniteNumber(parsed.meshLatticePhase);
+    if (meshLatticePhase !== null) {
+      draft.meshLatticePhase = meshLatticePhase;
+    }
+    const sectionLevel = asFiniteNumber(parsed.sectionLevel);
+    if (sectionLevel !== null) {
+      draft.sectionLevel = sectionLevel;
+    }
+    if (parsed.voxelsPerLatticePeriod === 4 || parsed.voxelsPerLatticePeriod === 6 || parsed.voxelsPerLatticePeriod === 8) {
+      draft.voxelsPerLatticePeriod = parsed.voxelsPerLatticePeriod;
+    }
+
+    return draft;
+  } catch {
+    return {};
   }
 }
 
@@ -197,21 +324,22 @@ function bytesToMiB(value: number): string {
 }
 
 export default function App() {
-  const [workflow, setWorkflow] = useState<WorkflowMode>("dsl");
+  const [workspaceDraft] = useState<Partial<WorkspaceDraft>>(() => loadWorkspaceDraft());
+  const [workflow, setWorkflow] = useState<WorkflowMode>(workspaceDraft.workflow ?? "dsl");
 
-  const [source, setSource] = useState(EXAMPLES["Field Expression"]);
+  const [source, setSource] = useState(workspaceDraft.source ?? EXAMPLES["Field Expression"]);
   const [sourceDirty, setSourceDirty] = useState(true);
   const [sceneIr, setSceneIr] = useState<SceneIR | null>(null);
   const [diagnostics, setDiagnostics] = useState<CompileDiagnostics | null>(null);
   const [params, setParams] = useState<Record<string, number>>({});
 
   const [meshFile, setMeshFile] = useState<File | null>(null);
-  const [meshShellThickness, setMeshShellThickness] = useState(2.0);
-  const [meshLatticeType, setMeshLatticeType] = useState<MeshLatticeType>("gyroid");
-  const [meshLatticePitch, setMeshLatticePitch] = useState(5.0);
-  const [meshLatticeThickness, setMeshLatticeThickness] = useState(0.5);
-  const [meshLatticePhase, setMeshLatticePhase] = useState(0.0);
-  const [voxelsPerLatticePeriod, setVoxelsPerLatticePeriod] = useState(6);
+  const [meshShellThickness, setMeshShellThickness] = useState(workspaceDraft.meshShellThickness ?? 2.0);
+  const [meshLatticeType, setMeshLatticeType] = useState<MeshLatticeType>(workspaceDraft.meshLatticeType ?? "gyroid");
+  const [meshLatticePitch, setMeshLatticePitch] = useState(workspaceDraft.meshLatticePitch ?? 5.0);
+  const [meshLatticeThickness, setMeshLatticeThickness] = useState(workspaceDraft.meshLatticeThickness ?? 0.5);
+  const [meshLatticePhase, setMeshLatticePhase] = useState(workspaceDraft.meshLatticePhase ?? 0.0);
+  const [voxelsPerLatticePeriod, setVoxelsPerLatticePeriod] = useState(workspaceDraft.voxelsPerLatticePeriod ?? 6);
   const [meshCommitted, setMeshCommitted] = useState(false);
   const [meshMemoryContext, setMeshMemoryContext] = useState<UploadedMeshMemoryContext | null>(null);
 
@@ -222,19 +350,19 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [isCompiling, setIsCompiling] = useState(false);
   const [isPreviewing, setIsPreviewing] = useState(false);
-  const [wireframe, setWireframe] = useState(false);
-  const [showGrid, setShowGrid] = useState(true);
-  const [showAxes, setShowAxes] = useState(true);
-  const [transformMode, setTransformMode] = useState<"translate" | "rotate" | "scale">("translate");
+  const [wireframe, setWireframe] = useState(workspaceDraft.wireframe ?? false);
+  const [showGrid, setShowGrid] = useState(workspaceDraft.showGrid ?? true);
+  const [showAxes, setShowAxes] = useState(workspaceDraft.showAxes ?? true);
+  const [transformMode, setTransformMode] = useState<TransformMode>(workspaceDraft.transformMode ?? "translate");
   const [fitSignal, setFitSignal] = useState(0);
-  const [quality, setQuality] = useState<QualityProfile>("high");
-  const [computePrecision, setComputePrecision] = useState<ComputePrecision>("float32");
-  const [computeBackend, setComputeBackend] = useState<ComputeBackend>("auto");
-  const [meshBackend, setMeshBackend] = useState<MeshBackend>("auto");
-  const [meshingMode, setMeshingMode] = useState<MeshingMode>("uniform");
+  const [quality, setQuality] = useState<QualityProfile>(workspaceDraft.quality ?? "high");
+  const [computePrecision, setComputePrecision] = useState<ComputePrecision>(workspaceDraft.computePrecision ?? "float32");
+  const [computeBackend, setComputeBackend] = useState<ComputeBackend>(workspaceDraft.computeBackend ?? "auto");
+  const [meshBackend, setMeshBackend] = useState<MeshBackend>(workspaceDraft.meshBackend ?? "auto");
+  const [meshingMode, setMeshingMode] = useState<MeshingMode>(workspaceDraft.meshingMode ?? "uniform");
   const [uploadedMeshFieldSignature, setUploadedMeshFieldSignature] = useState<string | null>(null);
-  const [sectionEnabled, setSectionEnabled] = useState(false);
-  const [sectionLevel, setSectionLevel] = useState(0);
+  const [sectionEnabled, setSectionEnabled] = useState(workspaceDraft.sectionEnabled ?? false);
+  const [sectionLevel, setSectionLevel] = useState(workspaceDraft.sectionLevel ?? 0);
   const [sectionYBounds, setSectionYBounds] = useState<[number, number]>([-2, 2]);
   const [isSignatureHelpOpen, setIsSignatureHelpOpen] = useState(false);
   const [savedExpressions, setSavedExpressions] = useState<SavedFieldExpression[]>(() => loadSavedExpressions());
@@ -661,12 +789,60 @@ export default function App() {
     if (typeof window === "undefined") {
       return;
     }
+    const draft: WorkspaceDraft = {
+      version: 1,
+      workflow,
+      source,
+      quality,
+      computePrecision,
+      computeBackend,
+      meshBackend,
+      meshingMode,
+      meshShellThickness,
+      meshLatticeType,
+      meshLatticePitch,
+      meshLatticeThickness,
+      meshLatticePhase,
+      voxelsPerLatticePeriod,
+      wireframe,
+      showGrid,
+      showAxes,
+      transformMode,
+      sectionEnabled,
+      sectionLevel
+    };
+    try {
+      window.localStorage.setItem(WORKSPACE_DRAFT_KEY, JSON.stringify(draft));
+    } catch {
+      // Ignore storage failures (private mode/quota), keep UI responsive.
+    }
     try {
       window.localStorage.setItem(SAVED_EXPRESSIONS_KEY, JSON.stringify(savedExpressions));
     } catch {
       // Ignore storage failures (private mode/quota), keep UI responsive.
     }
-  }, [savedExpressions]);
+  }, [
+    savedExpressions,
+    workflow,
+    source,
+    quality,
+    computePrecision,
+    computeBackend,
+    meshBackend,
+    meshingMode,
+    meshShellThickness,
+    meshLatticeType,
+    meshLatticePitch,
+    meshLatticeThickness,
+    meshLatticePhase,
+    voxelsPerLatticePeriod,
+    wireframe,
+    showGrid,
+    showAxes,
+    transformMode,
+    sectionEnabled,
+    sectionLevel
+  ]);
 
   useEffect(() => {
     if (!selectedExpressionName) {

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 
+const WORKSPACE_DRAFT_KEY = "sdfcad.workspaceDraft.v1";
 const viewerMock = vi.fn();
 
 vi.mock("./components/Viewer", () => ({
@@ -148,6 +149,66 @@ describe("App", () => {
     expect(screen.getByRole("tab", { name: "Lattice Infill" })).toHaveAttribute("aria-selected", "false");
     expect(screen.getByRole("button", { name: "Compile now" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Generate Shape" })).toBeInTheDocument();
+  });
+
+  it("restores workspace draft from localStorage after refresh", () => {
+    window.localStorage.setItem(
+      WORKSPACE_DRAFT_KEY,
+      JSON.stringify({
+        version: 1,
+        workflow: "mesh",
+        source: "root = sphere(r=2.5)",
+        quality: "ultra",
+        computePrecision: "float16",
+        computeBackend: "cuda",
+        meshBackend: "cpu",
+        meshingMode: "adaptive",
+        meshShellThickness: 1.5,
+        meshLatticeType: "diamond",
+        meshLatticePitch: 6.5,
+        meshLatticeThickness: 0.7,
+        meshLatticePhase: 0.15,
+        voxelsPerLatticePeriod: 8,
+        wireframe: true,
+        showGrid: false,
+        showAxes: false,
+        transformMode: "rotate",
+        sectionEnabled: true,
+        sectionLevel: 0.25
+      })
+    );
+
+    render(<App />);
+
+    expect(screen.getByRole("tab", { name: "Lattice Infill" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByLabelText("Shell thickness (mm)")).toHaveValue(1.5);
+    expect(screen.getByLabelText("Lattice type")).toHaveValue("diamond");
+    expect(screen.getByLabelText("Voxels per lattice period")).toHaveValue("8");
+    expect(screen.getByRole("button", { name: "Section Off" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Solid" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Grid" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "DSL" }));
+    expect(screen.getByLabelText("DSL source editor")).toHaveValue("root = sphere(r=2.5)");
+    expect(screen.getByLabelText("Quality")).toHaveValue("ultra");
+  });
+
+  it("autosaves workspace draft as settings change", () => {
+    render(<App />);
+
+    fireEvent.change(screen.getByLabelText("DSL source editor"), { target: { value: "root = sphere(r=1.2)" } });
+    fireEvent.click(screen.getByRole("button", { name: "Wire" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
+    fireEvent.change(screen.getByLabelText("Shell thickness (mm)"), { target: { value: "1.25" } });
+
+    const raw = window.localStorage.getItem(WORKSPACE_DRAFT_KEY);
+    expect(raw).not.toBeNull();
+
+    const parsed = JSON.parse(raw ?? "{}");
+    expect(parsed.workflow).toBe("mesh");
+    expect(parsed.source).toBe("root = sphere(r=1.2)");
+    expect(parsed.wireframe).toBe(true);
+    expect(parsed.meshShellThickness).toBe(1.25);
   });
 
   it("does not auto-compile or auto-preview when source changes", () => {

@@ -24,6 +24,10 @@ export interface ViewerProps {
   sectionLevel: number;
 }
 
+export const HARD_EDGE_MESH_MATERIAL_PROPS = {
+  flatShading: true
+} as const;
+
 const FIELD_VERTEX_SHADER = `
   out vec3 vWorldPos;
   void main() {
@@ -582,6 +586,7 @@ export function Viewer({
                 wireframe={wireframe}
                 clippingPlanes={clippingPlanes}
                 clipShadows
+                {...HARD_EDGE_MESH_MATERIAL_PROPS}
               />
             </mesh>
           </group>
@@ -602,6 +607,7 @@ export function Viewer({
             stencilFail={THREE.ReplaceStencilOp}
             stencilZFail={THREE.ReplaceStencilOp}
             stencilZPass={THREE.ReplaceStencilOp}
+            {...HARD_EDGE_MESH_MATERIAL_PROPS}
           />
         </mesh>
       ) : null}

@@ -4,7 +4,7 @@ import type { ComponentProps, ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import * as THREE from "three";
 
-import { Viewer } from "./Viewer";
+import { HARD_EDGE_MESH_MATERIAL_PROPS, Viewer } from "./Viewer";
 
 vi.mock("@react-three/fiber", () => ({
   Canvas: ({ children, onCreated }: { children: ReactNode; onCreated?: (state: any) => void }) => {
@@ -81,6 +81,10 @@ function renderViewer(overrides?: Partial<ComponentProps<typeof Viewer>>) {
 }
 
 describe("Viewer section capping", () => {
+  it("enables flat shading for lit mesh materials by default", () => {
+    expect(HARD_EDGE_MESH_MATERIAL_PROPS.flatShading).toBe(true);
+  });
+
   it("uses mesh stencil cap when mesh and field are both present", () => {
     const { container } = renderViewer();
 
