@@ -612,7 +612,7 @@ describe("App", () => {
     });
   });
 
-  it("keeps the previous preview visible while Generate Field is in flight", async () => {
+  it("clears the old layered preview when Generate Field is clicked again", async () => {
     let resolvePreview: ((value: typeof fieldPreviewPayload) => void) | null = null;
     previewUploadedMeshField.mockImplementationOnce(
       () =>
@@ -643,7 +643,33 @@ describe("App", () => {
     await waitFor(() => {
       const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
       expect(latestViewerProps.field).toEqual(fieldPreviewPayload.field);
-      expect(latestViewerProps.mesh).toBeNull();
+      expect(latestViewerProps.mesh).toEqual(outerMeshPayload);
+    });
+
+    let resolveSecondPreview: ((value: typeof fieldPreviewPayload) => void) | null = null;
+    previewUploadedMeshField.mockImplementationOnce(
+      () =>
+        new Promise<typeof fieldPreviewPayload>((resolve) => {
+          resolveSecondPreview = resolve;
+        })
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
+    await waitFor(() => {
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(2);
+    });
+
+    const rerunViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
+    expect(rerunViewerProps.field).toBeNull();
+    expect(rerunViewerProps.mesh).toEqual(outerMeshPayload);
+
+    expect(resolveSecondPreview).not.toBeNull();
+    resolveSecondPreview!(fieldPreviewPayload);
+
+    await waitFor(() => {
+      const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
+      expect(latestViewerProps.field).toEqual(fieldPreviewPayload.field);
+      expect(latestViewerProps.mesh).toEqual(outerMeshPayload);
     });
   });
 
@@ -664,25 +690,29 @@ describe("App", () => {
     expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
     expect(latestViewerProps.field).toEqual(fieldPreviewPayload.field);
-    expect(latestViewerProps.mesh).toBeNull();
+    expect(latestViewerProps.mesh).toEqual(outerMeshPayload);
   });
 
-  it("does not pass transparentShell to Viewer for field previews", async () => {
+  it("passes the layered field preview to Viewer without host-field rendering", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "Generate Shape" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
+
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Lattice infill file upload"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate Field" }));
 
     await waitFor(() => {
-      expect(previewField).toHaveBeenCalledTimes(1);
+      expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     });
 
     const fieldOnlyCall = viewerMock.mock.calls.find(([props]) => {
       const viewerProps = props as Record<string, unknown>;
-      return viewerProps.field != null && viewerProps.mesh == null;
+      return viewerProps.field != null && viewerProps.mesh != null;
     });
 
     expect(fieldOnlyCall).toBeDefined();
     const fieldOnlyProps = fieldOnlyCall?.[0] as Record<string, unknown>;
-    expect("transparentShell" in fieldOnlyProps).toBe(false);
+    expect("hostField" in fieldOnlyProps).toBe(false);
   });
 
   it("calls preprocessUploadedMesh and shows outer mesh after file selection", async () => {

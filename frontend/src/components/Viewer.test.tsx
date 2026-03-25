@@ -68,6 +68,7 @@ function renderViewer(overrides?: Partial<ComponentProps<typeof Viewer>>) {
     <Viewer
       mesh={sampleMesh}
       field={sampleField}
+      uploadedMeshPreviewActive={true}
       wireframe={false}
       transformMode="translate"
       fitSignal={0}
@@ -85,12 +86,13 @@ describe("Viewer section capping", () => {
     expect(HARD_EDGE_MESH_MATERIAL_PROPS.flatShading).toBe(true);
   });
 
-  it("uses mesh stencil cap when mesh and field are both present", () => {
+  it("uses layered translucent rendering when uploaded mesh preview is active", () => {
     const { container } = renderViewer();
 
     expect(container.querySelectorAll("meshbasicmaterial").length).toBe(2);
     expect(container.querySelectorAll("meshstandardmaterial").length).toBe(2);
-    expect(container.querySelectorAll("shadermaterial").length).toBe(0);
+    expect(container.querySelectorAll("shadermaterial").length).toBe(1);
+    expect(container.querySelectorAll("boxgeometry").length).toBe(1);
   });
 
   it("uses a translucent shader path for field-only rendering", () => {

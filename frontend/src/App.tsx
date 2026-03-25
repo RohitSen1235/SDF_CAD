@@ -551,6 +551,9 @@ export default function App() {
     }
 
     abortActiveMeshFieldPreview();
+    setField(null);
+    setStats(null);
+    setUploadedFieldPreviewTrace(null);
 
     const runId = meshFieldPreviewRunIdRef.current + 1;
     meshFieldPreviewRunIdRef.current = runId;
@@ -573,7 +576,6 @@ export default function App() {
       }
       const fieldAssignedAtMs = performance.now();
       setField(response.field);
-      setMesh(null);
       setStats(response.stats);
       setUploadedMeshFieldSignature(currentUploadedMeshFieldSignature);
       setUploadedFieldPreviewTrace(
@@ -1634,7 +1636,8 @@ export default function App() {
             <Viewer
               mesh={mesh}
               field={field}
-              uploadedFieldPreviewTrace={field && !mesh ? uploadedFieldPreviewTrace : null}
+              uploadedMeshPreviewActive={workflow === "mesh" && !meshCommitted && field != null}
+              uploadedFieldPreviewTrace={workflow === "mesh" ? uploadedFieldPreviewTrace : null}
               onUploadedFieldPreviewVisible={onUploadedFieldPreviewVisible}
               wireframe={wireframe}
               transformMode={transformMode}

@@ -137,6 +137,7 @@ export interface UploadedFieldPreviewTrace {
 }
 
 export interface UploadedPreviewFieldResponse extends PreviewFieldResponse {
+  hostField?: FieldPayload | null;
   trace?: UploadedFieldPreviewTrace | null;
 }
 

@@ -102,6 +102,7 @@ from .models import (
     QualityProfile,
     MeshBackend,
     MeshPayload,
+    UploadedPreviewFieldResponse,
     UploadedFieldStorageMode,
     UploadedFieldPreviewClientTelemetry,
     UploadedMeshPreviewWsRequest,
@@ -1501,6 +1502,18 @@ def _build_uploaded_field_payload(
     )
 
 
+def _build_uploaded_host_field_payload(
+    host_sdf: np.ndarray,
+    bounds: list[list[float]],
+) -> FieldPayload:
+    return FieldPayload(
+        encoding="f32-base64",
+        resolution=int(host_sdf.shape[0]),
+        bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
+        data=_encode_field(host_sdf),
+    )
+
+
 def _build_uploaded_field_payload_from_cache_entry(
     *,
     cache_entry: UploadedMeshCacheEntry,
@@ -1984,7 +1997,7 @@ def _run_uploaded_mesh_field_preview_data_with_audit(
     voxels_per_lattice_period: int = 6,
     compute_backend: ComputeBackend = "auto",
     field_storage_mode: UploadedFieldStorageMode = "auto",
-) -> tuple[np.ndarray, list[list[float]], PreviewStats, UploadedFieldPreviewServerAudit]:
+) -> tuple[np.ndarray, np.ndarray, list[list[float]], PreviewStats, UploadedFieldPreviewServerAudit]:
     metadata_start = time.perf_counter()
     metadata = _resolve_uploaded_mesh_metadata(
         file_bytes=file_bytes,
@@ -2051,7 +2064,7 @@ def _run_uploaded_mesh_field_preview_data_with_audit(
         field_cache_hit=composed.field_cache_hit,
         resolution=int(composed.field.shape[0]),
         voxel_count=int(composed.field.size),
-        payload_bytes=int(composed.field.size * np.dtype(np.float32).itemsize),
+        payload_bytes=int(composed.field.size * np.dtype(np.float32).itemsize * 2),
         compute_backend=composed.eval_backend_used,
         host_build_strategy=host_result.host_build_strategy,
         host_decision_reason=host_result.host_decision_reason,
@@ -2063,7 +2076,7 @@ def _run_uploaded_mesh_field_preview_data_with_audit(
         server_pack_binary_ms=0.0,
         server_handler_total_ms=0.0,
     )
-    return composed.field, out_bounds, stats, audit
+    return host_result.host_sdf, composed.field, out_bounds, stats, audit
 
 
 def _run_uploaded_mesh_field_preview_data(
@@ -2080,7 +2093,7 @@ def _run_uploaded_mesh_field_preview_data(
     compute_backend: ComputeBackend = "auto",
     field_storage_mode: UploadedFieldStorageMode = "auto",
 ) -> tuple[np.ndarray, list[list[float]], PreviewStats]:
-    field, bounds, stats, _audit = _run_uploaded_mesh_field_preview_data_with_audit(
+    _host_field, field, bounds, stats, _audit = _run_uploaded_mesh_field_preview_data_with_audit(
         file_bytes=file_bytes,
         file_hash=file_hash,
         extension=extension,
@@ -2786,7 +2799,7 @@ async def commit_uploaded_mesh_binary(
         cleanup_gpu_memory(reason="commit_uploaded_mesh_binary_inline")
 
 
-@app.post("/api/v1/mesh/field", response_model=PreviewFieldResponse)
+@app.post("/api/v1/mesh/field", response_model=UploadedPreviewFieldResponse)
 async def preview_uploaded_mesh_field(
     request: Request,
     response: Response,
@@ -2799,7 +2812,7 @@ async def preview_uploaded_mesh_field(
     voxels_per_lattice_period: int = Form(6),
     compute_backend: ComputeBackend = Form("auto"),
     field_storage_mode: UploadedFieldStorageMode = Form("auto"),
-) -> PreviewFieldResponse:
+) -> UploadedPreviewFieldResponse:
     trace_id = uuid4().hex
     route_started = time.perf_counter()
     await _reject_legacy_uploaded_mesh_quality_profile(request)
@@ -2819,7 +2832,7 @@ async def preview_uploaded_mesh_field(
     except MeshUploadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
-        field, bounds, stats, audit = await asyncio.to_thread(
+        host_sdf, field, bounds, stats, audit = await asyncio.to_thread(
             _run_uploaded_mesh_field_preview_data_with_audit,
             file_bytes=file_bytes,
             file_hash=file_hash,
@@ -2845,7 +2858,11 @@ async def preview_uploaded_mesh_field(
             audit=final_audit,
         )
         response.headers["X-SDF-Trace-Id"] = trace_id
-        return PreviewFieldResponse(field=_build_uploaded_field_payload(field, bounds), stats=stats)
+        return UploadedPreviewFieldResponse(
+            field=_build_uploaded_field_payload(field, bounds),
+            host_field=_build_uploaded_host_field_payload(host_sdf, bounds),
+            stats=stats,
+        )
     except (MeshUploadError, MeshingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
@@ -2884,7 +2901,7 @@ async def preview_uploaded_mesh_field_binary(
     except MeshUploadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
-        field, bounds, stats, audit = await asyncio.to_thread(
+        host_sdf, field, bounds, stats, audit = await asyncio.to_thread(
             _run_uploaded_mesh_field_preview_data_with_audit,
             file_bytes=file_bytes,
             file_hash=file_hash,
@@ -2899,7 +2916,7 @@ async def preview_uploaded_mesh_field_binary(
             field_storage_mode=field_storage_mode,
         )
         pack_started = time.perf_counter()
-        packet = _pack_field_binary(field)
+        packet = _pack_field_binary(host_sdf) + _pack_field_binary(field)
         server_pack_binary_ms = (time.perf_counter() - pack_started) * 1000.0
         final_audit = replace(
             audit,

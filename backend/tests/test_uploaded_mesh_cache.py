@@ -318,7 +318,7 @@ def test_uploaded_host_cache_returns_shared_immutable_arrays() -> None:
 
 
 def test_uploaded_field_preview_audit_reports_zero_compose_time_on_cache_hit() -> None:
-    _, _, _, first_audit = main_module._run_uploaded_mesh_field_preview_data_with_audit(
+    _, _, _, _, first_audit = main_module._run_uploaded_mesh_field_preview_data_with_audit(
         file_bytes=MESH_OBJ,
         file_hash=MESH_OBJ_HASH,
         extension=".obj",
@@ -328,7 +328,7 @@ def test_uploaded_field_preview_audit_reports_zero_compose_time_on_cache_hit() -
         lattice_thickness=0.09,
         lattice_phase=0.0,
     )
-    _, _, _, second_audit = main_module._run_uploaded_mesh_field_preview_data_with_audit(
+    _, _, _, _, second_audit = main_module._run_uploaded_mesh_field_preview_data_with_audit(
         file_bytes=MESH_OBJ,
         file_hash=MESH_OBJ_HASH,
         extension=".obj",

@@ -9,7 +9,7 @@ describe("previewUploadedMeshField", () => {
 
   it("reads the uploaded field preview trace id from response headers", async () => {
     const file = new File(["solid test"], "test.stl", { type: "model/stl" });
-    const values = new Float32Array(8);
+    const values = new Float32Array(16);
     const response = new Response(values.buffer.slice(0), {
       status: 200,
       headers: {
@@ -44,6 +44,7 @@ describe("previewUploadedMeshField", () => {
     );
 
     expect(result.trace?.traceId).toBe("trace-abc");
+    expect(result.hostField).not.toBeNull();
     expect(result.trace?.clientResponseWaitMs).toBeGreaterThanOrEqual(0);
     expect(result.trace?.clientDownloadMs).toBeGreaterThanOrEqual(0);
     expect(result.trace?.clientDecodeMs).toBeGreaterThanOrEqual(0);

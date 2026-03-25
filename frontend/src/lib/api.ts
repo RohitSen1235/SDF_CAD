@@ -220,6 +220,23 @@ function decodeBinaryFieldPayload(
   };
 }
 
+function decodeBinaryUploadedFieldPayload(
+  buffer: ArrayBuffer,
+  resolution: number,
+  bounds: [[number, number], [number, number], [number, number]]
+): { field: FieldPayloadBinary; hostField: FieldPayloadBinary | null } {
+  const expectedFloats = resolution * resolution * resolution;
+  const expectedBytes = expectedFloats * Float32Array.BYTES_PER_ELEMENT;
+  if (buffer.byteLength !== expectedBytes && buffer.byteLength !== expectedBytes * 2) {
+    throw new Error("Binary uploaded field payload size mismatch");
+  }
+
+  const hasHostField = buffer.byteLength === expectedBytes * 2;
+  const hostField = hasHostField ? decodeBinaryFieldPayload(buffer.slice(0, expectedBytes), resolution, bounds) : null;
+  const field = decodeBinaryFieldPayload(buffer.slice(hasHostField ? expectedBytes : 0), resolution, bounds);
+  return { field, hostField };
+}
+
 export async function compileScene(source: string): Promise<CompileSceneResult> {
   try {
     const response = await fetch(`${API_BASE}/api/v1/scene/compile`, {
@@ -590,10 +607,11 @@ export async function previewUploadedMeshField(
       const traceId = parseTraceIdHeader(response);
       const packet = await response.arrayBuffer();
       const arrayBufferDoneAt = performance.now();
-      const field = decodeBinaryFieldPayload(packet, resolution, bounds);
+      const { field, hostField } = decodeBinaryUploadedFieldPayload(packet, resolution, bounds);
       const decodeDoneAt = performance.now();
       return {
         field,
+        hostField,
         stats,
         trace: traceId
           ? {
@@ -625,7 +643,28 @@ export async function previewUploadedMeshField(
       body: fallbackBody,
       signal
     });
-    return parseJsonOrThrow(fallback);
+    const fallbackResponseReceivedAt = performance.now();
+    const payload = (await parseJsonOrThrow(fallback)) as {
+      field: UploadedPreviewFieldResponse["field"];
+      host_field?: UploadedPreviewFieldResponse["hostField"];
+      stats: PreviewStats;
+    };
+    const fallbackDecodeDoneAt = performance.now();
+    const traceId = parseTraceIdHeader(fallback);
+    return {
+      field: payload.field,
+      hostField: payload.host_field ?? null,
+      stats: payload.stats,
+      trace: traceId
+        ? {
+            traceId,
+            clientResponseWaitMs: fallbackResponseReceivedAt - fetchStartedAt,
+            clientDownloadMs: 0,
+            clientDecodeMs: fallbackDecodeDoneAt - fallbackResponseReceivedAt,
+            fieldAssignedAtMs: fallbackDecodeDoneAt
+          }
+        : null
+    };
   } catch (error) {
     if ((error as Error)?.name === "AbortError") {
       throw error;
