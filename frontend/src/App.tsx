@@ -919,10 +919,6 @@ export default function App() {
       setError(meshMemoryRisk?.fatalMessage ?? "Estimated memory exceeds available system capacity.");
       return;
     }
-    setField(null);
-    setMesh(null);
-    setStats(null);
-    setUploadedFieldPreviewTrace(null);
     setMeshCommitted(false);
     await runMeshFieldPreview();
   };
@@ -992,10 +988,6 @@ export default function App() {
       return;
     }
     if (!meshFile || uploadedMeshFieldSignature !== currentUploadedMeshFieldSignature) {
-      setField(null);
-      setMesh(null);
-      setStats(null);
-      setUploadedFieldPreviewTrace(null);
       setMeshCommitted(false);
     }
   }, [workflow, meshFile, uploadedMeshFieldSignature, currentUploadedMeshFieldSignature]);
@@ -1008,14 +1000,8 @@ export default function App() {
 
   useEffect(() => {
     abortActiveMeshFieldPreview();
-    setUploadedMeshFieldSignature(null);
-    setField(null);
-    setMesh(null);
-    setStats(null);
-    setUploadedFieldPreviewTrace(null);
     setMeshCommitted(false);
   }, [
-    meshFile,
     meshShellThickness,
     meshLatticeType,
     meshLatticePitch,
@@ -1287,6 +1273,7 @@ export default function App() {
                             // Abort any in-flight preprocess for the previous file
                             preprocessControllerRef.current?.abort();
                             preprocessControllerRef.current = null;
+                            abortActiveMeshFieldPreview();
 
                             setMeshFile(selected);
                             setField(null);

@@ -612,7 +612,7 @@ describe("App", () => {
     });
   });
 
-  it("clears the previous preview immediately when Generate Field is clicked", async () => {
+  it("keeps the previous preview visible while Generate Field is in flight", async () => {
     let resolvePreview: ((value: typeof fieldPreviewPayload) => void) | null = null;
     previewUploadedMeshField.mockImplementationOnce(
       () =>
@@ -633,17 +633,9 @@ describe("App", () => {
       expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     });
 
-    const clearedViewerCall = await waitFor(() => {
-      const found = viewerMock.mock.calls.find(([props]) => {
-        const viewerProps = props as Record<string, unknown>;
-        return viewerProps.field == null && viewerProps.mesh == null;
-      });
-      expect(found).toBeDefined();
-      return found;
-    });
-    const clearedViewerProps = clearedViewerCall?.[0] as Record<string, unknown>;
-    expect(clearedViewerProps.field).toBeNull();
-    expect(clearedViewerProps.mesh).toBeNull();
+    const inFlightViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
+    expect(inFlightViewerProps.field).toBeNull();
+    expect(inFlightViewerProps.mesh).toEqual(outerMeshPayload);
 
     expect(resolvePreview).not.toBeNull();
     resolvePreview!(fieldPreviewPayload);
@@ -655,7 +647,7 @@ describe("App", () => {
     });
   });
 
-  it("clears the mesh preview after parameter changes and requires re-preview", async () => {
+  it("keeps the field preview visible after parameter changes and requires re-preview", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
 
@@ -671,7 +663,7 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Lattice phase"), { target: { value: "0.35" } });
     expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     const latestViewerProps = viewerMock.mock.calls[viewerMock.mock.calls.length - 1]?.[0] as Record<string, unknown>;
-    expect(latestViewerProps.field).toBeNull();
+    expect(latestViewerProps.field).toEqual(fieldPreviewPayload.field);
     expect(latestViewerProps.mesh).toBeNull();
   });
 
