@@ -4,7 +4,7 @@ import base64
 import io
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from skimage.measure import marching_cubes
@@ -16,6 +16,22 @@ try:
 except Exception:
     cp = None  # type: ignore[assignment]
     CUPY_AVAILABLE = False
+
+
+def _is_cupy_array(array: object) -> bool:
+    return CUPY_AVAILABLE and cp is not None and isinstance(array, cp.ndarray)
+
+
+def _field_to_numpy(field: object) -> np.ndarray:
+    if _is_cupy_array(field):
+        return cp.asnumpy(field)
+    return np.asarray(field)
+
+
+def _field_min_max(field: object) -> tuple[float, float]:
+    if _is_cupy_array(field):
+        return float(cp.min(field).item()), float(cp.max(field).item())
+    return float(np.min(field)), float(np.max(field))
 
 
 def _decode_classic_tri_table() -> np.ndarray:
@@ -389,7 +405,8 @@ def _resolve_mesh_backend(requested: Literal["auto", "cpu", "cuda"]) -> Literal[
 
 
 
-def _mesh_single_cpu(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
+def _mesh_single_cpu(field: object, bounds: list[list[float]]) -> MeshData:
+    field = _field_to_numpy(field)
     nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
     dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
     dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
@@ -405,7 +422,7 @@ def _mesh_single_cpu(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
     return MeshData(vertices=vertices, faces=faces.astype(np.int32), normals=normals)
 
 
-def _mesh_single_cuda(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
+def _mesh_single_cuda(field: object, bounds: list[list[float]]) -> MeshData:
     if not _cuda_meshing_available() or cp is None:
         raise MeshingError("CUDA meshing requested but CUDA runtime is unavailable")
 
@@ -415,7 +432,7 @@ def _mesh_single_cuda(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
     dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
     origin = np.array([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float32)
 
-    volume = cp.asarray(np.ascontiguousarray(field), dtype=cp.float32)
+    volume = cp.ascontiguousarray(cp.asarray(field, dtype=cp.float32))
     nx, ny, nz = (int(volume.shape[0]), int(volume.shape[1]), int(volume.shape[2]))
     if nx < 2 or ny < 2 or nz < 2:
         raise MeshingError("Field resolution must be at least 2 along all axes")
@@ -481,15 +498,20 @@ def _mesh_single_cuda(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
 
     vertices = cp.asnumpy(vertices_flat).reshape(-1, 3).astype(np.float64, copy=False)
     faces = cp.asnumpy(faces_flat).reshape(-1, 3).astype(np.int32, copy=False)
+    # The raw CUDA generator emits triangles in the opposite winding compared
+    # with the CPU path, which flips stencil/capping behavior in the Viewer.
+    faces = faces[:, ::-1].copy()
     del vertices_flat, faces_flat, tri_counts, tri_offsets, volume
-    cp.get_default_memory_pool().free_all_blocks()
-    vertices, faces = _weld_vertices(vertices, faces)
+    # Keep the CUDA result fully usable without the expensive CPU weld step.
+    # The viewer uses flat shading, so per-face vertices/normals are acceptable
+    # and much faster than deduplicating the whole mesh on the host.
     normals = _compute_vertex_normals(vertices, faces)
     return MeshData(vertices=vertices, faces=faces, normals=normals)
 
 
 
-def _mesh_chunked(field: np.ndarray, bounds: list[list[float]], chunk_size: int = 80) -> MeshData:
+def _mesh_chunked(field: object, bounds: list[list[float]], chunk_size: int = 80) -> MeshData:
+    field = _field_to_numpy(field)
     nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
     dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
     dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
@@ -567,7 +589,8 @@ def _mesh_chunked(field: np.ndarray, bounds: list[list[float]], chunk_size: int 
         normals=np.array(normals, dtype=np.float64),
     )
  
-def _mesh_adaptive_cpu(field: np.ndarray, bounds: list[list[float]], block_size: int = 28) -> MeshData:
+def _mesh_adaptive_cpu(field: object, bounds: list[list[float]], block_size: int = 28) -> MeshData:
+    field = _field_to_numpy(field)
     nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
     dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
     dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
@@ -651,11 +674,12 @@ def _mesh_adaptive_cpu(field: np.ndarray, bounds: list[list[float]], block_size:
 
 
 def _mesh_active_blocks_cpu(
-    field: np.ndarray,
+    field: object,
     bounds: list[list[float]],
     active_blocks: list[tuple[int, int, int]],
     block_size: int,
 ) -> MeshData:
+    field = _field_to_numpy(field)
     nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
     dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
     dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
@@ -739,7 +763,7 @@ def _mesh_active_blocks_cpu(
 
 
 def build_mesh(
-    field: np.ndarray,
+    field: object,
     bounds: list[list[float]],
     chunk_size: int | None = None,
     backend: Literal["auto", "cpu", "cuda"] = "auto",
@@ -760,7 +784,7 @@ def build_mesh(
 
 
 def build_mesh_with_backend(
-    field: np.ndarray,
+    field: object,
     bounds: list[list[float]],
     chunk_size: int | None = None,
     backend: Literal["auto", "cpu", "cuda"] = "auto",
@@ -768,8 +792,7 @@ def build_mesh_with_backend(
     active_blocks: list[tuple[int, int, int]] | None = None,
     block_size: int | None = None,
 ) -> tuple[MeshData, Literal["cpu", "cuda"]]:
-    min_val = float(np.min(field))
-    max_val = float(np.max(field))
+    min_val, max_val = _field_min_max(field)
     if not (min_val <= 0.0 <= max_val):
         raise MeshingError(
             "No zero level-set detected in current grid bounds. Expand bounds or change parameters."

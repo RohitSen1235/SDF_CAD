@@ -267,6 +267,29 @@ def _freeze_cached_array(array: np.ndarray, dtype: np.dtype | type | None = None
     return frozen
 
 
+def _is_cupy_array(array: object) -> bool:
+    return _cupy is not None and isinstance(array, _cupy.ndarray)
+
+
+def _copy_field_array(array: object, dtype: np.dtype | type | None = None) -> object:
+    if _is_cupy_array(array):
+        return _cupy.array(array, dtype=dtype, copy=True)
+    return np.array(array, dtype=dtype, copy=True)
+
+
+def _freeze_field_array(array: object, dtype: np.dtype | type | None = None) -> object:
+    frozen = _copy_field_array(array, dtype=dtype)
+    if isinstance(frozen, np.ndarray):
+        frozen.setflags(write=False)
+    return frozen
+
+
+def _field_to_numpy(field: object) -> np.ndarray:
+    if _is_cupy_array(field):
+        return _cupy.asnumpy(field)
+    return np.asarray(field)
+
+
 def _freeze_meshdata(mesh: MeshData) -> MeshData:
     return MeshData(
         vertices=_freeze_cached_array(mesh.vertices, np.float64),
@@ -312,7 +335,7 @@ class UploadedMeshMemoryEstimate:
 class UploadedHostFieldResult:
     parsed: ParsedMesh
     bounds: list[list[float]]
-    host_sdf: np.ndarray
+    host_sdf: object
     host_compute_backend: Literal["cpu", "cuda"]
     fallback_reason: str | None
     block_size: int | None
@@ -328,10 +351,10 @@ class UploadedComposedFieldResult:
     parsed: ParsedMesh
     resolution_xyz: ResolutionXYZ
     bounds: list[list[float]]
-    host_sdf: np.ndarray
+    host_sdf: object
     sparse_block_size: int | None
     active_blocks: list[tuple[int, int, int]] | None
-    field: np.ndarray
+    field: object
     eval_backend_used: Literal["cpu", "cuda"]
     eval_ms: float
     field_cache_hit: bool
@@ -481,11 +504,53 @@ def _record_uploaded_field_preview_server_trace(
 
 
 def _sample_field_trilinear(
-    field: np.ndarray,
+    field: object,
     bounds: list[list[float]],
     points: np.ndarray,
 ) -> np.ndarray:
-    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    if _is_cupy_array(field):
+        xp = _cupy
+        field_xp = field
+        points_xp = _cupy.asarray(points, dtype=field.dtype)
+        nx, ny, nz = (int(field_xp.shape[0]), int(field_xp.shape[1]), int(field_xp.shape[2]))
+        dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
+        dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
+        dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
+
+        tx = xp.clip((points_xp[:, 0] - bounds[0][0]) / dx, 0.0, nx - 1.000001)
+        ty = xp.clip((points_xp[:, 1] - bounds[1][0]) / dy, 0.0, ny - 1.000001)
+        tz = xp.clip((points_xp[:, 2] - bounds[2][0]) / dz, 0.0, nz - 1.000001)
+
+        x0 = xp.floor(tx).astype(xp.int32)
+        y0 = xp.floor(ty).astype(xp.int32)
+        z0 = xp.floor(tz).astype(xp.int32)
+        x1 = xp.minimum(x0 + 1, nx - 1)
+        y1 = xp.minimum(y0 + 1, ny - 1)
+        z1 = xp.minimum(z0 + 1, nz - 1)
+
+        fx = tx - x0
+        fy = ty - y0
+        fz = tz - z0
+
+        c000 = field_xp[x0, y0, z0]
+        c100 = field_xp[x1, y0, z0]
+        c010 = field_xp[x0, y1, z0]
+        c110 = field_xp[x1, y1, z0]
+        c001 = field_xp[x0, y0, z1]
+        c101 = field_xp[x1, y0, z1]
+        c011 = field_xp[x0, y1, z1]
+        c111 = field_xp[x1, y1, z1]
+
+        c00 = c000 * (1.0 - fx) + c100 * fx
+        c10 = c010 * (1.0 - fx) + c110 * fx
+        c01 = c001 * (1.0 - fx) + c101 * fx
+        c11 = c011 * (1.0 - fx) + c111 * fx
+        c0 = c00 * (1.0 - fy) + c10 * fy
+        c1 = c01 * (1.0 - fy) + c11 * fy
+        return _cupy.asnumpy(c0 * (1.0 - fz) + c1 * fz)
+
+    field_np = np.asarray(field)
+    nx, ny, nz = (int(field_np.shape[0]), int(field_np.shape[1]), int(field_np.shape[2]))
     dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
     dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
     dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
@@ -505,14 +570,14 @@ def _sample_field_trilinear(
     fy = ty - y0
     fz = tz - z0
 
-    c000 = field[x0, y0, z0]
-    c100 = field[x1, y0, z0]
-    c010 = field[x0, y1, z0]
-    c110 = field[x1, y1, z0]
-    c001 = field[x0, y0, z1]
-    c101 = field[x1, y0, z1]
-    c011 = field[x0, y1, z1]
-    c111 = field[x1, y1, z1]
+    c000 = field_np[x0, y0, z0]
+    c100 = field_np[x1, y0, z0]
+    c010 = field_np[x0, y1, z0]
+    c110 = field_np[x1, y1, z0]
+    c001 = field_np[x0, y0, z1]
+    c101 = field_np[x1, y0, z1]
+    c011 = field_np[x0, y1, z1]
+    c111 = field_np[x1, y1, z1]
 
     c00 = c000 * (1.0 - fx) + c100 * fx
     c10 = c010 * (1.0 - fx) + c110 * fx
@@ -525,7 +590,7 @@ def _sample_field_trilinear(
 
 def _strip_outer_surface(
     mesh: MeshData,
-    host_sdf: np.ndarray,
+    host_sdf: object,
     bounds: list[list[float]],
 ) -> MeshData:
     if mesh.faces.size == 0 or mesh.vertices.size == 0:
@@ -594,18 +659,18 @@ def _field_cache_key(
     )
 
 
-def _encode_field(field: np.ndarray) -> str:
+def _encode_field(field: object) -> str:
     # WebGL 3D textures expect x as the fastest-varying index, while our
     # NumPy field is shaped (x, y, z) in C-order (z fastest). Serialize in
     # Fortran order so the uploaded volume preserves xyz sampling semantics.
-    payload = np.asarray(field, dtype=np.float32).tobytes(order="F")
+    payload = _field_to_numpy(field).astype(np.float32, copy=False).tobytes(order="F")
     return base64.b64encode(payload).decode("ascii")
 
 
-def _pack_field_binary(field: np.ndarray) -> bytes:
+def _pack_field_binary(field: object) -> bytes:
     # Preserve the same axis-major semantics as _encode_field() used by
     # existing JSON/base64 payloads.
-    return np.asarray(field, dtype=np.float32).tobytes(order="F")
+    return _field_to_numpy(field).astype(np.float32, copy=False).tobytes(order="F")
 
 
 def _encode_mesh_payload(mesh: MeshData) -> MeshPayload:
@@ -1218,7 +1283,7 @@ def _available_gpu_memory_bytes() -> tuple[int | None, int | None]:
         return None, None
 
 
-def _maybe_evict_uploaded_composed_field_cache_before_meshing(field: np.ndarray) -> bool:
+def _maybe_evict_uploaded_composed_field_cache_before_meshing(field: object) -> bool:
     available_cpu = _available_cpu_memory_bytes()
     if available_cpu is None:
         return False
@@ -1431,7 +1496,7 @@ def _resolve_uploaded_host_field(
         compute_backend=compute_backend,
         field_storage_mode=field_storage_mode,
     )
-    frozen_host_sdf = _freeze_cached_array(host.host_sdf, np.float32)
+    frozen_host_sdf = _freeze_field_array(host.host_sdf, np.float32)
 
     uploaded_host_field_cache.set(
         host_key,
@@ -1546,7 +1611,7 @@ def _uploaded_mesh_field_payload_key(
 
 
 def _build_uploaded_field_payload(
-    field: np.ndarray,
+    field: object,
     bounds: list[list[float]],
 ) -> FieldPayload:
     return FieldPayload(
@@ -1558,7 +1623,7 @@ def _build_uploaded_field_payload(
 
 
 def _build_uploaded_host_field_payload(
-    host_sdf: np.ndarray,
+    host_sdf: object,
     bounds: list[list[float]],
 ) -> FieldPayload:
     return FieldPayload(
@@ -1630,7 +1695,7 @@ def _resolve_uploaded_composed_field(
     parsed: ParsedMesh | None = None,
     resolution_xyz: ResolutionXYZ | None = None,
     bounds: list[list[float]] | None = None,
-    host_sdf: np.ndarray | None = None,
+    host_sdf: object | None = None,
     sparse_block_size: int | None = None,
     host_active_blocks: list[tuple[int, int, int]] | None = None,
     field_storage_mode: UploadedFieldStorageMode = "auto",
@@ -1734,7 +1799,7 @@ def _resolve_uploaded_composed_field(
     uploaded_composed_field_cache.set(
         field_key,
         UploadedComposedFieldCacheEntry(
-            field=np.array(field, dtype=np.float32, copy=True),
+            field=_freeze_field_array(field, np.float32),
             bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
             resolution_xyz=resolution_xyz,
             eval_backend=eval_backend_used,

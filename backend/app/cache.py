@@ -98,7 +98,7 @@ uploaded_mesh_metadata_cache: LruCache[UploadedMeshMetadataCacheEntry] = LruCach
 
 @dataclass
 class UploadedComposedFieldCacheEntry:
-    field: np.ndarray
+    field: Any
     bounds: list[list[float]]
     resolution_xyz: tuple[int, int, int]
     eval_backend: str
@@ -112,7 +112,7 @@ uploaded_composed_field_cache: LruCache[UploadedComposedFieldCacheEntry] = LruCa
 @dataclass
 class UploadedHostFieldCacheEntry:
     bounds: list[list[float]]
-    host_sdf: np.ndarray
+    host_sdf: Any
     host_compute_backend: str = "cpu"
     fallback_reason: str | None = None
     field_storage_mode: UploadedFieldStorageMode = "dense"

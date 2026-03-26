@@ -2,19 +2,29 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
+
+try:
+    import cupy as cp
+
+    CUPY_AVAILABLE = True
+except Exception:
+    cp = None  # type: ignore[assignment]
+    CUPY_AVAILABLE = False
 
 
 FieldStorageMode = Literal["dense", "sparse_bricks", "octree"]
 
 
 def sample_dense_trilinear(
-    field: np.ndarray,
+    field: Any,
     bounds: list[list[float]],
     points: np.ndarray,
 ) -> np.ndarray:
+    if CUPY_AVAILABLE and cp is not None and isinstance(field, cp.ndarray):
+        field = cp.asnumpy(field)
     if field.ndim != 3:
         raise ValueError("field must be a 3D array")
     if points.ndim != 2 or points.shape[1] != 3:
@@ -62,10 +72,45 @@ def sample_dense_trilinear(
 
 
 def detect_zero_crossing_blocks(
-    field: np.ndarray,
+    field: Any,
     block_size: int,
     candidate_blocks: list[tuple[int, int, int]] | None = None,
 ) -> list[tuple[int, int, int]]:
+    if CUPY_AVAILABLE and cp is not None and isinstance(field, cp.ndarray):
+        nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+        step = max(2, min(int(block_size), max(2, min(nx, ny, nz) - 1)))
+        if step <= 0:
+            return []
+
+        blocks: list[tuple[int, int, int]] = []
+        if candidate_blocks is not None:
+            candidate_iter = candidate_blocks
+        else:
+            blocks_x = int(math.ceil(nx / float(step)))
+            blocks_y = int(math.ceil(ny / float(step)))
+            blocks_z = int(math.ceil(nz / float(step)))
+            candidate_iter = [
+                (bx, by, bz)
+                for bx in range(blocks_x)
+                for by in range(blocks_y)
+                for bz in range(blocks_z)
+            ]
+
+        for bx, by, bz in candidate_iter:
+            i0 = max(0, min(int(bx) * step, nx - 1))
+            j0 = max(0, min(int(by) * step, ny - 1))
+            k0 = max(0, min(int(bz) * step, nz - 1))
+            i1 = min(nx, i0 + step + 1)
+            j1 = min(ny, j0 + step + 1)
+            k1 = min(nz, k0 + step + 1)
+            block = field[i0:i1, j0:j1, k0:k1]
+            if block.size == 0:
+                continue
+            bmin = float(cp.min(block).item())
+            bmax = float(cp.max(block).item())
+            if bmin <= 0.0 <= bmax:
+                blocks.append((int(bx), int(by), int(bz)))
+        return blocks
     if field.ndim != 3:
         raise ValueError("field must be a 3D array")
     nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
@@ -116,12 +161,14 @@ class SparseBrickField:
     @classmethod
     def from_dense(
         cls,
-        dense_field: np.ndarray,
+        dense_field: Any,
         bounds: list[list[float]],
         block_size: int,
         active_blocks: list[tuple[int, int, int]] | None = None,
         background_value: float | None = None,
     ) -> "SparseBrickField":
+        if CUPY_AVAILABLE and cp is not None and isinstance(dense_field, cp.ndarray):
+            dense_field = cp.asnumpy(dense_field)
         if dense_field.ndim != 3:
             raise ValueError("dense_field must be a 3D array")
         nx, ny, nz = (int(dense_field.shape[0]), int(dense_field.shape[1]), int(dense_field.shape[2]))

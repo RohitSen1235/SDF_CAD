@@ -69,7 +69,7 @@ class ParsedMesh:
 class HostFieldData:
     mesh: ParsedMesh
     bounds: list[list[float]]
-    host_sdf: np.ndarray
+    host_sdf: Any
     host_compute_backend: Literal["cpu", "cuda"] = "cpu"
     fallback_reason: str | None = None
     field_storage_mode: Literal["dense", "octree_sparse"] = "dense"
@@ -84,6 +84,16 @@ class HostFieldData:
     host_build_strategy: Literal["dense", "octree_sparse"] = "dense"
     host_decision_reason: str = "dense_default"
     resolution_xyz: ResolutionXYZ | None = None
+
+
+def _is_cupy_array(array: object) -> bool:
+    return CUPY_AVAILABLE and cp is not None and isinstance(array, cp.ndarray)
+
+
+def _field_to_numpy(field: object) -> np.ndarray:
+    if _is_cupy_array(field):
+        return cp.asnumpy(field)
+    return np.asarray(field)
 
 
 _AUTO_SPARSE_MAX_EST_NEAR_RATIO = 0.60
@@ -331,15 +341,15 @@ def build_host_field(
         allow_dense_fallback=allow_dense_fallback,
         compute_backend=compute_backend,
     )
-    host_sdf = np.asarray(host_sdf, dtype=np.float32)
     _log_host_field_backend(host_backend)
 
     use_sparse = bool(block_size and active_blocks)
 
     if use_sparse:
+        host_sdf_cpu = _field_to_numpy(host_sdf).astype(np.float32, copy=False)
         sparse = SparseBrickField.from_dense(
-            host_sdf,
-            bounds,
+            host_sdf_cpu,
+            resolved_bounds,
             block_size=block_size or 16,
             active_blocks=active_blocks,
             background_value=sparse_background_value,
@@ -348,7 +358,7 @@ def build_host_field(
         return HostFieldData(
             mesh=mesh,
             bounds=resolved_bounds,
-            host_sdf=host_sdf,
+            host_sdf=host_sdf_cpu,
             host_compute_backend=host_backend,
             fallback_reason=fallback_reason,
             field_storage_mode="octree_sparse",
@@ -399,7 +409,7 @@ def _build_host_sdf_dense(
     occupancy: np.ndarray,
     bounds: list[list[float]],
     resolution_xyz: ResolutionXYZ,
-) -> np.ndarray:
+) -> Any:
     return _build_host_sdf_dense_cpu(occupancy, bounds, resolution_xyz)
 
 
@@ -407,7 +417,7 @@ def _build_host_sdf_dense_cuda(
     occupancy: np.ndarray,
     bounds: list[list[float]],
     resolution_xyz: ResolutionXYZ,
-) -> np.ndarray:
+) -> Any:
     if not CUPY_AVAILABLE or cp is None or not CUPYX_AVAILABLE or cndimage is None or not _cuda_device_available():
         raise MeshUploadError("CUDA dense EDT requires CuPy and cupyx.scipy.ndimage")
 
@@ -416,7 +426,7 @@ def _build_host_sdf_dense_cuda(
     outside_gpu = cp.logical_not(occupancy_gpu)
     dist_out = cndimage.distance_transform_edt(outside_gpu, sampling=spacing)
     dist_in = cndimage.distance_transform_edt(occupancy_gpu, sampling=spacing)
-    return cp.asnumpy(dist_out - dist_in).astype(np.float32, copy=False)
+    return (dist_out - dist_in).astype(cp.float32, copy=False)
 
 
 def _build_host_sdf_dense_with_backend(
@@ -425,7 +435,7 @@ def _build_host_sdf_dense_with_backend(
     resolution_xyz: ResolutionXYZ,
     *,
     compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
-) -> tuple[np.ndarray, Literal["cpu", "cuda"]]:
+) -> tuple[Any, Literal["cpu", "cuda"]]:
     start = time.perf_counter()
     backend_name: Literal["cpu", "cuda"] = "cpu"
     resolved_backend = _resolve_compute_backend(compute_backend)
@@ -1065,7 +1075,7 @@ def _build_host_sdf_octree_sparse(
 
 
 def compose_hollow_lattice_field_sparse_with_backend(
-    host_sdf: np.ndarray,
+    host_sdf: object,
     bounds: list[list[float]],
     shell_thickness: float,
     lattice_type: str,
@@ -1075,7 +1085,7 @@ def compose_hollow_lattice_field_sparse_with_backend(
     block_size: int | None,
     active_blocks: list[tuple[int, int, int]] | None,
     compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
-) -> tuple[np.ndarray, Literal["cpu", "cuda"], list[tuple[int, int, int]] | None]:
+) -> tuple[Any, Literal["cpu", "cuda"], list[tuple[int, int, int]] | None]:
     field, backend = compose_hollow_lattice_field_with_backend(
         host_sdf,
         bounds,
@@ -1097,14 +1107,14 @@ def compose_hollow_lattice_field_sparse_with_backend(
 
 
 def compose_hollow_lattice_field(
-    host_sdf: np.ndarray,
+    host_sdf: object,
     bounds: list[list[float]],
     shell_thickness: float,
     lattice_type: str,
     lattice_pitch: float,
     lattice_thickness: float,
     lattice_phase: float,
-) -> np.ndarray:
+) -> Any:
     field, _ = compose_hollow_lattice_field_with_backend(
         host_sdf,
         bounds,
@@ -1127,7 +1137,7 @@ def _resolve_compute_backend(requested: Literal["auto", "cpu", "cuda"]) -> Liter
 
 
 def compose_hollow_lattice_field_with_backend(
-    host_sdf: np.ndarray,
+    host_sdf: object,
     bounds: list[list[float]],
     shell_thickness: float,
     lattice_type: str,
@@ -1135,7 +1145,7 @@ def compose_hollow_lattice_field_with_backend(
     lattice_thickness: float,
     lattice_phase: float,
     compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
-) -> tuple[np.ndarray, Literal["cpu", "cuda"]]:
+) -> tuple[Any, Literal["cpu", "cuda"]]:
     start = time.perf_counter()
     backend_name: Literal["cpu", "cuda"] = "cpu"
     resolved_backend = _resolve_compute_backend(compute_backend)
@@ -1181,7 +1191,7 @@ def compose_hollow_lattice_field_with_backend(
 
 
 def _compose_hollow_lattice_field_cpu(
-    host_sdf: np.ndarray,
+    host_sdf: object,
     bounds: list[list[float]],
     shell_thickness: float,
     lattice_type: str,
@@ -1189,6 +1199,7 @@ def _compose_hollow_lattice_field_cpu(
     lattice_thickness: float,
     lattice_phase: float,
 ) -> np.ndarray:
+    host_sdf = _field_to_numpy(host_sdf).astype(np.float32, copy=False)
     if shell_thickness <= 0.0:
         raise MeshUploadError("shell_thickness must be > 0")
     if lattice_pitch <= 0.0:
@@ -1238,14 +1249,14 @@ def _compose_hollow_lattice_field_cpu(
 
 
 def _compose_hollow_lattice_field_cuda(
-    host_sdf: np.ndarray,
+    host_sdf: object,
     bounds: list[list[float]],
     shell_thickness: float,
     lattice_type: str,
     lattice_pitch: float,
     lattice_thickness: float,
     lattice_phase: float,
-) -> np.ndarray:
+) -> Any:
     if not CUPY_AVAILABLE or cp is None or not _cuda_device_available():
         raise MeshUploadError("CUDA backend requested but CuPy is not available")
     if shell_thickness <= 0.0:
@@ -1290,7 +1301,7 @@ def _compose_hollow_lattice_field_cuda(
         out[mask] = cp.maximum(lattice_values, out[mask])
 
     cp.minimum(shell_field, out, out=out)
-    return cp.asnumpy(out)
+    return out
 
 
 def build_hollow_lattice_field(
@@ -1301,7 +1312,7 @@ def build_hollow_lattice_field(
     lattice_thickness: float,
     lattice_phase: float,
     resolution_xyz: ResolutionXYZ,
-) -> tuple[np.ndarray, list[list[float]], np.ndarray]:
+) -> tuple[Any, list[list[float]], Any]:
     host = build_host_field(mesh, resolution_xyz=resolution_xyz)
     field = compose_hollow_lattice_field(
         host.host_sdf,
