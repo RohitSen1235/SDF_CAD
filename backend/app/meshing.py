@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import base64
 import io
+import math
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from skimage.measure import marching_cubes
+
+from .sparse_field import detect_zero_crossing_blocks
 
 try:
     import cupy as cp
@@ -16,6 +19,88 @@ try:
 except Exception:
     cp = None  # type: ignore[assignment]
     CUPY_AVAILABLE = False
+
+
+def _is_cupy_array(array: object) -> bool:
+    return CUPY_AVAILABLE and cp is not None and isinstance(array, cp.ndarray)
+
+
+def _field_to_numpy(field: object) -> np.ndarray:
+    if _is_cupy_array(field):
+        return cp.asnumpy(field)
+    return np.asarray(field)
+
+
+def _field_min_max(field: object) -> tuple[float, float]:
+    if _is_cupy_array(field):
+        return float(cp.min(field).item()), float(cp.max(field).item())
+    return float(np.min(field)), float(np.max(field))
+
+
+def _estimate_zero_crossing_block_ratio(
+    field: object,
+    block_size: int | None = None,
+) -> tuple[float, int, int]:
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    if nx < 2 or ny < 2 or nz < 2:
+        return 1.0, 0, 1
+
+    if block_size is None:
+        sample_block_size = max(24, min(64, max(4, min(nx, ny, nz) // 8)))
+    else:
+        sample_block_size = max(4, min(int(block_size), max(2, min(nx, ny, nz) - 1)))
+
+    active_blocks = detect_zero_crossing_blocks(field, sample_block_size)
+    total_blocks = max(
+        1,
+        int(math.ceil(nx / float(sample_block_size)))
+        * int(math.ceil(ny / float(sample_block_size)))
+        * int(math.ceil(nz / float(sample_block_size))),
+    )
+    return len(active_blocks) / float(total_blocks), len(active_blocks), total_blocks
+
+
+def _select_mesh_backend(
+    field: object,
+    backend: Literal["auto", "cpu", "cuda"],
+    meshing_mode: Literal["uniform", "adaptive"],
+    active_blocks: list[tuple[int, int, int]] | None,
+    block_size: int | None,
+) -> tuple[Literal["cpu", "cuda"], str | None]:
+    if backend == "cpu":
+        return "cpu", None
+    if backend == "cuda":
+        if not _cuda_meshing_available():
+            raise MeshingError("CUDA meshing requested but CUDA runtime is unavailable")
+        return "cuda", None
+
+    if meshing_mode == "adaptive":
+        return "cpu", "adaptive_meshing_uses_cpu"
+
+    if active_blocks:
+        nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+        step = max(2, min(int(block_size or 24), max(2, min(nx, ny, nz) - 1)))
+        total_blocks = max(
+            1,
+            int(math.ceil(nx / float(step)))
+            * int(math.ceil(ny / float(step)))
+            * int(math.ceil(nz / float(step))),
+        )
+        ratio = len(active_blocks) / float(total_blocks)
+        if ratio <= 0.35:
+            return "cpu", f"auto_sparse_active_blocks_ratio_{ratio:.3f}"
+
+    else:
+        ratio, active_est, total_est = _estimate_zero_crossing_block_ratio(field, block_size)
+        if ratio <= 0.20:
+            return "cpu", (
+                "auto_sparse_coarse_estimate_"
+                f"{ratio:.3f}_{active_est}of{total_est}"
+            )
+
+    if _cuda_meshing_available():
+        return "cuda", None
+    return "cpu", "cuda_unavailable"
 
 
 def _decode_classic_tri_table() -> np.ndarray:
@@ -378,6 +463,34 @@ def _weld_vertices(
     return welded_vertices, welded_faces
 
 
+def _weld_vertices_cuda(
+    vertices_flat: object,
+    faces_flat: object,
+    quant: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray]:
+    if cp is None:
+        raise MeshingError("CUDA meshing requested but CuPy is unavailable")
+
+    vertices_gpu = cp.ascontiguousarray(cp.asarray(vertices_flat, dtype=cp.float32)).reshape(-1, 3)
+    faces_gpu = cp.ascontiguousarray(cp.asarray(faces_flat, dtype=cp.int32)).reshape(-1, 3)
+
+    try:
+        quantized = cp.rint(vertices_gpu / quant).astype(cp.int64, copy=False)
+        _, unique_idx, inverse = cp.unique(
+            quantized,
+            axis=0,
+            return_index=True,
+            return_inverse=True,
+        )
+        welded_vertices = cp.asnumpy(vertices_gpu[unique_idx]).astype(np.float64, copy=False)
+        welded_faces = cp.asnumpy(inverse[faces_gpu]).astype(np.int32, copy=False)
+        return welded_vertices, welded_faces
+    except Exception:
+        vertices = cp.asnumpy(vertices_gpu).astype(np.float64, copy=False)
+        faces = cp.asnumpy(faces_gpu).astype(np.int32, copy=False)
+        return _weld_vertices(vertices, faces)
+
+
 
 def _resolve_mesh_backend(requested: Literal["auto", "cpu", "cuda"]) -> Literal["cpu", "cuda"]:
     cuda_ready = _cuda_meshing_available()
@@ -389,11 +502,12 @@ def _resolve_mesh_backend(requested: Literal["auto", "cpu", "cuda"]) -> Literal[
 
 
 
-def _mesh_single_cpu(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
-    resolution = field.shape[0]
-    dx = (bounds[0][1] - bounds[0][0]) / float(resolution - 1)
-    dy = (bounds[1][1] - bounds[1][0]) / float(resolution - 1)
-    dz = (bounds[2][1] - bounds[2][0]) / float(resolution - 1)
+def _mesh_single_cpu(field: object, bounds: list[list[float]]) -> MeshData:
+    field = _field_to_numpy(field)
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
+    dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
+    dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
 
     vertices, faces, normals, _ = marching_cubes(
         field, level=0.0, spacing=(dx, dy, dz), allow_degenerate=False
@@ -405,17 +519,17 @@ def _mesh_single_cpu(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
     return MeshData(vertices=vertices, faces=faces.astype(np.int32), normals=normals)
 
 
-def _mesh_single_cuda(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
+def _mesh_single_cuda(field: object, bounds: list[list[float]]) -> MeshData:
     if not _cuda_meshing_available() or cp is None:
         raise MeshingError("CUDA meshing requested but CUDA runtime is unavailable")
 
-    resolution = field.shape[0]
-    dx = (bounds[0][1] - bounds[0][0]) / float(resolution - 1)
-    dy = (bounds[1][1] - bounds[1][0]) / float(resolution - 1)
-    dz = (bounds[2][1] - bounds[2][0]) / float(resolution - 1)
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
+    dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
+    dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
     origin = np.array([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float32)
 
-    volume = cp.asarray(np.ascontiguousarray(field), dtype=cp.float32)
+    volume = cp.ascontiguousarray(cp.asarray(field, dtype=cp.float32))
     nx, ny, nz = (int(volume.shape[0]), int(volume.shape[1]), int(volume.shape[2]))
     if nx < 2 or ny < 2 or nz < 2:
         raise MeshingError("Field resolution must be at least 2 along all axes")
@@ -479,24 +593,26 @@ def _mesh_single_cuda(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
         ),
     )
 
-    vertices = cp.asnumpy(vertices_flat).reshape(-1, 3).astype(np.float64, copy=False)
-    faces = cp.asnumpy(faces_flat).reshape(-1, 3).astype(np.int32, copy=False)
+    vertices, faces = _weld_vertices_cuda(vertices_flat, faces_flat)
+    # The raw CUDA generator emits triangles in the opposite winding compared
+    # with the CPU path, which flips stencil/capping behavior in the Viewer.
+    faces = faces[:, ::-1].copy()
     del vertices_flat, faces_flat, tri_counts, tri_offsets, volume
     cp.get_default_memory_pool().free_all_blocks()
-    vertices, faces = _weld_vertices(vertices, faces)
     normals = _compute_vertex_normals(vertices, faces)
     return MeshData(vertices=vertices, faces=faces, normals=normals)
 
 
 
-def _mesh_chunked(field: np.ndarray, bounds: list[list[float]], chunk_size: int = 80) -> MeshData:
-    resolution = field.shape[0]
-    dx = (bounds[0][1] - bounds[0][0]) / float(resolution - 1)
-    dy = (bounds[1][1] - bounds[1][0]) / float(resolution - 1)
-    dz = (bounds[2][1] - bounds[2][0]) / float(resolution - 1)
+def _mesh_chunked(field: object, bounds: list[list[float]], chunk_size: int = 80) -> MeshData:
+    field = _field_to_numpy(field)
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
+    dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
+    dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
 
     origin = np.array([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
-    slab_step = max(12, min(chunk_size, resolution - 1))
+    slab_step = max(12, min(chunk_size, nx - 1))
 
     vertex_map: dict[tuple[int, int, int], int] = {}
     vertices: list[list[float]] = []
@@ -504,8 +620,8 @@ def _mesh_chunked(field: np.ndarray, bounds: list[list[float]], chunk_size: int 
     faces: list[list[int]] = []
     quant = 1e-6
 
-    for start in range(0, resolution - 1, slab_step):
-        stop = min(resolution - 1, start + slab_step)
+    for start in range(0, nx - 1, slab_step):
+        stop = min(nx - 1, start + slab_step)
         slab = field[start : stop + 1, :, :]
         if slab.size == 0:
             continue
@@ -567,14 +683,15 @@ def _mesh_chunked(field: np.ndarray, bounds: list[list[float]], chunk_size: int 
         normals=np.array(normals, dtype=np.float64),
     )
  
-def _mesh_adaptive_cpu(field: np.ndarray, bounds: list[list[float]], block_size: int = 28) -> MeshData:
-    resolution = field.shape[0]
-    dx = (bounds[0][1] - bounds[0][0]) / float(resolution - 1)
-    dy = (bounds[1][1] - bounds[1][0]) / float(resolution - 1)
-    dz = (bounds[2][1] - bounds[2][0]) / float(resolution - 1)
+def _mesh_adaptive_cpu(field: object, bounds: list[list[float]], block_size: int = 28) -> MeshData:
+    field = _field_to_numpy(field)
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
+    dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
+    dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
 
     origin = np.array([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
-    step = max(8, min(block_size, resolution - 1))
+    step = max(8, min(block_size, min(nx, ny, nz) - 1))
 
     vertex_map: dict[tuple[int, int, int], int] = {}
     vertices: list[list[float]] = []
@@ -582,12 +699,12 @@ def _mesh_adaptive_cpu(field: np.ndarray, bounds: list[list[float]], block_size:
     faces: list[list[int]] = []
     quant = 1e-6
 
-    for i0 in range(0, resolution - 1, step):
-        i1 = min(resolution - 1, i0 + step)
-        for j0 in range(0, resolution - 1, step):
-            j1 = min(resolution - 1, j0 + step)
-            for k0 in range(0, resolution - 1, step):
-                k1 = min(resolution - 1, k0 + step)
+    for i0 in range(0, nx - 1, step):
+        i1 = min(nx - 1, i0 + step)
+        for j0 in range(0, ny - 1, step):
+            j1 = min(ny - 1, j0 + step)
+            for k0 in range(0, nz - 1, step):
+                k1 = min(nz - 1, k0 + step)
                 block = field[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1]
                 if block.size == 0:
                     continue
@@ -651,18 +768,19 @@ def _mesh_adaptive_cpu(field: np.ndarray, bounds: list[list[float]], block_size:
 
 
 def _mesh_active_blocks_cpu(
-    field: np.ndarray,
+    field: object,
     bounds: list[list[float]],
     active_blocks: list[tuple[int, int, int]],
     block_size: int,
 ) -> MeshData:
-    resolution = field.shape[0]
-    dx = (bounds[0][1] - bounds[0][0]) / float(resolution - 1)
-    dy = (bounds[1][1] - bounds[1][0]) / float(resolution - 1)
-    dz = (bounds[2][1] - bounds[2][0]) / float(resolution - 1)
+    field = _field_to_numpy(field)
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
+    dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
+    dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
 
     origin = np.array([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
-    step = max(8, min(int(block_size), resolution - 1))
+    step = max(8, min(int(block_size), min(nx, ny, nz) - 1))
 
     vertex_map: dict[tuple[int, int, int], int] = {}
     vertices: list[list[float]] = []
@@ -671,12 +789,12 @@ def _mesh_active_blocks_cpu(
     quant = 1e-6
 
     for bx, by, bz in active_blocks:
-        i0 = max(0, min((int(bx) * step), resolution - 1))
-        j0 = max(0, min((int(by) * step), resolution - 1))
-        k0 = max(0, min((int(bz) * step), resolution - 1))
-        i1 = min(resolution - 1, i0 + step)
-        j1 = min(resolution - 1, j0 + step)
-        k1 = min(resolution - 1, k0 + step)
+        i0 = max(0, min((int(bx) * step), nx - 1))
+        j0 = max(0, min((int(by) * step), ny - 1))
+        k0 = max(0, min((int(bz) * step), nz - 1))
+        i1 = min(nx - 1, i0 + step)
+        j1 = min(ny - 1, j0 + step)
+        k1 = min(nz - 1, k0 + step)
         block = field[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1]
         if block.size == 0:
             continue
@@ -739,7 +857,7 @@ def _mesh_active_blocks_cpu(
 
 
 def build_mesh(
-    field: np.ndarray,
+    field: object,
     bounds: list[list[float]],
     chunk_size: int | None = None,
     backend: Literal["auto", "cpu", "cuda"] = "auto",
@@ -747,7 +865,7 @@ def build_mesh(
     active_blocks: list[tuple[int, int, int]] | None = None,
     block_size: int | None = None,
 ) -> MeshData:
-    mesh, _ = build_mesh_with_backend(
+    mesh, _, _ = build_mesh_with_backend(
         field,
         bounds,
         chunk_size=chunk_size,
@@ -760,16 +878,15 @@ def build_mesh(
 
 
 def build_mesh_with_backend(
-    field: np.ndarray,
+    field: object,
     bounds: list[list[float]],
     chunk_size: int | None = None,
     backend: Literal["auto", "cpu", "cuda"] = "auto",
     meshing_mode: Literal["uniform", "adaptive"] = "uniform",
     active_blocks: list[tuple[int, int, int]] | None = None,
     block_size: int | None = None,
-) -> tuple[MeshData, Literal["cpu", "cuda"]]:
-    min_val = float(np.min(field))
-    max_val = float(np.max(field))
+) -> tuple[MeshData, Literal["cpu", "cuda"], str | None]:
+    min_val, max_val = _field_min_max(field)
     if not (min_val <= 0.0 <= max_val):
         raise MeshingError(
             "No zero level-set detected in current grid bounds. Expand bounds or change parameters."
@@ -781,32 +898,41 @@ def build_mesh_with_backend(
                 return (
                     _mesh_active_blocks_cpu(field, bounds, active_blocks, block_size or 24),
                     "cpu",
+                    "adaptive_meshing_uses_cpu",
                 )
-            return _mesh_adaptive_cpu(field, bounds), "cpu"
+            return _mesh_adaptive_cpu(field, bounds), "cpu", "adaptive_meshing_uses_cpu"
         except MemoryError:
-            return _mesh_chunked(field, bounds, chunk_size=chunk_size or 80), "cpu"
+            return _mesh_chunked(field, bounds, chunk_size=chunk_size or 80), "cpu", "adaptive_meshing_uses_cpu"
 
-    if active_blocks and backend != "cuda":
+    resolved_backend, backend_reason = _select_mesh_backend(
+        field,
+        backend,
+        meshing_mode,
+        active_blocks,
+        block_size,
+    )
+    if resolved_backend == "cpu" and active_blocks:
         try:
             return (
                 _mesh_active_blocks_cpu(field, bounds, active_blocks, block_size or 24),
                 "cpu",
+                backend_reason,
             )
         except MemoryError:
-            return _mesh_chunked(field, bounds, chunk_size=chunk_size or 80), "cpu"
+            return _mesh_chunked(field, bounds, chunk_size=chunk_size or 80), "cpu", backend_reason
 
-    resolved_backend = _resolve_mesh_backend(backend)
     if resolved_backend == "cuda":
         try:
-            return _mesh_single_cuda(field, bounds), "cuda"
+            return _mesh_single_cuda(field, bounds), "cuda", backend_reason
         except Exception as exc:
             if backend == "cuda":
                 raise MeshingError(f"CUDA meshing failed: {exc}") from exc
+            backend_reason = backend_reason or "cuda_fallback_to_cpu"
 
     try:
-        return _mesh_single_cpu(field, bounds), "cpu"
+        return _mesh_single_cpu(field, bounds), "cpu", backend_reason
     except MemoryError:
-        return _mesh_chunked(field, bounds, chunk_size=chunk_size or 80), "cpu"
+        return _mesh_chunked(field, bounds, chunk_size=chunk_size or 80), "cpu", backend_reason
 
 
 

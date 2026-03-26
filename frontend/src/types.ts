@@ -51,7 +51,7 @@ export interface CompileDiagnostics {
 
 export interface GridConfig {
   bounds: [[number, number], [number, number], [number, number]];
-  resolution: number;
+  resolution_xyz: [number, number, number];
 }
 
 export interface MeshPayloadBase64 {
@@ -76,14 +76,14 @@ export type MeshPayload = MeshPayloadBase64 | MeshPayloadBinary;
 
 export interface FieldPayloadBase64 {
   encoding: "f32-base64";
-  resolution: number;
+  resolution_xyz: [number, number, number];
   bounds: [[number, number], [number, number], [number, number]];
   data: string;
 }
 
 export interface FieldPayloadBinary {
   encoding: "f32-binary-v1";
-  resolution: number;
+  resolution_xyz: [number, number, number];
   bounds: [[number, number], [number, number], [number, number]];
   data: Float32Array;
 }
@@ -170,11 +170,14 @@ export interface MeshWorkflowParams {
 
 export interface UploadedMeshMemoryContext {
   meshSpan: number;
+  meshExtents: [number, number, number];
+  resolutionXYZ?: [number, number, number] | null;
   availableCpuBytes: number | null;
   availableGpuFreeBytes: number | null;
   availableGpuTotalBytes: number | null;
   cpuBytesPerVoxel: number;
   gpuBytesPerVoxel: number;
+  meshGpuBytesPerVoxel: number;
   safetyFactor: number;
 }
 

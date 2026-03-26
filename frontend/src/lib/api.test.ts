@@ -21,7 +21,7 @@ describe("previewUploadedMeshField", () => {
           voxel_count: 8,
           preview_mode: "field"
         }),
-        "X-SDF-Resolution": "2",
+        "X-SDF-Resolution-XYZ": "2,2,2",
         "X-SDF-Bounds": JSON.stringify([
           [-1, 1],
           [-1, 1],

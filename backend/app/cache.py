@@ -76,7 +76,7 @@ class UploadedMeshCacheEntry:
     faces: np.ndarray
     normals: np.ndarray
     stats: dict[str, float | int | bool | str]
-    field_resolution: int | None = None
+    field_resolution_xyz: list[int] | None = None
     field_bounds: list[list[float]] | None = None
     field_data: str | None = None
 
@@ -90,6 +90,7 @@ class UploadedMeshMetadataCacheEntry:
     faces: np.ndarray
     normals: np.ndarray
     mesh_span: float
+    mesh_extents: tuple[float, float, float]
 
 
 uploaded_mesh_metadata_cache: LruCache[UploadedMeshMetadataCacheEntry] = LruCache(maxsize=1)
@@ -97,9 +98,9 @@ uploaded_mesh_metadata_cache: LruCache[UploadedMeshMetadataCacheEntry] = LruCach
 
 @dataclass
 class UploadedComposedFieldCacheEntry:
-    field: np.ndarray
+    field: Any
     bounds: list[list[float]]
-    resolution: int
+    resolution_xyz: tuple[int, int, int]
     eval_backend: str
     block_size: int | None = None
     active_blocks: list[tuple[int, int, int]] | None = None
@@ -111,7 +112,7 @@ uploaded_composed_field_cache: LruCache[UploadedComposedFieldCacheEntry] = LruCa
 @dataclass
 class UploadedHostFieldCacheEntry:
     bounds: list[list[float]]
-    host_sdf: np.ndarray
+    host_sdf: Any
     host_compute_backend: str = "cpu"
     fallback_reason: str | None = None
     field_storage_mode: UploadedFieldStorageMode = "dense"
@@ -132,7 +133,7 @@ class UploadedFieldPreviewTraceEntry:
     created_at: float
     route: str
     extension: str | None = None
-    resolution: int | None = None
+    resolution_xyz: list[int] | None = None
     voxel_count: int | None = None
     payload_bytes: int | None = None
     compute_backend: str | None = None
@@ -276,7 +277,7 @@ def hash_uploaded_mesh_request(
     *,
     file_hash: str,
     extension: str,
-    resolution: int,
+    resolution_xyz: tuple[int, int, int] | list[int],
     shell_thickness: float,
     lattice_type: str,
     lattice_pitch: float,
@@ -291,7 +292,7 @@ def hash_uploaded_mesh_request(
     payload: dict[str, Any] = {
         "file_hash": file_hash,
         "extension": extension.lower(),
-        "resolution": int(resolution),
+        "resolution_xyz": [int(v) for v in resolution_xyz],
         "shell_thickness": float(shell_thickness),
         "lattice_type": lattice_type,
         "lattice_pitch": float(lattice_pitch),
@@ -324,14 +325,16 @@ def hash_uploaded_mesh_host_request(
     *,
     file_hash: str,
     extension: str,
-    resolution: int,
+    resolution_xyz: tuple[int, int, int] | list[int],
+    lattice_pitch: float,
     compute_backend: str = "auto",
     field_storage_mode: str = "auto",
 ) -> str:
     payload: dict[str, Any] = {
         "file_hash": file_hash,
         "extension": extension.lower(),
-        "resolution": int(resolution),
+        "resolution_xyz": [int(v) for v in resolution_xyz],
+        "lattice_pitch": float(lattice_pitch),
         "compute_backend": compute_backend,
         "field_storage_mode": field_storage_mode,
     }
@@ -343,7 +346,7 @@ def hash_uploaded_mesh_field_request(
     *,
     file_hash: str,
     extension: str,
-    resolution: int,
+    resolution_xyz: tuple[int, int, int] | list[int],
     shell_thickness: float,
     lattice_type: str,
     lattice_pitch: float,
@@ -356,7 +359,7 @@ def hash_uploaded_mesh_field_request(
     payload: dict[str, Any] = {
         "file_hash": file_hash,
         "extension": extension.lower(),
-        "resolution": int(resolution),
+        "resolution_xyz": [int(v) for v in resolution_xyz],
         "shell_thickness": float(shell_thickness),
         "lattice_type": lattice_type,
         "lattice_pitch": float(lattice_pitch),

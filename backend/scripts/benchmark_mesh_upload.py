@@ -32,11 +32,12 @@ def _measure_host_phase(
     field_storage_mode: str,
     runs: int,
 ) -> tuple[float, str]:
+    resolution_xyz = (quality_resolution, quality_resolution, quality_resolution)
     best_ms = float("inf")
     final_storage = "dense"
     for _ in range(max(1, runs)):
         host_start = time.perf_counter()
-        host = build_host_field(mesh, resolution=quality_resolution, field_storage_mode=field_storage_mode)
+        host = build_host_field(mesh, resolution_xyz=resolution_xyz, field_storage_mode=field_storage_mode)
         host_ms = (time.perf_counter() - host_start) * 1000.0
         if host_ms < best_ms:
             best_ms = host_ms
@@ -69,10 +70,10 @@ def _run_case(
     if assert_auto_ratio is not None and auto_ratio > assert_auto_ratio:
         raise SystemExit(
             f"Acceptance failed for {label}: auto/dense host ratio {auto_ratio:.3f} exceeded {assert_auto_ratio:.3f}"
-        )
+    )
 
     host_start = time.perf_counter()
-    host = build_host_field(mesh, resolution=quality_resolution)
+    host = build_host_field(mesh, resolution_xyz=(quality_resolution, quality_resolution, quality_resolution))
     host_ms = (time.perf_counter() - host_start) * 1000.0
 
     field_start = time.perf_counter()
@@ -89,7 +90,7 @@ def _run_case(
     field_ms = (time.perf_counter() - field_start) * 1000.0
 
     mesh_start = time.perf_counter()
-    out_mesh, mesh_backend = build_mesh_with_backend(
+    out_mesh, mesh_backend, mesh_backend_reason = build_mesh_with_backend(
         field,
         host.bounds,
         backend="cpu",
@@ -100,7 +101,7 @@ def _run_case(
         f"{label}: dense_host_ms={dense_host_ms:.1f} dense_storage={dense_storage} "
         f"auto_host_ms={auto_host_ms:.1f} auto_storage={auto_storage} auto_vs_dense={auto_ratio:.3f} "
         f"host_ms={host_ms:.1f} field_ms={field_ms:.1f} mesh_ms={mesh_ms:.1f} "
-        f"compute_backend={compute_backend} mesh_backend={mesh_backend} tri_count={out_mesh.faces.shape[0]}"
+        f"compute_backend={compute_backend} mesh_backend={mesh_backend} mesh_backend_reason={mesh_backend_reason} tri_count={out_mesh.faces.shape[0]}"
     )
 
 

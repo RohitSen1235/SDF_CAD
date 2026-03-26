@@ -10,7 +10,7 @@ from app.models import GridConfig
 def test_sphere_field_signs() -> None:
     scene = compile_source("root = sphere(r=0.6)")
     params = merge_parameter_values(scene, {})
-    field = evaluate_scene_field(scene, params, GridConfig(bounds=[[-1, 1], [-1, 1], [-1, 1]], resolution=33))
+    field = evaluate_scene_field(scene, params, GridConfig(bounds=[[-1, 1], [-1, 1], [-1, 1]], resolution_xyz=[33, 33, 33]))
 
     center = field[16, 16, 16]
     corner = field[0, 0, 0]
@@ -26,7 +26,7 @@ def test_tpms_conformal_fill_builds_mesh() -> None:
     """
     scene = compile_source(source)
     params = merge_parameter_values(scene, {})
-    grid = GridConfig(bounds=[[-1.2, 1.2], [-1.2, 1.2], [-1.2, 1.2]], resolution=64)
+    grid = GridConfig(bounds=[[-1.2, 1.2], [-1.2, 1.2], [-1.2, 1.2]], resolution_xyz=[64, 64, 64])
     field = evaluate_scene_field(scene, params, grid)
     mesh = build_mesh(field, grid.bounds)
 
@@ -43,7 +43,7 @@ def test_turbomachinery_union_mesh_non_empty() -> None:
     """
     scene = compile_source(source)
     params = merge_parameter_values(scene, {})
-    grid = GridConfig(bounds=[[-1.5, 1.5], [-1.0, 1.0], [-1.5, 1.5]], resolution=64)
+    grid = GridConfig(bounds=[[-1.5, 1.5], [-1.0, 1.0], [-1.5, 1.5]], resolution_xyz=[64, 64, 64])
     field = evaluate_scene_field(scene, params, grid)
     mesh = build_mesh(field, grid.bounds)
 
@@ -57,7 +57,7 @@ def test_strut_lattice_field_is_finite() -> None:
     field = evaluate_scene_field(
         scene,
         params,
-        GridConfig(bounds=[[-0.7, 0.7], [-0.7, 0.7], [-0.7, 0.7]], resolution=40),
+        GridConfig(bounds=[[-0.7, 0.7], [-0.7, 0.7], [-0.7, 0.7]], resolution_xyz=[40, 40, 40]),
     )
 
     assert np.all(np.isfinite(field))
@@ -74,7 +74,7 @@ def test_field_expression_symbol_reference_evaluates() -> None:
     field = evaluate_scene_field(
         scene,
         params,
-        GridConfig(bounds=[[-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0]], resolution=36),
+        GridConfig(bounds=[[-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0]], resolution_xyz=[36, 36, 36]),
     )
 
     assert np.all(np.isfinite(field))
@@ -95,7 +95,7 @@ def test_field_expression_cuboid_min_max_with_scalars() -> None:
     field = evaluate_scene_field(
         scene,
         params,
-        GridConfig(bounds=[[-3.0, 3.0], [-2.0, 2.0], [-2.0, 2.0]], resolution=36),
+        GridConfig(bounds=[[-3.0, 3.0], [-2.0, 2.0], [-2.0, 2.0]], resolution_xyz=[36, 36, 36]),
     )
 
     assert field.shape == (36, 36, 36)
@@ -115,7 +115,7 @@ def test_circular_array_domain_op_produces_periodic_blades() -> None:
     field = evaluate_scene_field(
         scene,
         params,
-        GridConfig(bounds=[[-1.2, 1.2], [-0.35, 0.35], [-1.2, 1.2]], resolution=64),
+        GridConfig(bounds=[[-1.2, 1.2], [-0.35, 0.35], [-1.2, 1.2]], resolution_xyz=[64, 64, 64]),
     )
     mesh = build_mesh(field, [[-1.2, 1.2], [-0.35, 0.35], [-1.2, 1.2]])
 
@@ -143,7 +143,7 @@ def test_spline_primitive_builds_tubular_mesh() -> None:
     """
     scene = compile_source(source)
     params = merge_parameter_values(scene, {})
-    grid = GridConfig(bounds=[[-0.3, 1.4], [-0.6, 0.6], [-0.6, 0.6]], resolution=64)
+    grid = GridConfig(bounds=[[-0.3, 1.4], [-0.6, 0.6], [-0.6, 0.6]], resolution_xyz=[64, 64, 64])
     field = evaluate_scene_field(scene, params, grid)
     mesh = build_mesh(field, grid.bounds)
 
@@ -163,7 +163,7 @@ def test_freeform_surface_primitive_builds_mesh() -> None:
     """
     scene = compile_source(source)
     params = merge_parameter_values(scene, {})
-    grid = GridConfig(bounds=[[-1.0, 1.0], [-0.3, 0.6], [-1.0, 1.0]], resolution=64)
+    grid = GridConfig(bounds=[[-1.0, 1.0], [-0.3, 0.6], [-1.0, 1.0]], resolution_xyz=[64, 64, 64])
     field = evaluate_scene_field(scene, params, grid)
     mesh = build_mesh(field, grid.bounds)
 
@@ -175,7 +175,7 @@ def test_freeform_surface_primitive_builds_mesh() -> None:
 def test_evaluator_respects_requested_compute_precision() -> None:
     scene = compile_source("root = sphere(r=0.6)")
     params = merge_parameter_values(scene, {})
-    grid = GridConfig(bounds=[[-1, 1], [-1, 1], [-1, 1]], resolution=33)
+    grid = GridConfig(bounds=[[-1, 1], [-1, 1], [-1, 1]], resolution_xyz=[33, 33, 33])
 
     field32 = evaluate_scene_field(scene, params, grid, compute_precision="float32")
     field16 = evaluate_scene_field(scene, params, grid, compute_precision="float16")
@@ -188,7 +188,7 @@ def test_evaluator_respects_requested_compute_precision() -> None:
 def test_cuda_backend_selection_reports_fallback_or_cuda() -> None:
     scene = compile_source("root = sphere(r=0.55)")
     params = merge_parameter_values(scene, {})
-    grid = GridConfig(bounds=[[-1, 1], [-1, 1], [-1, 1]], resolution=24)
+    grid = GridConfig(bounds=[[-1, 1], [-1, 1], [-1, 1]], resolution_xyz=[24, 24, 24])
     field, backend = evaluate_scene_field_with_backend(
         scene,
         params,
@@ -214,7 +214,7 @@ def test_spline_simd_path_matches_python_fallback(monkeypatch) -> None:
     """
     scene = compile_source(source)
     params = merge_parameter_values(scene, {})
-    grid = GridConfig(bounds=[[-0.3, 1.2], [-0.6, 0.6], [-0.6, 0.6]], resolution=40)
+    grid = GridConfig(bounds=[[-0.3, 1.2], [-0.6, 0.6], [-0.6, 0.6]], resolution_xyz=[40, 40, 40])
     baseline = evaluate_scene_field(scene, params, grid)
 
     monkeypatch.setattr(evaluator_module, "NUMBA_AVAILABLE", False)
@@ -227,7 +227,7 @@ def test_turbomachine_simd_path_matches_python_fallback(monkeypatch) -> None:
     source = "root = impeller_centrifugal(r_in=0.22, r_out=0.95, hub_h=0.45, blade_count=9, blade_twist=0.9)"
     scene = compile_source(source)
     params = merge_parameter_values(scene, {})
-    grid = GridConfig(bounds=[[-1.2, 1.2], [-0.6, 0.6], [-1.2, 1.2]], resolution=36)
+    grid = GridConfig(bounds=[[-1.2, 1.2], [-0.6, 0.6], [-1.2, 1.2]], resolution_xyz=[36, 36, 36])
     baseline = evaluate_scene_field(scene, params, grid)
 
     monkeypatch.setattr(evaluator_module, "NUMBA_AVAILABLE", False)

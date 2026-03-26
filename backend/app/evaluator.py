@@ -150,28 +150,30 @@ def _resolve_compute_backend(requested: ComputeBackend) -> Literal["cpu", "cuda"
 @lru_cache(maxsize=48)
 def _cached_grid(
     bounds_key: tuple[float, ...],
-    resolution: int,
+    resolution_xyz: tuple[int, int, int],
     dtype_name: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     xmin, xmax, ymin, ymax, zmin, zmax = bounds_key
+    nx, ny, nz = resolution_xyz
     dtype = np.dtype(dtype_name)
-    x = np.linspace(xmin, xmax, resolution, dtype=dtype)
-    y = np.linspace(ymin, ymax, resolution, dtype=dtype)
-    z = np.linspace(zmin, zmax, resolution, dtype=dtype)
+    x = np.linspace(xmin, xmax, nx, dtype=dtype)
+    y = np.linspace(ymin, ymax, ny, dtype=dtype)
+    z = np.linspace(zmin, zmax, nz, dtype=dtype)
     return np.meshgrid(x, y, z, indexing="ij")
 
 
 @lru_cache(maxsize=48)
 def _cached_axes(
     bounds_key: tuple[float, ...],
-    resolution: int,
+    resolution_xyz: tuple[int, int, int],
     dtype_name: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     xmin, xmax, ymin, ymax, zmin, zmax = bounds_key
+    nx, ny, nz = resolution_xyz
     dtype = np.dtype(dtype_name)
-    x = np.linspace(xmin, xmax, resolution, dtype=dtype)
-    y = np.linspace(ymin, ymax, resolution, dtype=dtype)
-    z = np.linspace(zmin, zmax, resolution, dtype=dtype)
+    x = np.linspace(xmin, xmax, nx, dtype=dtype)
+    y = np.linspace(ymin, ymax, ny, dtype=dtype)
+    z = np.linspace(zmin, zmax, nz, dtype=dtype)
     return x, y, z
 
 
@@ -1319,6 +1321,12 @@ def _evaluate_scene_field_cpu(
         raise EvaluationError("Scene root node is not present in nodes list")
 
     bounds = grid.bounds
+    resolution_xyz = (
+        int(grid.resolution_xyz[0]),
+        int(grid.resolution_xyz[1]),
+        int(grid.resolution_xyz[2]),
+    )
+    nx, ny, nz = resolution_xyz
     eval_dtype = _resolve_eval_dtype(compute_precision)
     bounds_key = (
         float(bounds[0][0]),
@@ -1329,18 +1337,18 @@ def _evaluate_scene_field_cpu(
         float(bounds[2][1]),
     )
 
-    if grid.resolution <= 160:
-        x, y, z = _cached_grid(bounds_key, grid.resolution, eval_dtype.name)
+    if max(resolution_xyz) <= 160:
+        x, y, z = _cached_grid(bounds_key, resolution_xyz, eval_dtype.name)
         runtime = _FieldRuntime(scene_ir, parameter_values, eval_dtype=eval_dtype, xp=np)
         return runtime.evaluate(x, y, z)
 
-    x_axis, y_axis, z_axis = _cached_axes(bounds_key, grid.resolution, eval_dtype.name)
+    x_axis, y_axis, z_axis = _cached_axes(bounds_key, resolution_xyz, eval_dtype.name)
 
     runtime = _FieldRuntime(scene_ir, parameter_values, eval_dtype=eval_dtype, xp=np)
-    field = np.empty((grid.resolution, grid.resolution, grid.resolution), dtype=eval_dtype)
+    field = np.empty((nx, ny, nz), dtype=eval_dtype)
 
-    for start in range(0, grid.resolution, chunk_size):
-        stop = min(grid.resolution, start + chunk_size)
+    for start in range(0, nx, chunk_size):
+        stop = min(nx, start + chunk_size)
         x = x_axis[start:stop]
         px, py, pz = np.meshgrid(x, y_axis, z_axis, indexing="ij")
         field[start:stop, :, :] = runtime.evaluate(px, py, pz)
@@ -1362,6 +1370,12 @@ def _evaluate_scene_field_cuda(
         raise EvaluationError("Scene root node is not present in nodes list")
 
     bounds = grid.bounds
+    resolution_xyz = (
+        int(grid.resolution_xyz[0]),
+        int(grid.resolution_xyz[1]),
+        int(grid.resolution_xyz[2]),
+    )
+    nx, ny, nz = resolution_xyz
     eval_dtype = _resolve_eval_dtype(compute_precision)
     bounds_key = (
         float(bounds[0][0]),
@@ -1374,18 +1388,18 @@ def _evaluate_scene_field_cuda(
 
     runtime = _FieldRuntime(scene_ir, parameter_values, eval_dtype=eval_dtype, xp=cp)
 
-    if grid.resolution <= 160:
-        x, y, z = _cached_grid(bounds_key, grid.resolution, eval_dtype.name)
+    if max(resolution_xyz) <= 160:
+        x, y, z = _cached_grid(bounds_key, resolution_xyz, eval_dtype.name)
         field_gpu = runtime.evaluate(cp.asarray(x), cp.asarray(y), cp.asarray(z))
         return cp.asnumpy(field_gpu)
 
-    x_axis, y_axis, z_axis = _cached_axes(bounds_key, grid.resolution, eval_dtype.name)
+    x_axis, y_axis, z_axis = _cached_axes(bounds_key, resolution_xyz, eval_dtype.name)
     y_gpu = cp.asarray(y_axis)
     z_gpu = cp.asarray(z_axis)
-    field = np.empty((grid.resolution, grid.resolution, grid.resolution), dtype=eval_dtype)
+    field = np.empty((nx, ny, nz), dtype=eval_dtype)
 
-    for start in range(0, grid.resolution, chunk_size):
-        stop = min(grid.resolution, start + chunk_size)
+    for start in range(0, nx, chunk_size):
+        stop = min(nx, start + chunk_size)
         x_gpu = cp.asarray(x_axis[start:stop])
         px, py, pz = cp.meshgrid(x_gpu, y_gpu, z_gpu, indexing="ij")
         field[start:stop, :, :] = cp.asnumpy(runtime.evaluate(px, py, pz))

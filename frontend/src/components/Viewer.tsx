@@ -54,7 +54,7 @@ const FIELD_FRAGMENT_SHADER = `
   uniform vec3 uColor;
   uniform float uSectionEnabled;
   uniform float uSectionLevel;
-  uniform float uResolution;
+  uniform vec3 uResolutionXYZ;
   uniform float uStepScale;
   uniform float uAlphaScale;
 
@@ -126,7 +126,9 @@ const FIELD_FRAGMENT_SHADER = `
     }
 
     vec3 extent = (uBoundsMax - uBoundsMin);
-    float voxel = min(min(extent.x, extent.y), extent.z) / max(uResolution, 2.0);
+    vec3 samples = max(uResolutionXYZ - vec3(1.0), vec3(1.0));
+    vec3 voxelAxis = extent / samples;
+    float voxel = min(min(voxelAxis.x, voxelAxis.y), voxelAxis.z);
     float minStep = max(voxel * 0.25, 1e-4);
     float maxStep = max(voxel * 1.25, minStep);
     float hitEps = max(voxel * 0.8, 1e-4);
@@ -326,16 +328,16 @@ function toFieldTexture(field: FieldPayload | null): THREE.Data3DTexture | null 
   if (!values) {
     return null;
   }
-  const expected = field.resolution * field.resolution * field.resolution;
+  const expected = field.resolution_xyz[0] * field.resolution_xyz[1] * field.resolution_xyz[2];
   if (values.length !== expected) {
     return null;
   }
 
   const texture = new THREE.Data3DTexture(
     values as unknown as BufferSource,
-    field.resolution,
-    field.resolution,
-    field.resolution
+    field.resolution_xyz[0],
+    field.resolution_xyz[1],
+    field.resolution_xyz[2]
   );
   texture.internalFormat = "R32F";
   texture.format = THREE.RedFormat;
@@ -543,7 +545,13 @@ export function Viewer({
               uColor: { value: new THREE.Color("#8be9fd") },
               uSectionEnabled: { value: sectionEnabled ? 1.0 : 0.0 },
               uSectionLevel: { value: sectionLevel },
-              uResolution: { value: field?.resolution ?? 64 },
+              uResolutionXYZ: {
+                value: new THREE.Vector3(
+                  field?.resolution_xyz[0] ?? 64,
+                  field?.resolution_xyz[1] ?? 64,
+                  field?.resolution_xyz[2] ?? 64
+                )
+              },
               uStepScale: { value: 1.0 },
               uAlphaScale: { value: 1.0 }
             }}
@@ -632,7 +640,13 @@ export function Viewer({
                     uColor: { value: new THREE.Color("#ffcf6e") },
                     uSectionEnabled: { value: sectionEnabled ? 1.0 : 0.0 },
                     uSectionLevel: { value: sectionLevel },
-                    uResolution: { value: field?.resolution ?? 64 },
+                    uResolutionXYZ: {
+                      value: new THREE.Vector3(
+                        field?.resolution_xyz[0] ?? 64,
+                        field?.resolution_xyz[1] ?? 64,
+                        field?.resolution_xyz[2] ?? 64
+                      )
+                    },
                     uStepScale: { value: 1.0 },
                     uAlphaScale: { value: 0.86 }
                   }}

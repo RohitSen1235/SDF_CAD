@@ -83,15 +83,18 @@ class GridConfig(BaseModel):
     bounds: list[list[float]] = Field(
         default_factory=lambda: [[-1.5, 1.5], [-1.5, 1.5], [-1.5, 1.5]]
     )
-    resolution: int = 64
+    resolution_xyz: list[int] = Field(default_factory=lambda: [64, 64, 64])
 
-    @field_validator("resolution")
+    @field_validator("resolution_xyz")
     @classmethod
-    def validate_resolution(cls, value: int) -> int:
-        if value < 16:
-            raise ValueError("resolution must be >= 16")
-        if value > 256:
-            raise ValueError("resolution must be <= 256")
+    def validate_resolution_xyz(cls, value: list[int]) -> list[int]:
+        if len(value) != 3:
+            raise ValueError("resolution_xyz must contain 3 axis values")
+        for axis_res in value:
+            if axis_res < 16:
+                raise ValueError("resolution_xyz values must be >= 16")
+            if axis_res > 256:
+                raise ValueError("resolution_xyz values must be <= 256")
         return value
 
     @field_validator("bounds")
@@ -133,7 +136,7 @@ class MeshPayload(BaseModel):
 
 class FieldPayload(BaseModel):
     encoding: Literal["f32-base64"] = "f32-base64"
-    resolution: int
+    resolution_xyz: list[int]
     bounds: list[list[float]]
     data: str
 

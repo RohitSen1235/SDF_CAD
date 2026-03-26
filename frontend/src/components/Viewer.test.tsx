@@ -54,7 +54,7 @@ function encodeFieldData(values: Float32Array): string {
 
 const sampleField = {
   encoding: "f32-base64" as const,
-  resolution: 2,
+  resolution_xyz: [2, 2, 2] as [number, number, number],
   bounds: [
     [-1, 1],
     [-1, 1],
