@@ -90,7 +90,7 @@ def _run_case(
     field_ms = (time.perf_counter() - field_start) * 1000.0
 
     mesh_start = time.perf_counter()
-    out_mesh, mesh_backend = build_mesh_with_backend(
+    out_mesh, mesh_backend, mesh_backend_reason = build_mesh_with_backend(
         field,
         host.bounds,
         backend="cpu",
@@ -101,7 +101,7 @@ def _run_case(
         f"{label}: dense_host_ms={dense_host_ms:.1f} dense_storage={dense_storage} "
         f"auto_host_ms={auto_host_ms:.1f} auto_storage={auto_storage} auto_vs_dense={auto_ratio:.3f} "
         f"host_ms={host_ms:.1f} field_ms={field_ms:.1f} mesh_ms={mesh_ms:.1f} "
-        f"compute_backend={compute_backend} mesh_backend={mesh_backend} tri_count={out_mesh.faces.shape[0]}"
+        f"compute_backend={compute_backend} mesh_backend={mesh_backend} mesh_backend_reason={mesh_backend_reason} tri_count={out_mesh.faces.shape[0]}"
     )
 
 

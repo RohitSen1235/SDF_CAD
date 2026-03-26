@@ -480,15 +480,25 @@ export default function App() {
       meshMemoryContext.cpuBytesPerVoxel,
       meshMemoryContext.safetyFactor
     );
-    const requiredGpuBytes = estimateRequiredBytes(
+    const requiredFieldGpuBytes = estimateRequiredBytes(
       resolutionXYZ,
       meshMemoryContext.gpuBytesPerVoxel,
       meshMemoryContext.safetyFactor
     );
+    const requiredMeshGpuBytes =
+      meshBackend !== "cpu" && meshingMode !== "adaptive"
+        ? estimateRequiredBytes(resolutionXYZ, meshMemoryContext.meshGpuBytesPerVoxel, meshMemoryContext.safetyFactor)
+        : 0;
+    const requiredGpuBytes = requiredFieldGpuBytes + requiredMeshGpuBytes;
     const cpuFatal =
       meshMemoryContext.availableCpuBytes != null && requiredCpuBytes > meshMemoryContext.availableCpuBytes;
-    const gpuCheckEnabled =
+    const fieldGpuCheckEnabled =
       computeBackend === "cuda" || (computeBackend === "auto" && meshMemoryContext.availableGpuFreeBytes != null);
+    const meshGpuCheckEnabled =
+      meshBackend !== "cpu" &&
+      meshingMode !== "adaptive" &&
+      meshMemoryContext.availableGpuFreeBytes != null;
+    const gpuCheckEnabled = fieldGpuCheckEnabled || meshGpuCheckEnabled;
     const gpuFatal =
       gpuCheckEnabled &&
       meshMemoryContext.availableGpuFreeBytes != null &&
@@ -507,7 +517,9 @@ export default function App() {
       ];
       if (gpuCheckEnabled) {
         parts.push(
-          `Required GPU: ${bytesToGiB(requiredGpuBytes)} (available: ${
+          `Required GPU field: ${bytesToGiB(requiredFieldGpuBytes)}.`,
+          `Required GPU meshing: ${bytesToGiB(requiredMeshGpuBytes)}.`,
+          `Required GPU total: ${bytesToGiB(requiredGpuBytes)} (available: ${
             meshMemoryContext.availableGpuFreeBytes != null
               ? bytesToGiB(meshMemoryContext.availableGpuFreeBytes)
               : "unknown"
@@ -521,6 +533,8 @@ export default function App() {
     return {
       resolutionXYZ,
       requiredCpuBytes,
+      requiredFieldGpuBytes,
+      requiredMeshGpuBytes,
       requiredGpuBytes,
       cpuFatal,
       gpuFatal,
@@ -1529,7 +1543,16 @@ export default function App() {
                               : " (available: unknown)"}
                           </p>
                           <p className="muted">
-                            Est. required GPU memory: <strong>{bytesToMiB(meshMemoryRisk.requiredGpuBytes)}</strong>
+                            Est. required GPU memory (field):{" "}
+                            <strong>{bytesToMiB(meshMemoryRisk.requiredFieldGpuBytes)}</strong>
+                          </p>
+                          <p className="muted">
+                            Est. required GPU memory (meshing):{" "}
+                            <strong>{bytesToMiB(meshMemoryRisk.requiredMeshGpuBytes)}</strong>
+                          </p>
+                          <p className="muted">
+                            Est. required GPU memory (total):{" "}
+                            <strong>{bytesToMiB(meshMemoryRisk.requiredGpuBytes)}</strong>
                             {meshMemoryContext?.availableGpuFreeBytes != null
                               ? ` (available: ${bytesToMiB(meshMemoryContext.availableGpuFreeBytes)})`
                               : " (available: unknown)"}

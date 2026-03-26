@@ -207,12 +207,14 @@ function parseUploadedMeshMemoryContext(response: Response): UploadedMeshMemoryC
   const resolutionXYZ = parseOptionalResolutionXYZHeader(response);
   const cpuBytesPerVoxel = parseOptionalNumericHeader(response, "X-SDF-CPU-Bytes-Per-Voxel");
   const gpuBytesPerVoxel = parseOptionalNumericHeader(response, "X-SDF-GPU-Bytes-Per-Voxel");
+  const meshGpuBytesPerVoxel = parseOptionalNumericHeader(response, "X-SDF-MESH-GPU-Bytes-Per-Voxel");
   const safetyFactor = parseOptionalNumericHeader(response, "X-SDF-Memory-Safety-Factor");
   if (
     meshSpan == null ||
     meshExtents == null ||
     cpuBytesPerVoxel == null ||
     gpuBytesPerVoxel == null ||
+    meshGpuBytesPerVoxel == null ||
     safetyFactor == null
   ) {
     return null;
@@ -226,6 +228,7 @@ function parseUploadedMeshMemoryContext(response: Response): UploadedMeshMemoryC
     availableGpuTotalBytes: parseOptionalNumericHeader(response, "X-SDF-Available-GPU-Total-Bytes"),
     cpuBytesPerVoxel,
     gpuBytesPerVoxel,
+    meshGpuBytesPerVoxel,
     safetyFactor
   };
 }

@@ -177,6 +177,7 @@ export interface UploadedMeshMemoryContext {
   availableGpuTotalBytes: number | null;
   cpuBytesPerVoxel: number;
   gpuBytesPerVoxel: number;
+  meshGpuBytesPerVoxel: number;
   safetyFactor: number;
 }
 

@@ -169,6 +169,7 @@ AUTO_QUEUE_TOTAL_VOXELS_THRESHOLD = 128**3
 AUTO_QUEUE_UPLOAD_BYTES_THRESHOLD = 8 * 1024 * 1024
 MEMORY_MODEL_CPU_BYTES_PER_VOXEL = 48.0
 MEMORY_MODEL_GPU_BYTES_PER_VOXEL = 56.0
+MEMORY_MODEL_MESH_GPU_BYTES_PER_VOXEL = 32.0
 MEMORY_MODEL_SAFETY_FACTOR = 1.0
 
 app = FastAPI(title="SDF CAD", version="0.2.0")
@@ -196,6 +197,7 @@ app.add_middleware(
         "X-SDF-Available-GPU-Total-Bytes",
         "X-SDF-CPU-Bytes-Per-Voxel",
         "X-SDF-GPU-Bytes-Per-Voxel",
+        "X-SDF-MESH-GPU-Bytes-Per-Voxel",
         "X-SDF-Memory-Safety-Factor",
     ],
 )
@@ -316,6 +318,7 @@ class UploadedMeshMemoryContext:
     available_gpu_total_bytes: int | None
     cpu_bytes_per_voxel: float
     gpu_bytes_per_voxel: float
+    mesh_gpu_bytes_per_voxel: float
     safety_factor: float
 
 
@@ -324,6 +327,8 @@ class UploadedMeshMemoryEstimate:
     context: UploadedMeshMemoryContext
     resolution_xyz: ResolutionXYZ
     required_cpu_bytes: int
+    required_field_gpu_bytes: int
+    required_mesh_gpu_bytes: int
     required_gpu_bytes: int
     cpu_fatal: bool
     gpu_fatal: bool
@@ -949,7 +954,7 @@ def _run_preview_meshdata(
 
     mesh_start = time.perf_counter()
     mesh_field = field.astype(np.float32, copy=False) if field.dtype == np.float16 else field
-    mesh, mesh_backend_used = build_mesh_with_backend(
+    mesh, mesh_backend_used, mesh_backend_reason = build_mesh_with_backend(
         mesh_field,
         grid.bounds,
         backend=mesh_backend,
@@ -968,6 +973,7 @@ def _run_preview_meshdata(
         compute_backend=eval_backend,
         mesh_backend=mesh_backend_used,
         preview_mode="mesh",
+        fallback_reason=mesh_backend_reason,
     )
 
     mesh_payload = _encode_mesh_payload(mesh) if encode_mesh_payload else None
@@ -1317,6 +1323,7 @@ def _snapshot_uploaded_mesh_memory_context(
         available_gpu_total_bytes=available_gpu_total,
         cpu_bytes_per_voxel=MEMORY_MODEL_CPU_BYTES_PER_VOXEL,
         gpu_bytes_per_voxel=MEMORY_MODEL_GPU_BYTES_PER_VOXEL,
+        mesh_gpu_bytes_per_voxel=MEMORY_MODEL_MESH_GPU_BYTES_PER_VOXEL,
         safety_factor=MEMORY_MODEL_SAFETY_FACTOR,
     )
 
@@ -1329,6 +1336,8 @@ def _resolve_uploaded_mesh_memory_estimate(
     lattice_pitch: float,
     voxels_per_lattice_period: int,
     compute_backend: ComputeBackend,
+    mesh_backend: MeshBackend = "cpu",
+    meshing_mode: MeshingMode = "uniform",
     metadata: UploadedMeshMetadata | None = None,
 ) -> tuple[UploadedMeshMemoryEstimate, UploadedMeshMetadata]:
     resolved_metadata = metadata or _resolve_uploaded_mesh_metadata(
@@ -1344,9 +1353,20 @@ def _resolve_uploaded_mesh_memory_estimate(
     )
     total_voxels = voxel_count(resolution_xyz)
     required_cpu_bytes = int(np.ceil(total_voxels * context.cpu_bytes_per_voxel * context.safety_factor))
-    required_gpu_bytes = int(np.ceil(total_voxels * context.gpu_bytes_per_voxel * context.safety_factor))
-    gpu_check_enabled = compute_backend == "cuda" or (
-        compute_backend == "auto" and context.available_gpu_free_bytes is not None
+    required_field_gpu_bytes = int(
+        np.ceil(total_voxels * context.gpu_bytes_per_voxel * context.safety_factor)
+    )
+    mesh_gpu_check_enabled = mesh_backend != "cpu" and meshing_mode != "adaptive"
+    required_mesh_gpu_bytes = (
+        int(np.ceil(total_voxels * context.mesh_gpu_bytes_per_voxel * context.safety_factor))
+        if mesh_gpu_check_enabled
+        else 0
+    )
+    required_gpu_bytes = required_field_gpu_bytes + required_mesh_gpu_bytes
+    gpu_check_enabled = (
+        compute_backend == "cuda"
+        or (compute_backend == "auto" and context.available_gpu_free_bytes is not None)
+        or (mesh_gpu_check_enabled and context.available_gpu_free_bytes is not None)
     )
     cpu_fatal = context.available_cpu_bytes is not None and required_cpu_bytes > context.available_cpu_bytes
     gpu_fatal = (
@@ -1359,6 +1379,8 @@ def _resolve_uploaded_mesh_memory_estimate(
             context=context,
             resolution_xyz=resolution_xyz,
             required_cpu_bytes=required_cpu_bytes,
+            required_field_gpu_bytes=required_field_gpu_bytes,
+            required_mesh_gpu_bytes=required_mesh_gpu_bytes,
             required_gpu_bytes=required_gpu_bytes,
             cpu_fatal=cpu_fatal,
             gpu_fatal=gpu_fatal,
@@ -1381,18 +1403,22 @@ def _uploaded_mesh_memory_guard_message(
     lattice_pitch: float,
     voxels_per_lattice_period: int,
     compute_backend: ComputeBackend,
+    mesh_backend: MeshBackend,
+    meshing_mode: MeshingMode,
 ) -> str:
     parts = [
         "Estimated memory requirement exceeds available system memory for this mesh preview.",
         (
             f"resolution_xyz={estimate.resolution_xyz[0]}x{estimate.resolution_xyz[1]}x{estimate.resolution_xyz[2]}, "
-            f"compute_backend={compute_backend}"
+            f"compute_backend={compute_backend}, mesh_backend={mesh_backend}, meshing_mode={meshing_mode}"
         ),
         f"required_cpu={_format_bytes_gib(estimate.required_cpu_bytes)}, available_cpu={_format_bytes_gib(estimate.context.available_cpu_bytes)}",
+        f"required_field_gpu={_format_bytes_gib(estimate.required_field_gpu_bytes)}",
+        f"required_mesh_gpu={_format_bytes_gib(estimate.required_mesh_gpu_bytes)}",
     ]
     if estimate.gpu_check_enabled:
         parts.append(
-            f"required_gpu={_format_bytes_gib(estimate.required_gpu_bytes)}, available_gpu_free={_format_bytes_gib(estimate.context.available_gpu_free_bytes)}"
+            f"required_gpu_total={_format_bytes_gib(estimate.required_gpu_bytes)}, available_gpu_free={_format_bytes_gib(estimate.context.available_gpu_free_bytes)}"
         )
     parts.append(
         "Reduce memory usage by increasing lattice_pitch, lowering voxels_per_lattice_period, or selecting CPU backend."
@@ -1411,6 +1437,8 @@ def _enforce_uploaded_mesh_memory_guard(
     lattice_pitch: float,
     voxels_per_lattice_period: int,
     compute_backend: ComputeBackend,
+    mesh_backend: MeshBackend = "cpu",
+    meshing_mode: MeshingMode = "uniform",
     metadata: UploadedMeshMetadata | None = None,
 ) -> UploadedMeshMemoryEstimate:
     estimate, _ = _resolve_uploaded_mesh_memory_estimate(
@@ -1420,6 +1448,8 @@ def _enforce_uploaded_mesh_memory_guard(
         lattice_pitch=lattice_pitch,
         voxels_per_lattice_period=voxels_per_lattice_period,
         compute_backend=compute_backend,
+        mesh_backend=mesh_backend,
+        meshing_mode=meshing_mode,
         metadata=metadata,
     )
     if estimate.fatal:
@@ -1429,6 +1459,8 @@ def _enforce_uploaded_mesh_memory_guard(
                 lattice_pitch=lattice_pitch,
                 voxels_per_lattice_period=voxels_per_lattice_period,
                 compute_backend=compute_backend,
+                mesh_backend=mesh_backend,
+                meshing_mode=meshing_mode,
             )
         )
     return estimate
@@ -1997,7 +2029,7 @@ def _run_uploaded_mesh_commit_meshdata(
         active_blocks = [(int(bx), int(by), int(bz)) for bx, by, bz in field_cached.active_blocks]
 
     mesh_start = time.perf_counter()
-    generated, mesh_backend_used = build_mesh_with_backend(
+    generated, mesh_backend_used, mesh_backend_reason = build_mesh_with_backend(
         field,
         bounds,
         backend=mesh_backend,
@@ -2019,6 +2051,7 @@ def _run_uploaded_mesh_commit_meshdata(
         compute_backend="cuda" if field_cached.eval_backend == "cuda" else "cpu",
         mesh_backend=mesh_backend_used,
         preview_mode="mesh",
+        fallback_reason=mesh_backend_reason,
     )
 
     mesh_payload = _encode_mesh_payload(mesh) if encode_response_payloads else None
@@ -2356,7 +2389,7 @@ def _run_uploaded_mesh_preview_meshdata(
     _maybe_evict_uploaded_composed_field_cache_before_meshing(field)
     mesh_start = time.perf_counter()
     mesher_start = time.perf_counter()
-    generated, mesh_backend_used = build_mesh_with_backend(
+    generated, mesh_backend_used, mesh_backend_reason = build_mesh_with_backend(
         field,
         bounds,
         backend=mesh_backend,
@@ -2395,6 +2428,7 @@ def _run_uploaded_mesh_preview_meshdata(
         compute_backend=eval_backend_used,
         mesh_backend=mesh_backend_used,
         preview_mode="mesh",
+        fallback_reason=mesh_backend_reason,
     )
 
     mesh_payload = _encode_mesh_payload(mesh) if encode_response_payloads else None
@@ -2711,6 +2745,8 @@ async def preview_uploaded_mesh(
             lattice_pitch=lattice_pitch,
             voxels_per_lattice_period=voxels_per_lattice_period,
             compute_backend=compute_backend,
+            mesh_backend=mesh_backend,
+            meshing_mode=meshing_mode,
         )
     except MeshUploadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2801,6 +2837,8 @@ async def preview_uploaded_mesh_binary(
             lattice_pitch=lattice_pitch,
             voxels_per_lattice_period=voxels_per_lattice_period,
             compute_backend=compute_backend,
+            mesh_backend=mesh_backend,
+            meshing_mode=meshing_mode,
         )
     except MeshUploadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2959,6 +2997,8 @@ async def preview_uploaded_mesh_field(
             lattice_pitch=lattice_pitch,
             voxels_per_lattice_period=voxels_per_lattice_period,
             compute_backend=compute_backend,
+            mesh_backend="cpu",
+            meshing_mode="uniform",
         )
     except MeshUploadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3028,6 +3068,8 @@ async def preview_uploaded_mesh_field_binary(
             lattice_pitch=lattice_pitch,
             voxels_per_lattice_period=voxels_per_lattice_period,
             compute_backend=compute_backend,
+            mesh_backend="cpu",
+            meshing_mode="uniform",
         )
     except MeshUploadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3166,6 +3208,7 @@ async def preprocess_uploaded_mesh(
             ),
             "X-SDF-CPU-Bytes-Per-Voxel": str(float(memory_estimate.context.cpu_bytes_per_voxel)),
             "X-SDF-GPU-Bytes-Per-Voxel": str(float(memory_estimate.context.gpu_bytes_per_voxel)),
+            "X-SDF-MESH-GPU-Bytes-Per-Voxel": str(float(memory_estimate.context.mesh_gpu_bytes_per_voxel)),
             "X-SDF-Memory-Safety-Factor": str(float(memory_estimate.context.safety_factor)),
         },
     )
@@ -3489,7 +3532,7 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                 try:
                     _maybe_evict_uploaded_composed_field_cache_before_meshing(field)
                     mesh_start = time.perf_counter()
-                    generated, mesh_backend_used = build_mesh_with_backend(
+                    generated, mesh_backend_used, mesh_backend_reason = build_mesh_with_backend(
                         field,
                         bounds,
                         backend=payload.mesh_backend,
@@ -3503,11 +3546,11 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                     mesh_payload = _encode_mesh_payload(mesh)
                     tri_count = int(mesh.faces.shape[0])
                     logger.debug("mesh_upload mesh_phase mesh_ms=%.2f tri_count=%d", mesh_ms, tri_count)
-                    return mesh_payload, mesh, mesh_ms, mesh_backend_used, tri_count
+                    return mesh_payload, mesh, mesh_ms, mesh_backend_used, mesh_backend_reason, tri_count
                 finally:
                     cleanup_gpu_memory(reason="uploaded_mesh_ws_mesh_phase")
 
-            mesh_payload, mesh_np, mesh_ms, mesh_backend_used, tri_count = (
+            mesh_payload, mesh_np, mesh_ms, mesh_backend_used, mesh_backend_reason, tri_count = (
                 await asyncio.to_thread(_compute_mesh_phase)
             )
 
@@ -3521,6 +3564,7 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                 compute_backend=eval_backend_used,
                 mesh_backend=mesh_backend_used,
                 preview_mode="mesh",
+                fallback_reason=mesh_backend_reason,
             )
             uploaded_mesh_preview_cache.set(
                 cache_key,
