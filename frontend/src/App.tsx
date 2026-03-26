@@ -289,8 +289,47 @@ function resolutionForQuality(profile: QualityProfile): number {
   return 256;
 }
 
-function computeRequiredResolution(meshSpan: number, latticePitch: number, voxelsPerPeriod: number): number {
-  return Math.min(1024, Math.max(24, Math.ceil((meshSpan * 1.24 / latticePitch) * voxelsPerPeriod)));
+function capResolutionXYZ(
+  resolutionXYZ: [number, number, number],
+  maxTotalVoxels: number
+): [number, number, number] {
+  const current = resolutionXYZ[0] * resolutionXYZ[1] * resolutionXYZ[2];
+  if (current <= maxTotalVoxels) {
+    return resolutionXYZ;
+  }
+  const scale = Math.cbrt(maxTotalVoxels / current);
+  const dims = [
+    Math.max(24, Math.floor(resolutionXYZ[0] * scale)),
+    Math.max(24, Math.floor(resolutionXYZ[1] * scale)),
+    Math.max(24, Math.floor(resolutionXYZ[2] * scale))
+  ];
+  while (dims[0] * dims[1] * dims[2] > maxTotalVoxels) {
+    const maxIndex = dims[0] >= dims[1] && dims[0] >= dims[2] ? 0 : dims[1] >= dims[2] ? 1 : 2;
+    if (dims[maxIndex] <= 24) {
+      break;
+    }
+    dims[maxIndex] -= 1;
+  }
+  return [dims[0], dims[1], dims[2]];
+}
+
+function computeRequiredResolutionXYZ(
+  meshExtents: [number, number, number],
+  latticePitch: number,
+  voxelsPerPeriod: number
+): [number, number, number] {
+  const spacing = latticePitch / Math.max(voxelsPerPeriod, 1);
+  const padded = [
+    meshExtents[0] + 4.0 * latticePitch,
+    meshExtents[1] + 4.0 * latticePitch,
+    meshExtents[2] + 4.0 * latticePitch
+  ];
+  const raw: [number, number, number] = [
+    Math.max(24, Math.ceil(padded[0] / spacing) + 1),
+    Math.max(24, Math.ceil(padded[1] / spacing) + 1),
+    Math.max(24, Math.ceil(padded[2] / spacing) + 1)
+  ];
+  return capResolutionXYZ(raw, 1024 ** 3);
 }
 
 function computeMinShellThickness(latticePitch: number, voxelsPerPeriod: number): number {
@@ -308,11 +347,16 @@ function computeMinLatticeThickness(latticePitch: number, voxelsPerPeriod: numbe
 }
 
 function estimateRequiredBytes(
-  resolution: number,
+  resolutionXYZ: [number, number, number],
   bytesPerVoxel: number,
   safetyFactor: number
 ): number {
-  return Math.ceil((resolution ** 3) * bytesPerVoxel * safetyFactor);
+  const voxelCount = resolutionXYZ[0] * resolutionXYZ[1] * resolutionXYZ[2];
+  return Math.ceil(voxelCount * bytesPerVoxel * safetyFactor);
+}
+
+function formatResolutionXYZ(resolutionXYZ: [number, number, number]): string {
+  return `${resolutionXYZ[0]} x ${resolutionXYZ[1]} x ${resolutionXYZ[2]}`;
 }
 
 function bytesToGiB(value: number): string {
@@ -417,23 +461,27 @@ export default function App() {
     voxelsPerLatticePeriod
   ]);
 
-  const meshMemoryRisk = useMemo(() => {
+  const meshMemoryRisk = (() => {
     if (!meshMemoryContext) {
       return null;
     }
 
-    const resolution = computeRequiredResolution(
-      meshMemoryContext.meshSpan,
+    // Always derive the live estimate from the current controls.
+    // Backend resolution hints are useful for diagnostics, but they must not
+    // freeze the gate after the user changes pitch / sampling settings.
+    const resolutionXYZ = computeRequiredResolutionXYZ(
+      meshMemoryContext.meshExtents,
       meshLatticePitch,
       voxelsPerLatticePeriod
     );
+    const resolutionLabel = formatResolutionXYZ(resolutionXYZ);
     const requiredCpuBytes = estimateRequiredBytes(
-      resolution,
+      resolutionXYZ,
       meshMemoryContext.cpuBytesPerVoxel,
       meshMemoryContext.safetyFactor
     );
     const requiredGpuBytes = estimateRequiredBytes(
-      resolution,
+      resolutionXYZ,
       meshMemoryContext.gpuBytesPerVoxel,
       meshMemoryContext.safetyFactor
     );
@@ -450,7 +498,7 @@ export default function App() {
     let fatalMessage: string | null = null;
     if (fatal) {
       const parts = [
-        `Estimated memory exceeds available capacity for resolution ${resolution}.`,
+        `Estimated memory exceeds available capacity for resolution ${resolutionLabel}.`,
         `Required CPU: ${bytesToGiB(requiredCpuBytes)} (available: ${
           meshMemoryContext.availableCpuBytes != null
             ? bytesToGiB(meshMemoryContext.availableCpuBytes)
@@ -471,7 +519,7 @@ export default function App() {
     }
 
     return {
-      resolution,
+      resolutionXYZ,
       requiredCpuBytes,
       requiredGpuBytes,
       cpuFatal,
@@ -480,7 +528,7 @@ export default function App() {
       fatalMessage,
       gpuCheckEnabled
     };
-  }, [meshMemoryContext, meshLatticePitch, voxelsPerLatticePeriod, computeBackend]);
+  })();
 
   const minShellThickness = useMemo(
     () => computeMinShellThickness(meshLatticePitch, voxelsPerLatticePeriod),
@@ -661,7 +709,9 @@ export default function App() {
       try {
         const gridBounds = inferPreviewBounds(nextDiagnostics);
         const resolution = resolutionForQuality(quality);
-        const grid = gridBounds ? { bounds: gridBounds, resolution } : undefined;
+        const grid = gridBounds
+          ? { bounds: gridBounds, resolution_xyz: [resolution, resolution, resolution] as [number, number, number] }
+          : undefined;
 
         // Step 1: Evaluate the SDF field grid and display it as a ray-marched
         // volume while the mesh is being generated.
@@ -1469,8 +1519,8 @@ export default function App() {
                       {meshMemoryRisk ? (
                         <>
                           <p className="muted">
-                            Est. resolution for uploaded mesh: <strong>{meshMemoryRisk.resolution}³</strong>
-                            {meshMemoryRisk.resolution >= 1024 ? " (clamped to 1024³ max)" : ""}
+                            Est. resolution for uploaded mesh:{" "}
+                            <strong>{formatResolutionXYZ(meshMemoryRisk.resolutionXYZ)}</strong>
                           </p>
                           <p className="muted">
                             Est. required CPU memory: <strong>{bytesToMiB(meshMemoryRisk.requiredCpuBytes)}</strong>

@@ -58,7 +58,7 @@ function encodeBuffer(buffer: ArrayBuffer): string {
 const fieldPreviewPayload = {
   field: {
     encoding: "f32-base64",
-    resolution: 2,
+    resolution_xyz: [2, 2, 2],
     bounds: [
       [-1, 1],
       [-1, 1],
@@ -126,6 +126,8 @@ describe("App", () => {
       mesh: outerMeshPayload,
       memoryContext: {
         meshSpan: 1,
+        meshExtents: [1, 1, 1],
+        resolutionXYZ: [999, 999, 999],
         availableCpuBytes: 16 * 1024 * 1024 * 1024,
         availableGpuFreeBytes: 8 * 1024 * 1024 * 1024,
         availableGpuTotalBytes: 12 * 1024 * 1024 * 1024,
@@ -245,8 +247,8 @@ describe("App", () => {
     const meshCall = previewMesh.mock.calls[0];
     expect(fieldCall?.[2]).toBe("high");
     expect(meshCall?.[2]).toBe("high");
-    expect(fieldCall?.[6]).toMatchObject({ resolution: 192 });
-    expect(meshCall?.[8]).toMatchObject({ resolution: 192 });
+    expect(fieldCall?.[6]).toMatchObject({ resolution_xyz: [192, 192, 192] });
+    expect(meshCall?.[8]).toMatchObject({ resolution_xyz: [192, 192, 192] });
   });
 
   it("sends selected quality, precision, and backends only on Generate Shape", async () => {
@@ -271,13 +273,13 @@ describe("App", () => {
     expect(fieldCall?.[2]).toBe("ultra");
     expect(fieldCall?.[3]).toBe("float16");
     expect(fieldCall?.[4]).toBe("cuda");
-    expect(fieldCall?.[6]).toMatchObject({ resolution: 256 });
+    expect(fieldCall?.[6]).toMatchObject({ resolution_xyz: [256, 256, 256] });
     expect(meshCall?.[2]).toBe("ultra");
     expect(meshCall?.[3]).toBe("float16");
     expect(meshCall?.[4]).toBe("cuda");
     expect(meshCall?.[5]).toBe("cuda");
     expect(meshCall?.[6]).toBe("adaptive");
-    expect(meshCall?.[8]).toMatchObject({ resolution: 256 });
+    expect(meshCall?.[8]).toMatchObject({ resolution_xyz: [256, 256, 256] });
   });
 
   it("does not auto-rerun preview when quality/backend settings change", async () => {
@@ -436,6 +438,7 @@ describe("App", () => {
       mesh: outerMeshPayload,
       memoryContext: {
         meshSpan: 50,
+        meshExtents: [50, 50, 50],
         availableCpuBytes: 256 * 1024 * 1024,
         availableGpuFreeBytes: 256 * 1024 * 1024,
         availableGpuTotalBytes: 1024 * 1024 * 1024,
@@ -462,6 +465,8 @@ describe("App", () => {
       mesh: outerMeshPayload,
       memoryContext: {
         meshSpan: 50,
+        meshExtents: [50, 50, 50],
+        resolutionXYZ: [999, 999, 999],
         availableCpuBytes: 256 * 1024 * 1024,
         availableGpuFreeBytes: 256 * 1024 * 1024,
         availableGpuTotalBytes: 1024 * 1024 * 1024,
@@ -491,6 +496,43 @@ describe("App", () => {
       expect(previewUploadedMeshField).toHaveBeenCalledTimes(1);
     });
     expect(commitButton).not.toBeDisabled();
+  });
+
+  it("uses anisotropic resolution for memory compatibility checks before enabling Generate Field", async () => {
+    preprocessUploadedMesh.mockResolvedValueOnce({
+      mesh: outerMeshPayload,
+      memoryContext: {
+        meshSpan: 50,
+        meshExtents: [50, 10, 5],
+        resolutionXYZ: [999, 999, 999],
+        availableCpuBytes: 512 * 1024 * 1024,
+        availableGpuFreeBytes: 512 * 1024 * 1024,
+        availableGpuTotalBytes: 1024 * 1024 * 1024,
+        cpuBytesPerVoxel: 32,
+        gpuBytesPerVoxel: 40,
+        safetyFactor: 1.25
+      }
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "Lattice Infill" }));
+    const file = new File(["v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"], "test.obj", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Lattice infill file upload"), { target: { files: [file] } });
+    fireEvent.change(screen.getByLabelText("Unit cell size (mm)"), { target: { value: "0.5" } });
+
+    await waitFor(() => {
+      expect(screen.getByText(/625 x 145 x 85/i)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/Estimated memory exceeds available capacity/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Generate Field" })).not.toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("Unit cell size (mm)"), { target: { value: "20" } });
+
+    await waitFor(() => {
+      expect(screen.getByText(/40 x 28 x 27/i)).toBeInTheDocument();
+    });
+    expect(preprocessUploadedMesh).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Generate Field" })).not.toBeDisabled();
   });
 
   it("runs uploaded field preview immediately when Generate Field is clicked", async () => {

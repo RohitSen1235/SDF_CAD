@@ -32,11 +32,12 @@ def _measure_host_phase(
     field_storage_mode: str,
     runs: int,
 ) -> tuple[float, str]:
+    resolution_xyz = (quality_resolution, quality_resolution, quality_resolution)
     best_ms = float("inf")
     final_storage = "dense"
     for _ in range(max(1, runs)):
         host_start = time.perf_counter()
-        host = build_host_field(mesh, resolution=quality_resolution, field_storage_mode=field_storage_mode)
+        host = build_host_field(mesh, resolution_xyz=resolution_xyz, field_storage_mode=field_storage_mode)
         host_ms = (time.perf_counter() - host_start) * 1000.0
         if host_ms < best_ms:
             best_ms = host_ms
@@ -69,10 +70,10 @@ def _run_case(
     if assert_auto_ratio is not None and auto_ratio > assert_auto_ratio:
         raise SystemExit(
             f"Acceptance failed for {label}: auto/dense host ratio {auto_ratio:.3f} exceeded {assert_auto_ratio:.3f}"
-        )
+    )
 
     host_start = time.perf_counter()
-    host = build_host_field(mesh, resolution=quality_resolution)
+    host = build_host_field(mesh, resolution_xyz=(quality_resolution, quality_resolution, quality_resolution))
     host_ms = (time.perf_counter() - host_start) * 1000.0
 
     field_start = time.perf_counter()

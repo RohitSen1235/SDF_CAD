@@ -120,6 +120,66 @@ function parseBoundsHeader(response: Response): [[number, number], [number, numb
   }
 }
 
+function parseResolutionXYZHeader(response: Response): [number, number, number] {
+  const raw = response.headers.get("X-SDF-Resolution-XYZ");
+  if (!raw) {
+    throw new Error("Missing X-SDF-Resolution-XYZ response header");
+  }
+  const parts = raw.split(",").map((part) => Number(part.trim()));
+  if (
+    parts.length !== 3 ||
+    !Number.isFinite(parts[0]) ||
+    !Number.isFinite(parts[1]) ||
+    !Number.isFinite(parts[2]) ||
+    parts[0] <= 0 ||
+    parts[1] <= 0 ||
+    parts[2] <= 0
+  ) {
+    throw new Error("Invalid X-SDF-Resolution-XYZ response header");
+  }
+  return [parts[0], parts[1], parts[2]];
+}
+
+function parseOptionalResolutionXYZHeader(response: Response): [number, number, number] | null {
+  const raw = response.headers.get("X-SDF-Resolution-XYZ");
+  if (!raw || raw.trim() === "") {
+    return null;
+  }
+  const parts = raw.split(",").map((part) => Number(part.trim()));
+  if (
+    parts.length !== 3 ||
+    !Number.isFinite(parts[0]) ||
+    !Number.isFinite(parts[1]) ||
+    !Number.isFinite(parts[2]) ||
+    parts[0] <= 0 ||
+    parts[1] <= 0 ||
+    parts[2] <= 0
+  ) {
+    return null;
+  }
+  return [parts[0], parts[1], parts[2]];
+}
+
+function parseMeshExtentsHeader(response: Response): [number, number, number] | null {
+  const raw = response.headers.get("X-SDF-Mesh-Extents");
+  if (!raw || raw.trim() === "") {
+    return null;
+  }
+  const parts = raw.split(",").map((part) => Number(part.trim()));
+  if (
+    parts.length !== 3 ||
+    !Number.isFinite(parts[0]) ||
+    !Number.isFinite(parts[1]) ||
+    !Number.isFinite(parts[2]) ||
+    parts[0] <= 0 ||
+    parts[1] <= 0 ||
+    parts[2] <= 0
+  ) {
+    return null;
+  }
+  return [parts[0], parts[1], parts[2]];
+}
+
 function parseTraceIdHeader(response: Response): string | null {
   const raw = response.headers.get("X-SDF-Trace-Id");
   if (!raw) {
@@ -143,11 +203,14 @@ function parseOptionalNumericHeader(response: Response, name: string): number | 
 
 function parseUploadedMeshMemoryContext(response: Response): UploadedMeshMemoryContext | null {
   const meshSpan = parseOptionalNumericHeader(response, "X-SDF-Mesh-Span");
+  const meshExtents = parseMeshExtentsHeader(response);
+  const resolutionXYZ = parseOptionalResolutionXYZHeader(response);
   const cpuBytesPerVoxel = parseOptionalNumericHeader(response, "X-SDF-CPU-Bytes-Per-Voxel");
   const gpuBytesPerVoxel = parseOptionalNumericHeader(response, "X-SDF-GPU-Bytes-Per-Voxel");
   const safetyFactor = parseOptionalNumericHeader(response, "X-SDF-Memory-Safety-Factor");
   if (
     meshSpan == null ||
+    meshExtents == null ||
     cpuBytesPerVoxel == null ||
     gpuBytesPerVoxel == null ||
     safetyFactor == null
@@ -156,6 +219,8 @@ function parseUploadedMeshMemoryContext(response: Response): UploadedMeshMemoryC
   }
   return {
     meshSpan,
+    meshExtents,
+    resolutionXYZ,
     availableCpuBytes: parseOptionalNumericHeader(response, "X-SDF-Available-CPU-Bytes"),
     availableGpuFreeBytes: parseOptionalNumericHeader(response, "X-SDF-Available-GPU-Free-Bytes"),
     availableGpuTotalBytes: parseOptionalNumericHeader(response, "X-SDF-Available-GPU-Total-Bytes"),
@@ -204,17 +269,17 @@ export function decodeBinaryMeshPacket(buffer: ArrayBuffer): MeshPayloadBinary {
 
 function decodeBinaryFieldPayload(
   buffer: ArrayBuffer,
-  resolution: number,
+  resolutionXYZ: [number, number, number],
   bounds: [[number, number], [number, number], [number, number]]
 ): FieldPayloadBinary {
   const values = new Float32Array(buffer.slice(0));
-  const expected = resolution * resolution * resolution;
+  const expected = resolutionXYZ[0] * resolutionXYZ[1] * resolutionXYZ[2];
   if (values.length !== expected) {
     throw new Error("Binary field payload size mismatch");
   }
   return {
     encoding: "f32-binary-v1",
-    resolution,
+    resolution_xyz: resolutionXYZ,
     bounds,
     data: values
   };
@@ -222,18 +287,18 @@ function decodeBinaryFieldPayload(
 
 function decodeBinaryUploadedFieldPayload(
   buffer: ArrayBuffer,
-  resolution: number,
+  resolutionXYZ: [number, number, number],
   bounds: [[number, number], [number, number], [number, number]]
 ): { field: FieldPayloadBinary; hostField: FieldPayloadBinary | null } {
-  const expectedFloats = resolution * resolution * resolution;
+  const expectedFloats = resolutionXYZ[0] * resolutionXYZ[1] * resolutionXYZ[2];
   const expectedBytes = expectedFloats * Float32Array.BYTES_PER_ELEMENT;
   if (buffer.byteLength !== expectedBytes && buffer.byteLength !== expectedBytes * 2) {
     throw new Error("Binary uploaded field payload size mismatch");
   }
 
   const hasHostField = buffer.byteLength === expectedBytes * 2;
-  const hostField = hasHostField ? decodeBinaryFieldPayload(buffer.slice(0, expectedBytes), resolution, bounds) : null;
-  const field = decodeBinaryFieldPayload(buffer.slice(hasHostField ? expectedBytes : 0), resolution, bounds);
+  const hostField = hasHostField ? decodeBinaryFieldPayload(buffer.slice(0, expectedBytes), resolutionXYZ, bounds) : null;
+  const field = decodeBinaryFieldPayload(buffer.slice(hasHostField ? expectedBytes : 0), resolutionXYZ, bounds);
   return { field, hostField };
 }
 
@@ -343,15 +408,11 @@ export async function previewField(
     });
     if (response.ok) {
       const stats = parseStatsHeader(response);
-      const resolutionRaw = response.headers.get("X-SDF-Resolution");
-      const resolution = resolutionRaw ? Number(resolutionRaw) : NaN;
-      if (!Number.isFinite(resolution) || resolution <= 0) {
-        throw new Error("Missing or invalid X-SDF-Resolution response header");
-      }
+      const resolutionXYZ = parseResolutionXYZHeader(response);
       const bounds = parseBoundsHeader(response);
       const packet = await response.arrayBuffer();
       return {
-        field: decodeBinaryFieldPayload(packet, resolution, bounds),
+        field: decodeBinaryFieldPayload(packet, resolutionXYZ, bounds),
         stats
       };
     }
@@ -598,16 +659,12 @@ export async function previewUploadedMeshField(
     if (response.ok) {
       const headersReceivedAt = performance.now();
       const stats = parseStatsHeader(response);
-      const resolutionRaw = response.headers.get("X-SDF-Resolution");
-      const resolution = resolutionRaw ? Number(resolutionRaw) : NaN;
-      if (!Number.isFinite(resolution) || resolution <= 0) {
-        throw new Error("Missing or invalid X-SDF-Resolution response header");
-      }
+      const resolutionXYZ = parseResolutionXYZHeader(response);
       const bounds = parseBoundsHeader(response);
       const traceId = parseTraceIdHeader(response);
       const packet = await response.arrayBuffer();
       const arrayBufferDoneAt = performance.now();
-      const { field, hostField } = decodeBinaryUploadedFieldPayload(packet, resolution, bounds);
+      const { field, hostField } = decodeBinaryUploadedFieldPayload(packet, resolutionXYZ, bounds);
       const decodeDoneAt = performance.now();
       return {
         field,

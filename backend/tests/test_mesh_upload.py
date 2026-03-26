@@ -159,26 +159,55 @@ def test_numba_rasterization_topology_equivalent_to_python() -> None:
 
     mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
     bounds = mesh_upload._build_bounds(mesh)
-    resolution = 48
+    resolution_xyz = (48, 40, 32)
     mins = np.asarray([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
     scales = np.asarray(
         [
-            (resolution - 1) / (bounds[0][1] - bounds[0][0]),
-            (resolution - 1) / (bounds[1][1] - bounds[1][0]),
-            (resolution - 1) / (bounds[2][1] - bounds[2][0]),
+            (resolution_xyz[0] - 1) / (bounds[0][1] - bounds[0][0]),
+            (resolution_xyz[1] - 1) / (bounds[1][1] - bounds[1][0]),
+            (resolution_xyz[2] - 1) / (bounds[2][1] - bounds[2][0]),
         ],
         dtype=np.float64,
     )
     verts_grid = np.ascontiguousarray((mesh.vertices - mins) * scales, dtype=np.float64)
     faces = np.ascontiguousarray(mesh.faces, dtype=np.int32)
 
-    py_surface = mesh_upload._rasterize_surface_python(verts_grid, faces, resolution).astype(bool)
-    nb_surface = mesh_upload._rasterize_surface_numba(verts_grid, faces, resolution).astype(bool)
+    py_surface = mesh_upload._rasterize_surface_python(
+        verts_grid,
+        faces,
+        resolution_xyz,
+    ).astype(bool)
+    nb_surface = mesh_upload._rasterize_surface_numba(verts_grid, faces, resolution_xyz).astype(bool)
     union = np.logical_or(py_surface, nb_surface)
     if not np.any(union):
         raise AssertionError("Expected non-empty rasterized surface for comparison")
     overlap = float(np.count_nonzero(np.logical_and(py_surface, nb_surface))) / float(np.count_nonzero(union))
     assert overlap >= 0.995
+
+
+def test_voxelize_uses_numba_for_anisotropic_grid(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not mesh_upload.NUMBA_AVAILABLE:
+        pytest.skip("Numba is not available in this environment")
+
+    mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
+    bounds = mesh_upload._build_bounds(mesh)
+    called = {"numba": False}
+
+    def track_numba(verts_grid: np.ndarray, faces: np.ndarray, resolution_xyz: tuple[int, int, int]) -> np.ndarray:
+        called["numba"] = True
+        surface = np.zeros(resolution_xyz, dtype=np.uint8)
+        surface[10:14, 9:13, 8:12] = 1
+        return surface
+
+    monkeypatch.setattr(mesh_upload, "_rasterize_surface_numba", track_numba)
+    monkeypatch.setattr(mesh_upload, "_dilate_close_and_fill", lambda surface, closing_iterations=1: (surface, None))
+    monkeypatch.setattr(mesh_upload, "NUMBA_AVAILABLE", True)
+
+    filled, _ = mesh_upload._voxelize_and_fill(mesh, bounds, (36, 28, 24))
+    assert called["numba"] is True
+    assert filled.shape == (36, 28, 24)
+    assert filled.dtype == bool
+    assert np.count_nonzero(filled) > 0
 
 
 def test_voxelize_falls_back_when_numba_kernel_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -187,18 +216,18 @@ def test_voxelize_falls_back_when_numba_kernel_fails(monkeypatch: pytest.MonkeyP
     called = {"python": False}
     python_impl = mesh_upload._rasterize_surface_python
 
-    def fail_numba(_verts_grid: np.ndarray, _faces: np.ndarray, _resolution: int) -> np.ndarray:
+    def fail_numba(_verts_grid: np.ndarray, _faces: np.ndarray, _resolution_xyz: tuple[int, int, int]) -> np.ndarray:
         raise RuntimeError("numba failure")
 
-    def track_python(verts_grid: np.ndarray, faces: np.ndarray, resolution: int) -> np.ndarray:
+    def track_python(verts_grid: np.ndarray, faces: np.ndarray, resolution_xyz: tuple[int, int, int]) -> np.ndarray:
         called["python"] = True
-        return python_impl(verts_grid, faces, resolution)
+        return python_impl(verts_grid, faces, resolution_xyz)
 
     monkeypatch.setattr(mesh_upload, "_rasterize_surface_numba", fail_numba)
     monkeypatch.setattr(mesh_upload, "_rasterize_surface_python", track_python)
     monkeypatch.setattr(mesh_upload, "NUMBA_AVAILABLE", True)
 
-    filled = mesh_upload._voxelize_and_fill(mesh, bounds, resolution=40)
+    filled, _ = mesh_upload._voxelize_and_fill(mesh, bounds, (40, 32, 24))
     assert called["python"] is True
     assert np.any(filled)
 
@@ -215,7 +244,7 @@ def test_voxelize_cpu_fill_recovers_hollow_interior(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(mesh_upload, "CUPYX_AVAILABLE", False)
     monkeypatch.setattr(mesh_upload, "_rasterize_surface_python", lambda *_args, **_kwargs: synthetic)
 
-    filled = mesh_upload._voxelize_and_fill(mesh, bounds, resolution=resolution)
+    filled, _ = mesh_upload._voxelize_and_fill(mesh, bounds, (resolution, resolution, resolution))
 
     assert filled.dtype == bool
     assert filled.shape == synthetic.shape
@@ -225,8 +254,8 @@ def test_voxelize_cpu_fill_recovers_hollow_interior(monkeypatch: pytest.MonkeyPa
 
 def test_build_host_field_defaults_to_dense_host_sdf_metadata() -> None:
     mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
-    host = mesh_upload.build_host_field(mesh, resolution=48)
-    assert host.host_sdf.shape == (48, 48, 48)
+    host = mesh_upload.build_host_field(mesh, resolution_xyz=(48, 40, 32))
+    assert host.host_sdf.shape == (48, 40, 32)
     assert host.host_sdf.dtype == np.float32
     assert host.block_size is None
     assert host.active_blocks is None
@@ -242,7 +271,7 @@ def test_octree_sparse_host_sdf_returns_active_blocks_for_large_sparse_volume() 
         None,
         occupancy,
         bounds,
-        resolution,
+        (resolution, resolution, resolution),
     )
 
     assert host_sdf.shape == (resolution, resolution, resolution)
@@ -260,12 +289,12 @@ def test_octree_sparse_host_sdf_scan_conversion_matches_cube_face_distance() -> 
     mesh = parse_mesh_bytes(_cube_obj_bytes(), ".obj")
     bounds = [[-2.0, 3.0], [-2.0, 3.0], [-2.0, 3.0]]
     resolution = 128
-    occupancy = mesh_upload._voxelize_and_fill(mesh, bounds, resolution)
+    occupancy, _ = mesh_upload._voxelize_and_fill(mesh, bounds, (resolution, resolution, resolution))
     host_sdf, block_size, active_blocks, sparse_background_value, decision_reason, host_backend = mesh_upload._build_host_sdf_octree_sparse(
         mesh,
         occupancy,
         bounds,
-        resolution,
+        (resolution, resolution, resolution),
     )
 
     x_axis = np.linspace(bounds[0][0], bounds[0][1], resolution, dtype=np.float64)
@@ -279,7 +308,7 @@ def test_octree_sparse_host_sdf_scan_conversion_matches_cube_face_distance() -> 
 
     inside_point = np.array([x_axis[ix_inside], y_axis[iy], z_axis[iz]], dtype=np.float64)
     outside_point = np.array([x_axis[ix_outside], y_axis[iy], z_axis[iz]], dtype=np.float64)
-    spacing = float(np.max(mesh_upload._bounds_spacing(bounds, resolution)))
+    spacing = float(np.max(mesh_upload._bounds_spacing(bounds, (resolution, resolution, resolution))))
 
     expected_inside = -(1.0 - inside_point[0])
     expected_outside = outside_point[0] - 1.0
@@ -359,7 +388,7 @@ def test_octree_sparse_host_sdf_uses_thread_pool_for_block_refinement(
             mesh,
             occupancy,
             bounds,
-            resolution,
+            (resolution, resolution, resolution),
         )
     )
 
@@ -384,7 +413,7 @@ def test_build_host_field_auto_short_circuits_before_triangle_candidate_work(mon
 
     monkeypatch.setattr(mesh_upload, "_triangle_scan_convert_candidates", fail_if_called)
 
-    host = mesh_upload.build_host_field(mesh, resolution=128, field_storage_mode="auto")
+    host = mesh_upload.build_host_field(mesh, resolution_xyz=(128, 128, 128), field_storage_mode="auto")
 
     assert called["candidates"] == 0
     assert host.field_storage_mode == "dense"
@@ -410,7 +439,7 @@ def test_build_host_field_explicit_sparse_attempts_scan_conversion_even_when_aut
         lambda *_args, **_kwargs: (False, "dense_auto_gate_near_ratio", 1.0, 10_000_000, 9999.0),
     )
 
-    host = mesh_upload.build_host_field(mesh, resolution=128, field_storage_mode="octree_sparse")
+    host = mesh_upload.build_host_field(mesh, resolution_xyz=(128, 128, 128), field_storage_mode="octree_sparse")
 
     assert called["candidates"] > 0
     assert host.host_decision_reason.startswith("sparse_selected") or host.host_decision_reason.startswith("dense_sparse")
@@ -424,10 +453,10 @@ def test_build_host_field_populates_sparse_metadata_when_sparse_path_is_used(
     synthetic = np.zeros((resolution, resolution, resolution), dtype=bool)
     synthetic[56:72, 56:72, 56:72] = True
 
-    monkeypatch.setattr(mesh_upload, "_voxelize_and_fill", lambda *_args, **_kwargs: synthetic)
+    monkeypatch.setattr(mesh_upload, "_voxelize_and_fill", lambda *_args, **_kwargs: (synthetic, None))
     monkeypatch.setattr(mesh_upload, "_build_bounds", lambda *_args, **_kwargs: [[-2.0, 3.0], [-2.0, 3.0], [-2.0, 3.0]])
 
-    host = mesh_upload.build_host_field(mesh, resolution=resolution)
+    host = mesh_upload.build_host_field(mesh, resolution_xyz=(resolution, resolution, resolution))
 
     assert host.host_sdf.shape == (resolution, resolution, resolution)
     assert host.block_size is not None
@@ -439,7 +468,7 @@ def test_build_host_field_populates_sparse_metadata_when_sparse_path_is_used(
 
 def test_build_host_field_supports_explicit_dense_mode() -> None:
     mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
-    host = mesh_upload.build_host_field(mesh, resolution=96, field_storage_mode="dense")
+    host = mesh_upload.build_host_field(mesh, resolution_xyz=(96, 96, 96), field_storage_mode="dense")
     assert host.host_sdf.dtype == np.float32
     assert host.field_storage_mode == "dense"
     assert host.block_size is None
@@ -452,8 +481,8 @@ def test_build_host_field_reports_gpu_backend_when_cuda_dense_path_is_selected(
 ) -> None:
     mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
     bounds = mesh_upload._build_bounds(mesh)
-    occupancy = mesh_upload._voxelize_and_fill(mesh, bounds, resolution=48)
-    cpu_baseline = mesh_upload._build_host_sdf_dense_cpu(occupancy, bounds, 48)
+    occupancy, _ = mesh_upload._voxelize_and_fill(mesh, bounds, (48, 48, 48))
+    cpu_baseline = mesh_upload._build_host_sdf_dense_cpu(occupancy, bounds, (48, 48, 48))
 
     monkeypatch.setattr(mesh_upload, "_resolve_compute_backend", lambda _requested: "cuda")
     monkeypatch.setattr(
@@ -464,7 +493,7 @@ def test_build_host_field_reports_gpu_backend_when_cuda_dense_path_is_selected(
 
     host = mesh_upload.build_host_field(
         mesh,
-        resolution=48,
+        resolution_xyz=(48, 48, 48),
         compute_backend="cuda",
         field_storage_mode="dense",
     )
@@ -481,8 +510,8 @@ def test_build_host_field_reports_cpu_backend_when_cuda_dense_path_falls_back(
 ) -> None:
     mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
     bounds = mesh_upload._build_bounds(mesh)
-    occupancy = mesh_upload._voxelize_and_fill(mesh, bounds, resolution=48)
-    cpu_baseline = mesh_upload._build_host_sdf_dense_cpu(occupancy, bounds, 48)
+    occupancy, _ = mesh_upload._voxelize_and_fill(mesh, bounds, (48, 48, 48))
+    cpu_baseline = mesh_upload._build_host_sdf_dense_cpu(occupancy, bounds, (48, 48, 48))
 
     monkeypatch.setattr(mesh_upload, "_resolve_compute_backend", lambda _requested: "cuda")
 
@@ -497,7 +526,7 @@ def test_build_host_field_reports_cpu_backend_when_cuda_dense_path_falls_back(
 
     host = mesh_upload.build_host_field(
         mesh,
-        resolution=48,
+        resolution_xyz=(48, 48, 48),
         compute_backend="cuda",
         field_storage_mode="dense",
     )
@@ -520,15 +549,16 @@ def test_uploaded_host_field_threads_compute_backend_to_builder(
 
     def fake_build_host_field(
         parsed,
-        resolution: int,
+        resolution_xyz: tuple[int, int, int],
         compute_backend: str = "auto",
         field_storage_mode: str = "auto",
     ):
         observed["compute_backend"] = compute_backend
+        nx, ny, nz = resolution_xyz
         return SimpleNamespace(
             mesh=parsed,
             bounds=[[-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0]],
-            host_sdf=np.zeros((resolution, resolution, resolution), dtype=np.float32),
+            host_sdf=np.zeros((nx, ny, nz), dtype=np.float32),
             host_compute_backend="cuda",
             field_storage_mode="dense",
             block_size=None,
@@ -549,7 +579,8 @@ def test_uploaded_host_field_threads_compute_backend_to_builder(
         file_bytes=_tetra_obj_bytes(),
         file_hash=hashlib.sha256(_tetra_obj_bytes()).hexdigest(),
         extension=".obj",
-        resolution=48,
+        resolution_xyz=(48, 48, 48),
+        lattice_pitch=0.45,
         compute_backend="cuda",
         parsed=mesh,
         field_storage_mode="dense",
@@ -662,7 +693,7 @@ def _legacy_compose_field(
 
 def test_uploaded_compose_normalizes_to_float32_and_preserves_mesh_parity() -> None:
     mesh = parse_mesh_bytes(_tetra_obj_bytes(), ".obj")
-    host = mesh_upload.build_host_field(mesh, resolution=48, field_storage_mode="dense")
+    host = mesh_upload.build_host_field(mesh, resolution_xyz=(48, 48, 48), field_storage_mode="dense")
 
     field = mesh_upload.compose_hollow_lattice_field(
         host.host_sdf,
@@ -683,7 +714,13 @@ def test_uploaded_compose_normalizes_to_float32_and_preserves_mesh_parity() -> N
         lattice_phase=0.0,
     )
 
-    spacing = np.array(mesh_upload._bounds_spacing(host.bounds, int(field.shape[0])), dtype=np.float64)
+    spacing = np.array(
+        mesh_upload._bounds_spacing(
+            host.bounds,
+            (int(field.shape[0]), int(field.shape[1]), int(field.shape[2])),
+        ),
+        dtype=np.float64,
+    )
     max_spacing = float(np.max(spacing))
 
     assert field.dtype == np.float32

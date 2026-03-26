@@ -55,13 +55,20 @@ from .evaluator import (
     evaluate_scene_field_with_backend,
     merge_parameter_values,
 )
+from .grid_shape import (
+    ResolutionXYZ,
+    compute_uploaded_mesh_resolution_xyz,
+    normalize_resolution_xyz,
+    parse_resolution_xyz_header,
+    spacing_from_bounds,
+    voxel_count,
+)
 from .mesh_upload import (
     MeshUploadError,
     ParsedMesh,
     build_host_field,
     compose_hollow_lattice_field_sparse_with_backend,
     compose_hollow_lattice_field_with_backend,
-    compute_resolution_for_lattice_pitch,
     parse_mesh_bytes,
     validate_triangle_mesh,
     _log_host_field_backend,
@@ -155,11 +162,10 @@ QUALITY_TO_RESOLUTION: dict[QualityProfile, int] = {
     "high": 192,
     "ultra": 256,
 }
-# Hard cap for mesh-upload voxel grids. 1024^3 at float32 = 4 GB.
-# The tiered upload policy will never exceed this value.
-MESH_UPLOAD_MAX_RESOLUTION = 1024
+# Hard cap for mesh-upload voxel grids. 1024^3 at float32 ~= 4 GiB field payload.
+MESH_UPLOAD_MAX_TOTAL_VOXELS = 1024**3
 MESH_UPLOAD_MAX_BYTES = 200 * 1024 * 1024
-AUTO_QUEUE_RESOLUTION_THRESHOLD = 128
+AUTO_QUEUE_TOTAL_VOXELS_THRESHOLD = 128**3
 AUTO_QUEUE_UPLOAD_BYTES_THRESHOLD = 8 * 1024 * 1024
 MEMORY_MODEL_CPU_BYTES_PER_VOXEL = 48.0
 MEMORY_MODEL_GPU_BYTES_PER_VOXEL = 56.0
@@ -178,12 +184,13 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=[
         "X-SDF-Stats",
-        "X-SDF-Resolution",
+        "X-SDF-Resolution-XYZ",
         "X-SDF-Bounds",
         "X-SDF-Vertex-Count",
         "X-SDF-Face-Count",
         "X-SDF-Trace-Id",
         "X-SDF-Mesh-Span",
+        "X-SDF-Mesh-Extents",
         "X-SDF-Available-CPU-Bytes",
         "X-SDF-Available-GPU-Free-Bytes",
         "X-SDF-Available-GPU-Total-Bytes",
@@ -218,29 +225,33 @@ async def compile_scene(payload: CompileSceneRequest) -> CompileSceneResponse:
 def _resolve_grid(grid: GridConfig | None, quality_profile: QualityProfile) -> GridConfig:
     if grid is not None:
         return grid
-    return GridConfig(resolution=QUALITY_TO_RESOLUTION[quality_profile])
+    base_resolution = QUALITY_TO_RESOLUTION[quality_profile]
+    return GridConfig(resolution_xyz=[base_resolution, base_resolution, base_resolution])
 
 
-def _resolve_mesh_resolution(
+def _resolve_mesh_resolution_xyz(
     _lattice_pitch: float,
-    mesh_span: float,
+    mesh_extents: tuple[float, float, float],
     _voxels_per_lattice_period: int = 6,
-) -> tuple[int, bool]:
+) -> tuple[ResolutionXYZ, bool]:
     """Resolve the uploaded mesh grid from lattice requirements."""
-    needed = compute_resolution_for_lattice_pitch(
-        mesh_span,
+    needed, clamped = compute_uploaded_mesh_resolution_xyz(
+        mesh_extents,
         _lattice_pitch,
         _voxels_per_lattice_period,
+        max_total_voxels=MESH_UPLOAD_MAX_TOTAL_VOXELS,
+        min_axis_resolution=24,
     )
-    if needed > MESH_UPLOAD_MAX_RESOLUTION:
+    if clamped:
         logger.warning(
-            "Computed mesh resolution %d exceeds hard cap %d; clamping. "
+            "Computed mesh resolution %dx%dx%d exceeded hard cap (%d total voxels); clamping. "
             "Consider increasing lattice_pitch or reducing voxels_per_lattice_period.",
-            needed,
-            MESH_UPLOAD_MAX_RESOLUTION,
+            needed[0],
+            needed[1],
+            needed[2],
+            MESH_UPLOAD_MAX_TOTAL_VOXELS,
         )
-        return MESH_UPLOAD_MAX_RESOLUTION, True
-    return needed, False
+    return needed, clamped
 
 
 def _meshdata_from_parsed(parsed) -> MeshData:
@@ -269,12 +280,14 @@ class UploadedMeshMetadata:
     parsed: ParsedMesh
     outer_mesh: MeshData
     mesh_span: float
+    mesh_extents: tuple[float, float, float]
     cache_hit: bool
 
 
 @dataclass(frozen=True)
 class UploadedMeshMemoryContext:
     mesh_span: float
+    mesh_extents: tuple[float, float, float]
     available_cpu_bytes: int | None
     available_gpu_free_bytes: int | None
     available_gpu_total_bytes: int | None
@@ -286,7 +299,7 @@ class UploadedMeshMemoryContext:
 @dataclass(frozen=True)
 class UploadedMeshMemoryEstimate:
     context: UploadedMeshMemoryContext
-    resolution: int
+    resolution_xyz: ResolutionXYZ
     required_cpu_bytes: int
     required_gpu_bytes: int
     cpu_fatal: bool
@@ -313,7 +326,7 @@ class UploadedHostFieldResult:
 @dataclass(frozen=True)
 class UploadedComposedFieldResult:
     parsed: ParsedMesh
-    resolution: int
+    resolution_xyz: ResolutionXYZ
     bounds: list[list[float]]
     host_sdf: np.ndarray
     sparse_block_size: int | None
@@ -329,7 +342,7 @@ class UploadedFieldPreviewServerAudit:
     metadata_cache_hit: bool
     host_cache_hit: bool
     field_cache_hit: bool
-    resolution: int
+    resolution_xyz: ResolutionXYZ
     voxel_count: int
     payload_bytes: int
     compute_backend: Literal["cpu", "cuda"]
@@ -369,7 +382,7 @@ def _log_uploaded_field_preview_server_trace(
                 f"trace_id={trace_id}",
                 f"route={route}",
                 f"extension={extension}",
-                f"resolution={audit.resolution}",
+                f"resolution_xyz={audit.resolution_xyz[0]}x{audit.resolution_xyz[1]}x{audit.resolution_xyz[2]}",
                 f"voxel_count={audit.voxel_count}",
                 f"payload_bytes={audit.payload_bytes}",
                 f"compute_backend={audit.compute_backend}",
@@ -399,7 +412,11 @@ def _log_uploaded_field_preview_consolidated_trace(entry: UploadedFieldPreviewTr
                 f"trace_id={entry.trace_id}",
                 f"route={entry.route}",
                 f"extension={entry.extension}",
-                f"resolution={entry.resolution}",
+                (
+                    f"resolution_xyz={entry.resolution_xyz[0]}x{entry.resolution_xyz[1]}x{entry.resolution_xyz[2]}"
+                    if entry.resolution_xyz is not None
+                    else "resolution_xyz=None"
+                ),
                 f"voxel_count={entry.voxel_count}",
                 f"payload_bytes={entry.payload_bytes}",
                 f"compute_backend={entry.compute_backend}",
@@ -441,7 +458,7 @@ def _record_uploaded_field_preview_server_trace(
             created_at=time.time(),
             route=route,
             extension=extension,
-            resolution=audit.resolution,
+            resolution_xyz=[int(v) for v in audit.resolution_xyz],
             voxel_count=audit.voxel_count,
             payload_bytes=audit.payload_bytes,
             compute_backend=audit.compute_backend,
@@ -468,21 +485,21 @@ def _sample_field_trilinear(
     bounds: list[list[float]],
     points: np.ndarray,
 ) -> np.ndarray:
-    resolution = field.shape[0]
-    dx = (bounds[0][1] - bounds[0][0]) / float(resolution - 1)
-    dy = (bounds[1][1] - bounds[1][0]) / float(resolution - 1)
-    dz = (bounds[2][1] - bounds[2][0]) / float(resolution - 1)
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
+    dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
+    dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
 
-    tx = np.clip((points[:, 0] - bounds[0][0]) / dx, 0.0, resolution - 1.000001)
-    ty = np.clip((points[:, 1] - bounds[1][0]) / dy, 0.0, resolution - 1.000001)
-    tz = np.clip((points[:, 2] - bounds[2][0]) / dz, 0.0, resolution - 1.000001)
+    tx = np.clip((points[:, 0] - bounds[0][0]) / dx, 0.0, nx - 1.000001)
+    ty = np.clip((points[:, 1] - bounds[1][0]) / dy, 0.0, ny - 1.000001)
+    tz = np.clip((points[:, 2] - bounds[2][0]) / dz, 0.0, nz - 1.000001)
 
     x0 = np.floor(tx).astype(np.int32)
     y0 = np.floor(ty).astype(np.int32)
     z0 = np.floor(tz).astype(np.int32)
-    x1 = np.minimum(x0 + 1, resolution - 1)
-    y1 = np.minimum(y0 + 1, resolution - 1)
-    z1 = np.minimum(z0 + 1, resolution - 1)
+    x1 = np.minimum(x0 + 1, nx - 1)
+    y1 = np.minimum(y0 + 1, ny - 1)
+    z1 = np.minimum(z0 + 1, nz - 1)
 
     fx = tx - x0
     fy = ty - y0
@@ -518,13 +535,15 @@ def _strip_outer_surface(
             normals=np.empty((0, 3), dtype=np.float64),
         )
 
-    resolution = host_sdf.shape[0]
     spacing = np.array(
-        [
-            (bounds[0][1] - bounds[0][0]) / float(resolution - 1),
-            (bounds[1][1] - bounds[1][0]) / float(resolution - 1),
-            (bounds[2][1] - bounds[2][0]) / float(resolution - 1),
-        ],
+        spacing_from_bounds(
+            bounds,
+            (
+                int(host_sdf.shape[0]),
+                int(host_sdf.shape[1]),
+                int(host_sdf.shape[2]),
+            ),
+        ),
         dtype=np.float64,
     )
     outer_tol = float(np.max(spacing) * 0.5)
@@ -622,6 +641,11 @@ def _bounds_header_value(bounds: list[list[float]]) -> str:
     return json.dumps(compact, separators=(",", ":"))
 
 
+def _resolution_xyz_header_value(resolution_xyz: ResolutionXYZ) -> str:
+    nx, ny, nz = normalize_resolution_xyz(resolution_xyz)
+    return f"{nx},{ny},{nz}"
+
+
 def _should_queue_scene_job(grid: GridConfig, execution_mode: ExecutionMode) -> bool:
     if execution_mode == "queued":
         return True
@@ -629,17 +653,17 @@ def _should_queue_scene_job(grid: GridConfig, execution_mode: ExecutionMode) -> 
         return False
     if not REDIS_CLIENT_AVAILABLE:
         return False
-    return int(grid.resolution) >= AUTO_QUEUE_RESOLUTION_THRESHOLD
+    return voxel_count((int(grid.resolution_xyz[0]), int(grid.resolution_xyz[1]), int(grid.resolution_xyz[2]))) >= AUTO_QUEUE_TOTAL_VOXELS_THRESHOLD
 
 
-def _should_queue_upload_job(file_size: int, resolution: int, execution_mode: ExecutionMode) -> bool:
+def _should_queue_upload_job(file_size: int, resolution_xyz: ResolutionXYZ, execution_mode: ExecutionMode) -> bool:
     if execution_mode == "queued":
         return True
     if execution_mode == "inline":
         return False
     if not REDIS_CLIENT_AVAILABLE:
         return False
-    return file_size >= AUTO_QUEUE_UPLOAD_BYTES_THRESHOLD or resolution >= AUTO_QUEUE_RESOLUTION_THRESHOLD
+    return file_size >= AUTO_QUEUE_UPLOAD_BYTES_THRESHOLD or voxel_count(resolution_xyz) >= AUTO_QUEUE_TOTAL_VOXELS_THRESHOLD
 
 
 def _celery_state_to_status(state: str) -> Literal["queued", "running", "succeeded", "failed"]:
@@ -913,7 +937,7 @@ def _run_field_preview(
     )
     payload = FieldPayload(
         encoding="f32-base64",
-        resolution=int(field.shape[0]),
+        resolution_xyz=[int(field.shape[0]), int(field.shape[1]), int(field.shape[2])],
         bounds=bounds,
         data=_encode_field(field),
     )
@@ -1025,12 +1049,19 @@ def _resolve_uploaded_mesh_metadata(
     if cached is not None:
         parsed = ParsedMesh(vertices=cached.vertices, faces=cached.faces)
         outer_mesh = MeshData(vertices=cached.vertices, faces=cached.faces, normals=cached.normals)
-        return UploadedMeshMetadata(parsed=parsed, outer_mesh=outer_mesh, mesh_span=float(cached.mesh_span), cache_hit=True)
+        return UploadedMeshMetadata(
+            parsed=parsed,
+            outer_mesh=outer_mesh,
+            mesh_span=float(cached.mesh_span),
+            mesh_extents=(float(cached.mesh_extents[0]), float(cached.mesh_extents[1]), float(cached.mesh_extents[2])),
+            cache_hit=True,
+        )
 
     parsed = parse_mesh_bytes(file_bytes, extension)
     validate_triangle_mesh(parsed)
     extents = np.ptp(parsed.vertices, axis=0)
     mesh_span = float(np.max(extents))
+    mesh_extents = (float(extents[0]), float(extents[1]), float(extents[2]))
     outer_mesh = _freeze_meshdata(_meshdata_from_parsed(parsed))
     frozen_vertices = _freeze_cached_array(parsed.vertices, np.float64)
     frozen_faces = _freeze_cached_array(parsed.faces, np.int32)
@@ -1041,12 +1072,14 @@ def _resolve_uploaded_mesh_metadata(
             faces=frozen_faces,
             normals=outer_mesh.normals,
             mesh_span=mesh_span,
+            mesh_extents=mesh_extents,
         ),
     )
     return UploadedMeshMetadata(
         parsed=ParsedMesh(vertices=frozen_vertices, faces=frozen_faces),
         outer_mesh=MeshData(vertices=frozen_vertices, faces=frozen_faces, normals=outer_mesh.normals),
         mesh_span=mesh_span,
+        mesh_extents=mesh_extents,
         cache_hit=False,
     )
 
@@ -1205,11 +1238,15 @@ def _maybe_evict_uploaded_composed_field_cache_before_meshing(field: np.ndarray)
     return True
 
 
-def _snapshot_uploaded_mesh_memory_context(mesh_span: float) -> UploadedMeshMemoryContext:
+def _snapshot_uploaded_mesh_memory_context(
+    mesh_span: float,
+    mesh_extents: tuple[float, float, float],
+) -> UploadedMeshMemoryContext:
     available_cpu = _available_cpu_memory_bytes()
     available_gpu_free, available_gpu_total = _available_gpu_memory_bytes()
     return UploadedMeshMemoryContext(
         mesh_span=float(mesh_span),
+        mesh_extents=(float(mesh_extents[0]), float(mesh_extents[1]), float(mesh_extents[2])),
         available_cpu_bytes=available_cpu,
         available_gpu_free_bytes=available_gpu_free,
         available_gpu_total_bytes=available_gpu_total,
@@ -1234,15 +1271,15 @@ def _resolve_uploaded_mesh_memory_estimate(
         file_hash=file_hash,
         extension=extension,
     )
-    context = _snapshot_uploaded_mesh_memory_context(resolved_metadata.mesh_span)
-    resolution, _ = _resolve_mesh_resolution(
+    context = _snapshot_uploaded_mesh_memory_context(resolved_metadata.mesh_span, resolved_metadata.mesh_extents)
+    resolution_xyz, _ = _resolve_mesh_resolution_xyz(
         lattice_pitch,
-        resolved_metadata.mesh_span,
+        resolved_metadata.mesh_extents,
         voxels_per_lattice_period,
     )
-    voxel_count = int(resolution**3)
-    required_cpu_bytes = int(np.ceil(voxel_count * context.cpu_bytes_per_voxel * context.safety_factor))
-    required_gpu_bytes = int(np.ceil(voxel_count * context.gpu_bytes_per_voxel * context.safety_factor))
+    total_voxels = voxel_count(resolution_xyz)
+    required_cpu_bytes = int(np.ceil(total_voxels * context.cpu_bytes_per_voxel * context.safety_factor))
+    required_gpu_bytes = int(np.ceil(total_voxels * context.gpu_bytes_per_voxel * context.safety_factor))
     gpu_check_enabled = compute_backend == "cuda" or (
         compute_backend == "auto" and context.available_gpu_free_bytes is not None
     )
@@ -1255,7 +1292,7 @@ def _resolve_uploaded_mesh_memory_estimate(
     return (
         UploadedMeshMemoryEstimate(
             context=context,
-            resolution=resolution,
+            resolution_xyz=resolution_xyz,
             required_cpu_bytes=required_cpu_bytes,
             required_gpu_bytes=required_gpu_bytes,
             cpu_fatal=cpu_fatal,
@@ -1282,7 +1319,10 @@ def _uploaded_mesh_memory_guard_message(
 ) -> str:
     parts = [
         "Estimated memory requirement exceeds available system memory for this mesh preview.",
-        f"resolution={estimate.resolution}, compute_backend={compute_backend}",
+        (
+            f"resolution_xyz={estimate.resolution_xyz[0]}x{estimate.resolution_xyz[1]}x{estimate.resolution_xyz[2]}, "
+            f"compute_backend={compute_backend}"
+        ),
         f"required_cpu={_format_bytes_gib(estimate.required_cpu_bytes)}, available_cpu={_format_bytes_gib(estimate.context.available_cpu_bytes)}",
     ]
     if estimate.gpu_check_enabled:
@@ -1334,7 +1374,8 @@ def _resolve_uploaded_host_field(
     file_bytes: bytes,
     file_hash: str,
     extension: str,
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
+    lattice_pitch: float,
     compute_backend: ComputeBackend = "auto",
     parsed: ParsedMesh | None = None,
     field_storage_mode: UploadedFieldStorageMode = "auto",
@@ -1348,7 +1389,8 @@ def _resolve_uploaded_host_field(
     host_key = hash_uploaded_mesh_host_request(
         file_hash=file_hash,
         extension=extension,
-        resolution=resolution,
+        resolution_xyz=resolution_xyz,
+        lattice_pitch=lattice_pitch,
         compute_backend=compute_backend,
         field_storage_mode=field_storage_mode,
     )
@@ -1373,9 +1415,19 @@ def _resolve_uploaded_host_field(
             cache_hit=True,
         )
 
+    mins = np.min(parsed.vertices, axis=0)
+    maxs = np.max(parsed.vertices, axis=0)
+    pad_each_side = 2.0 * float(lattice_pitch)
+    bounds = [
+        [float(mins[0] - pad_each_side), float(maxs[0] + pad_each_side)],
+        [float(mins[1] - pad_each_side), float(maxs[1] + pad_each_side)],
+        [float(mins[2] - pad_each_side), float(maxs[2] + pad_each_side)],
+    ]
+
     host = build_host_field(
         parsed,
-        resolution=resolution,
+        resolution_xyz=resolution_xyz,
+        bounds=bounds,
         compute_backend=compute_backend,
         field_storage_mode=field_storage_mode,
     )
@@ -1422,16 +1474,19 @@ def _compute_mesh_upload_resolution(
     extension: str,
     _lattice_pitch: float,
     _voxels_per_lattice_period: int,
-) -> int:
+) -> ResolutionXYZ:
     """Resolve the uploaded mesh bbox span, then compute the lattice-driven grid."""
     metadata = _resolve_uploaded_mesh_metadata(
         file_bytes=file_bytes,
         file_hash=file_hash,
         extension=extension,
     )
-    mesh_span = metadata.mesh_span
-    resolution, _ = _resolve_mesh_resolution(_lattice_pitch, mesh_span, _voxels_per_lattice_period)
-    return resolution
+    resolution_xyz, _ = _resolve_mesh_resolution_xyz(
+        _lattice_pitch,
+        metadata.mesh_extents,
+        _voxels_per_lattice_period,
+    )
+    return resolution_xyz
 
 
 def _should_queue_uploaded_request(
@@ -1451,21 +1506,21 @@ def _should_queue_uploaded_request(
         return False
     if len(file_bytes) >= AUTO_QUEUE_UPLOAD_BYTES_THRESHOLD:
         return True
-    resolution = _compute_mesh_upload_resolution(
+    resolution_xyz = _compute_mesh_upload_resolution(
         file_bytes,
         file_hash,
         extension,
         lattice_pitch,
         voxels_per_lattice_period,
     )
-    return _should_queue_upload_job(len(file_bytes), resolution, execution_mode)
+    return _should_queue_upload_job(len(file_bytes), resolution_xyz, execution_mode)
 
 
 def _uploaded_mesh_field_payload_key(
     *,
     file_hash: str,
     extension: str,
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
     shell_thickness: float,
     lattice_type: Literal["gyroid", "schwarz_p", "diamond"],
     lattice_pitch: float,
@@ -1478,7 +1533,7 @@ def _uploaded_mesh_field_payload_key(
     return hash_uploaded_mesh_field_request(
         file_hash=file_hash,
         extension=extension,
-        resolution=resolution,
+        resolution_xyz=resolution_xyz,
         shell_thickness=shell_thickness,
         lattice_type=lattice_type,
         lattice_pitch=lattice_pitch,
@@ -1496,7 +1551,7 @@ def _build_uploaded_field_payload(
 ) -> FieldPayload:
     return FieldPayload(
         encoding="f32-base64",
-        resolution=int(field.shape[0]),
+        resolution_xyz=[int(field.shape[0]), int(field.shape[1]), int(field.shape[2])],
         bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
         data=_encode_field(field),
     )
@@ -1508,7 +1563,7 @@ def _build_uploaded_host_field_payload(
 ) -> FieldPayload:
     return FieldPayload(
         encoding="f32-base64",
-        resolution=int(host_sdf.shape[0]),
+        resolution_xyz=[int(host_sdf.shape[0]), int(host_sdf.shape[1]), int(host_sdf.shape[2])],
         bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
         data=_encode_field(host_sdf),
     )
@@ -1519,7 +1574,7 @@ def _build_uploaded_field_payload_from_cache_entry(
     cache_entry: UploadedMeshCacheEntry,
     file_hash: str,
     extension: str,
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
     shell_thickness: float,
     lattice_type: Literal["gyroid", "schwarz_p", "diamond"],
     lattice_pitch: float,
@@ -1530,13 +1585,13 @@ def _build_uploaded_field_payload_from_cache_entry(
     field_storage_mode: UploadedFieldStorageMode,
 ) -> FieldPayload:
     if (
-        cache_entry.field_resolution is not None
+        cache_entry.field_resolution_xyz is not None
         and cache_entry.field_bounds is not None
         and cache_entry.field_data is not None
     ):
         return FieldPayload(
             encoding="f32-base64",
-            resolution=int(cache_entry.field_resolution),
+            resolution_xyz=[int(v) for v in cache_entry.field_resolution_xyz],
             bounds=[[float(axis[0]), float(axis[1])] for axis in cache_entry.field_bounds],
             data=cache_entry.field_data,
         )
@@ -1544,7 +1599,7 @@ def _build_uploaded_field_payload_from_cache_entry(
     field_key = _uploaded_mesh_field_payload_key(
         file_hash=file_hash,
         extension=extension,
-        resolution=resolution,
+        resolution_xyz=resolution_xyz,
         shell_thickness=shell_thickness,
         lattice_type=lattice_type,
         lattice_pitch=lattice_pitch,
@@ -1573,14 +1628,14 @@ def _resolve_uploaded_composed_field(
     voxels_per_lattice_period: int = 6,
     compute_backend: ComputeBackend = "auto",
     parsed: ParsedMesh | None = None,
-    resolution: int | None = None,
+    resolution_xyz: ResolutionXYZ | None = None,
     bounds: list[list[float]] | None = None,
     host_sdf: np.ndarray | None = None,
     sparse_block_size: int | None = None,
     host_active_blocks: list[tuple[int, int, int]] | None = None,
     field_storage_mode: UploadedFieldStorageMode = "auto",
 ) -> UploadedComposedFieldResult:
-    if parsed is None or resolution is None:
+    if parsed is None or resolution_xyz is None:
         metadata = _resolve_uploaded_mesh_metadata(
             file_bytes=file_bytes,
             file_hash=file_hash,
@@ -1588,21 +1643,22 @@ def _resolve_uploaded_composed_field(
         )
         if parsed is None:
             parsed = metadata.parsed
-        if resolution is None:
-            resolution, _ = _resolve_mesh_resolution(
+        if resolution_xyz is None:
+            resolution_xyz, _ = _resolve_mesh_resolution_xyz(
                 lattice_pitch,
-                metadata.mesh_span,
+                metadata.mesh_extents,
                 voxels_per_lattice_period,
             )
 
     assert parsed is not None
-    assert resolution is not None
+    assert resolution_xyz is not None
     if bounds is None or host_sdf is None:
         host_result = _resolve_uploaded_host_field(
             file_bytes=file_bytes,
             file_hash=file_hash,
             extension=extension,
-            resolution=resolution,
+            resolution_xyz=resolution_xyz,
+            lattice_pitch=lattice_pitch,
             compute_backend=compute_backend,
             parsed=parsed,
             field_storage_mode=field_storage_mode,
@@ -1619,7 +1675,7 @@ def _resolve_uploaded_composed_field(
     field_key = _uploaded_mesh_field_payload_key(
         file_hash=file_hash,
         extension=extension,
-        resolution=resolution,
+        resolution_xyz=resolution_xyz,
         shell_thickness=shell_thickness,
         lattice_type=lattice_type,
         lattice_pitch=lattice_pitch,
@@ -1636,7 +1692,7 @@ def _resolve_uploaded_composed_field(
             active_blocks = [(int(bx), int(by), int(bz)) for bx, by, bz in cached_field.active_blocks]
         return UploadedComposedFieldResult(
             parsed=parsed,
-            resolution=resolution,
+            resolution_xyz=resolution_xyz,
             bounds=[[float(axis[0]), float(axis[1])] for axis in cached_field.bounds],
             host_sdf=host_sdf,
             sparse_block_size=cached_field.block_size,
@@ -1680,7 +1736,7 @@ def _resolve_uploaded_composed_field(
         UploadedComposedFieldCacheEntry(
             field=np.array(field, dtype=np.float32, copy=True),
             bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
-            resolution=resolution,
+            resolution_xyz=resolution_xyz,
             eval_backend=eval_backend_used,
             block_size=sparse_block_size,
             active_blocks=(
@@ -1693,7 +1749,7 @@ def _resolve_uploaded_composed_field(
     eval_ms = (time.perf_counter() - eval_start) * 1000.0
     return UploadedComposedFieldResult(
         parsed=parsed,
-        resolution=resolution,
+        resolution_xyz=resolution_xyz,
         bounds=bounds,
         host_sdf=host_sdf,
         sparse_block_size=sparse_block_size,
@@ -1720,7 +1776,7 @@ def _resolve_cached_uploaded_mesh_commit_inputs(
     field_storage_mode: UploadedFieldStorageMode = "auto",
 ) -> tuple[
     UploadedMeshMetadata,
-    int,
+    ResolutionXYZ,
     UploadedHostFieldCacheEntry,
     UploadedComposedFieldCacheEntry,
 ]:
@@ -1729,22 +1785,23 @@ def _resolve_cached_uploaded_mesh_commit_inputs(
         file_hash=file_hash,
         extension=extension,
     )
-    resolution, _ = _resolve_mesh_resolution(
+    resolution_xyz, _ = _resolve_mesh_resolution_xyz(
         lattice_pitch,
-        metadata.mesh_span,
+        metadata.mesh_extents,
         voxels_per_lattice_period,
     )
     host_key = hash_uploaded_mesh_host_request(
         file_hash=file_hash,
         extension=extension,
-        resolution=resolution,
+        resolution_xyz=resolution_xyz,
+        lattice_pitch=lattice_pitch,
         compute_backend=compute_backend,
         field_storage_mode=field_storage_mode,
     )
     field_key = _uploaded_mesh_field_payload_key(
         file_hash=file_hash,
         extension=extension,
-        resolution=resolution,
+        resolution_xyz=resolution_xyz,
         shell_thickness=shell_thickness,
         lattice_type=lattice_type,
         lattice_pitch=lattice_pitch,
@@ -1758,7 +1815,7 @@ def _resolve_cached_uploaded_mesh_commit_inputs(
     field_cached = uploaded_composed_field_cache.get(field_key)
     if host_cached is None or field_cached is None:
         raise MeshUploadError("Preview Field first before committing the mesh.")
-    return metadata, resolution, host_cached, field_cached
+    return metadata, resolution_xyz, host_cached, field_cached
 
 
 def _run_uploaded_mesh_commit_meshdata(
@@ -1778,7 +1835,7 @@ def _run_uploaded_mesh_commit_meshdata(
     field_storage_mode: UploadedFieldStorageMode = "auto",
     encode_response_payloads: bool = True,
 ) -> tuple[MeshData, PreviewStats, MeshPayload | None]:
-    metadata, resolution, host_cached, field_cached = _resolve_cached_uploaded_mesh_commit_inputs(
+    metadata, resolution_xyz, host_cached, field_cached = _resolve_cached_uploaded_mesh_commit_inputs(
         file_bytes=file_bytes,
         file_hash=file_hash,
         extension=extension,
@@ -1794,7 +1851,7 @@ def _run_uploaded_mesh_commit_meshdata(
     cache_key = hash_uploaded_mesh_request(
         file_hash=file_hash,
         extension=extension,
-        resolution=resolution,
+        resolution_xyz=resolution_xyz,
         shell_thickness=shell_thickness,
         lattice_type=lattice_type,
         lattice_pitch=lattice_pitch,
@@ -1826,7 +1883,7 @@ def _run_uploaded_mesh_commit_meshdata(
             cache_entry=cached_mesh,
             file_hash=file_hash,
             extension=extension,
-            resolution=resolution,
+            resolution_xyz=resolution_xyz,
             shell_thickness=shell_thickness,
             lattice_type=lattice_type,
             lattice_pitch=lattice_pitch,
@@ -1853,7 +1910,7 @@ def _run_uploaded_mesh_commit_meshdata(
                 faces=cached_mesh.faces,
                 normals=cached_mesh.normals,
                 stats=cached_stats,
-                field_resolution=int(cached_field.resolution),
+                field_resolution_xyz=[int(v) for v in cached_field.resolution_xyz],
                 field_bounds=[[float(axis[0]), float(axis[1])] for axis in cached_field.bounds],
                 field_data=cached_field.data,
             )
@@ -1909,7 +1966,7 @@ def _run_uploaded_mesh_commit_meshdata(
                 faces=_freeze_cached_array(mesh.faces, np.int32),
                 normals=_freeze_cached_array(mesh.normals, np.float64),
                 stats=stats.model_dump(),
-                field_resolution=int(field.shape[0]),
+                field_resolution_xyz=[int(field.shape[0]), int(field.shape[1]), int(field.shape[2])],
                 field_bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
                 field_data=_build_uploaded_field_payload(field, bounds).data,
             ),
@@ -2005,9 +2062,9 @@ def _run_uploaded_mesh_field_preview_data_with_audit(
         extension=extension,
     )
     server_metadata_resolve_ms = (time.perf_counter() - metadata_start) * 1000.0
-    resolution, _ = _resolve_mesh_resolution(
+    resolution_xyz, _ = _resolve_mesh_resolution_xyz(
         lattice_pitch,
-        metadata.mesh_span,
+        metadata.mesh_extents,
         voxels_per_lattice_period,
     )
 
@@ -2016,7 +2073,8 @@ def _run_uploaded_mesh_field_preview_data_with_audit(
         file_bytes=file_bytes,
         file_hash=file_hash,
         extension=extension,
-        resolution=resolution,
+        resolution_xyz=resolution_xyz,
+        lattice_pitch=lattice_pitch,
         compute_backend=compute_backend,
         parsed=metadata.parsed,
         field_storage_mode=field_storage_mode,
@@ -2035,7 +2093,7 @@ def _run_uploaded_mesh_field_preview_data_with_audit(
         voxels_per_lattice_period=voxels_per_lattice_period,
         compute_backend=compute_backend,
         parsed=host_result.parsed,
-        resolution=resolution,
+        resolution_xyz=resolution_xyz,
         bounds=host_result.bounds,
         host_sdf=host_result.host_sdf,
         sparse_block_size=host_result.block_size,
@@ -2062,7 +2120,7 @@ def _run_uploaded_mesh_field_preview_data_with_audit(
         metadata_cache_hit=metadata.cache_hit,
         host_cache_hit=host_result.cache_hit,
         field_cache_hit=composed.field_cache_hit,
-        resolution=int(composed.field.shape[0]),
+        resolution_xyz=resolution_xyz,
         voxel_count=int(composed.field.size),
         payload_bytes=int(composed.field.size * np.dtype(np.float32).itemsize * 2),
         compute_backend=composed.eval_backend_used,
@@ -2132,15 +2190,15 @@ def _run_uploaded_mesh_preview_meshdata(
         file_hash=file_hash,
         extension=extension,
     )
-    resolution, _ = _resolve_mesh_resolution(
+    resolution_xyz, _ = _resolve_mesh_resolution_xyz(
         lattice_pitch,
-        metadata.mesh_span,
+        metadata.mesh_extents,
         voxels_per_lattice_period,
     )
     cache_key = hash_uploaded_mesh_request(
         file_hash=file_hash,
         extension=extension,
-        resolution=resolution,
+        resolution_xyz=resolution_xyz,
         shell_thickness=shell_thickness,
         lattice_type=lattice_type,
         lattice_pitch=lattice_pitch,
@@ -2175,7 +2233,7 @@ def _run_uploaded_mesh_preview_meshdata(
                 cache_entry=cached_mesh,
                 file_hash=file_hash,
                 extension=extension,
-                resolution=resolution,
+                resolution_xyz=resolution_xyz,
                 shell_thickness=shell_thickness,
                 lattice_type=lattice_type,
                 lattice_pitch=lattice_pitch,
@@ -2216,11 +2274,11 @@ def _run_uploaded_mesh_preview_meshdata(
         voxels_per_lattice_period=voxels_per_lattice_period,
         compute_backend=compute_backend,
         parsed=metadata.parsed,
-        resolution=resolution,
+        resolution_xyz=resolution_xyz,
         field_storage_mode=field_storage_mode,
     )
     parsed = composed.parsed
-    resolution = composed.resolution
+    resolution_xyz = composed.resolution_xyz
     bounds = composed.bounds
     host_sdf = composed.host_sdf
     sparse_block_size = composed.sparse_block_size
@@ -2248,8 +2306,10 @@ def _run_uploaded_mesh_preview_meshdata(
     post_mesh_ms = (time.perf_counter() - post_mesh_start) * 1000.0
     mesh_ms = (time.perf_counter() - mesh_start) * 1000.0
     logger.debug(
-        "mesh_upload_timing resolution=%d eval_ms=%.2f cache_hit=%s mesher_ms=%.2f post_mesh_ms=%.2f mesh_ms=%.2f",
-        resolution,
+        "mesh_upload_timing resolution_xyz=%dx%dx%d eval_ms=%.2f cache_hit=%s mesher_ms=%.2f post_mesh_ms=%.2f mesh_ms=%.2f",
+        resolution_xyz[0],
+        resolution_xyz[1],
+        resolution_xyz[2],
         eval_ms,
         field_cache_hit,
         mesher_ms,
@@ -2282,7 +2342,11 @@ def _run_uploaded_mesh_preview_meshdata(
                 faces=_freeze_cached_array(mesh.faces, np.int32),
                 normals=_freeze_cached_array(mesh.normals, np.float64),
                 stats=stats.model_dump(),
-                field_resolution=int(field_payload.resolution) if field_payload is not None else int(field.shape[0]),
+                field_resolution_xyz=(
+                    [int(v) for v in field_payload.resolution_xyz]
+                    if field_payload is not None
+                    else [int(field.shape[0]), int(field.shape[1]), int(field.shape[2])]
+                ),
                 field_bounds=(
                     [[float(axis[0]), float(axis[1])] for axis in field_payload.bounds]
                     if field_payload is not None
@@ -2387,7 +2451,9 @@ async def preview_field_binary(payload: PreviewFieldRequest) -> Response:
         )
         headers = {
             "X-SDF-Stats": _stats_header_value(stats),
-            "X-SDF-Resolution": str(int(field.shape[0])),
+            "X-SDF-Resolution-XYZ": _resolution_xyz_header_value(
+                (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+            ),
             "X-SDF-Bounds": _bounds_header_value(bounds),
         }
         return Response(
@@ -2933,7 +2999,9 @@ async def preview_uploaded_mesh_field_binary(
         )
         headers = {
             "X-SDF-Stats": _stats_header_value(stats),
-            "X-SDF-Resolution": str(int(field.shape[0])),
+            "X-SDF-Resolution-XYZ": _resolution_xyz_header_value(
+                (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+            ),
             "X-SDF-Bounds": _bounds_header_value(bounds),
             "X-SDF-Trace-Id": trace_id,
         }
@@ -3012,6 +3080,10 @@ async def preprocess_uploaded_mesh(
             "X-SDF-Vertex-Count": str(int(outer.vertices.shape[0])),
             "X-SDF-Face-Count": str(int(outer.faces.shape[0])),
             "X-SDF-Mesh-Span": str(float(memory_estimate.context.mesh_span)),
+            "X-SDF-Resolution-XYZ": _resolution_xyz_header_value(memory_estimate.resolution_xyz),
+            "X-SDF-Mesh-Extents": (
+                f"{memory_estimate.context.mesh_extents[0]},{memory_estimate.context.mesh_extents[1]},{memory_estimate.context.mesh_extents[2]}"
+            ),
             "X-SDF-Available-CPU-Bytes": (
                 str(int(memory_estimate.context.available_cpu_bytes))
                 if memory_estimate.context.available_cpu_bytes is not None
@@ -3169,15 +3241,15 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                 file_hash=file_hash,
                 extension=extension,
             )
-            resolution, _ = _resolve_mesh_resolution(
+            resolution_xyz, _ = _resolve_mesh_resolution_xyz(
                 payload.lattice_pitch,
-                metadata.mesh_span,
+                metadata.mesh_extents,
                 voxels_per_lattice_period,
             )
             cache_key = hash_uploaded_mesh_request(
                 file_hash=file_hash,
                 extension=extension,
-                resolution=resolution,
+                resolution_xyz=resolution_xyz,
                 shell_thickness=payload.shell_thickness,
                 lattice_type=payload.lattice_type,
                 lattice_pitch=payload.lattice_pitch,
@@ -3209,7 +3281,7 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                     cache_entry=cached_mesh,
                     file_hash=file_hash,
                     extension=extension,
-                    resolution=resolution,
+                    resolution_xyz=resolution_xyz,
                     shell_thickness=payload.shell_thickness,
                     lattice_type=payload.lattice_type,
                     lattice_pitch=payload.lattice_pitch,
@@ -3228,7 +3300,13 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                                 eval_ms=0.0,
                                 mesh_ms=None,
                                 tri_count=0,
-                                voxel_count=int(cached_field.resolution**3),
+                                voxel_count=voxel_count(
+                                    (
+                                        int(cached_field.resolution_xyz[0]),
+                                        int(cached_field.resolution_xyz[1]),
+                                        int(cached_field.resolution_xyz[2]),
+                                    )
+                                ),
                                 cache_hit=True,
                                 field_cache_hit=True,
                                 mesh_cache_hit=False,
@@ -3273,7 +3351,7 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                         voxels_per_lattice_period=voxels_per_lattice_period,
                         compute_backend=payload.compute_backend,
                         parsed=metadata.parsed,
-                        resolution=resolution,
+                        resolution_xyz=resolution_xyz,
                         field_storage_mode=payload.field_storage_mode,
                     )
                     parsed = composed.parsed
@@ -3387,7 +3465,7 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
                     faces=_freeze_cached_array(mesh_np.faces, np.int32),
                     normals=_freeze_cached_array(mesh_np.normals, np.float64),
                     stats=stats.model_dump(),
-                    field_resolution=int(field_payload.resolution),
+                    field_resolution_xyz=[int(v) for v in field_payload.resolution_xyz],
                     field_bounds=[[float(axis[0]), float(axis[1])] for axis in field_payload.bounds],
                     field_data=field_payload.data,
                 ),
@@ -3424,8 +3502,8 @@ async def preview_ws(websocket: WebSocket) -> None:
                 coarse_res = min(64, target)
                 fine_res = target
 
-                coarse_grid = GridConfig(bounds=bounds, resolution=coarse_res)
-                fine_grid = GridConfig(bounds=bounds, resolution=fine_res)
+                coarse_grid = GridConfig(bounds=bounds, resolution_xyz=[coarse_res, coarse_res, coarse_res])
+                fine_grid = GridConfig(bounds=bounds, resolution_xyz=[fine_res, fine_res, fine_res])
 
                 coarse_preview = await asyncio.to_thread(
                     _run_preview,

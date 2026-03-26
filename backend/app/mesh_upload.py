@@ -4,6 +4,7 @@ import math
 import logging
 import os
 import struct
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +15,7 @@ from scipy import ndimage
 from scipy.sparse import coo_matrix
 from scipy.spatial import cKDTree
 
+from .grid_shape import ResolutionXYZ, normalize_resolution_xyz, spacing_from_bounds, voxel_count
 from .sparse_field import OctreeField, SparseBrickField, detect_zero_crossing_blocks
 
 logger = logging.getLogger(__name__)
@@ -81,6 +83,7 @@ class HostFieldData:
     octree_node_kind: np.ndarray | None = None
     host_build_strategy: Literal["dense", "octree_sparse"] = "dense"
     host_decision_reason: str = "dense_default"
+    resolution_xyz: ResolutionXYZ | None = None
 
 
 _AUTO_SPARSE_MAX_EST_NEAR_RATIO = 0.60
@@ -117,11 +120,11 @@ def _is_cupy_out_of_memory_error(exc: BaseException) -> bool:
     return module.startswith("cupy")
 
 
-def _gpu_fill_memory_estimate_bytes(resolution: int) -> int:
-    return int(math.ceil(float(resolution**3) * _GPU_FILL_BYTES_PER_VOXEL))
+def _gpu_fill_memory_estimate_bytes(resolution_xyz: ResolutionXYZ) -> int:
+    return int(math.ceil(float(voxel_count(resolution_xyz)) * _GPU_FILL_BYTES_PER_VOXEL))
 
 
-def _gpu_fill_resolution_suggestion(resolution: int, free_bytes: int | None) -> int | None:
+def _gpu_fill_resolution_suggestion(resolution_xyz: ResolutionXYZ, free_bytes: int | None) -> ResolutionXYZ | None:
     if free_bytes is None or free_bytes <= 0:
         return None
 
@@ -129,15 +132,20 @@ def _gpu_fill_resolution_suggestion(resolution: int, free_bytes: int | None) -> 
     if usable_bytes <= 0.0:
         return None
 
-    suggested = int(math.floor((usable_bytes / _GPU_FILL_BYTES_PER_VOXEL) ** (1.0 / 3.0)))
-    suggested = min(suggested, resolution - 1)
-    if suggested < 24:
+    nx, ny, nz = resolution_xyz
+    current_total = max(1, voxel_count((nx, ny, nz)))
+    target_total = max(1.0, usable_bytes / _GPU_FILL_BYTES_PER_VOXEL)
+    scale = (target_total / float(current_total)) ** (1.0 / 3.0)
+    sx = min(nx - 1, max(24, int(math.floor(nx * scale))))
+    sy = min(ny - 1, max(24, int(math.floor(ny * scale))))
+    sz = min(nz - 1, max(24, int(math.floor(nz * scale))))
+    if sx < 24 or sy < 24 or sz < 24:
         return None
-    return suggested
+    return (sx, sy, sz)
 
 
-def _gpu_fill_fallback_reason(resolution: int, exc: BaseException) -> str:
-    estimated_bytes = _gpu_fill_memory_estimate_bytes(resolution)
+def _gpu_fill_fallback_reason(resolution_xyz: ResolutionXYZ, exc: BaseException) -> str:
+    estimated_bytes = _gpu_fill_memory_estimate_bytes(resolution_xyz)
     free_bytes: int | None = None
     total_bytes: int | None = None
     if CUPY_AVAILABLE and cp is not None and _cuda_device_available():
@@ -149,18 +157,20 @@ def _gpu_fill_fallback_reason(resolution: int, exc: BaseException) -> str:
             free_bytes = None
             total_bytes = None
 
-    suggested_resolution = _gpu_fill_resolution_suggestion(resolution, free_bytes)
+    suggested_resolution = _gpu_fill_resolution_suggestion(resolution_xyz, free_bytes)
     estimated_gib = estimated_bytes / float(1024**3)
+    nx, ny, nz = resolution_xyz
     parts = [
-        f"GPU voxel fill ran out of memory at resolution {resolution} (estimated working set about {estimated_gib:.2f} GiB).",
+        f"GPU voxel fill ran out of memory at resolution {nx}x{ny}x{nz} (estimated working set about {estimated_gib:.2f} GiB).",
     ]
     if free_bytes is not None:
         parts.append(f"Free GPU memory was about {free_bytes / float(1024**3):.2f} GiB.")
     if total_bytes is not None:
         parts.append(f"Total GPU memory was about {total_bytes / float(1024**3):.2f} GiB.")
     if suggested_resolution is not None:
+        sx, sy, sz = suggested_resolution
         parts.append(
-            f"Try lowering the preview to about resolution {suggested_resolution}, or reduce voxels_per_lattice_period / increase lattice_pitch."
+            f"Try lowering the preview to about resolution {sx}x{sy}x{sz}, or reduce voxels_per_lattice_period / increase lattice_pitch."
         )
     else:
         parts.append("Try lowering the preview resolution, or reduce voxels_per_lattice_period / increase lattice_pitch.")
@@ -243,56 +253,64 @@ def validate_triangle_mesh(mesh: ParsedMesh) -> None:
 
 
 def compute_resolution_for_lattice_pitch(
-    mesh_span: float,
+    mesh_extents: tuple[float, float, float],
     lattice_pitch: float,
     voxels_per_period: int = 6,
-) -> int:
+) -> ResolutionXYZ:
     """Compute the voxel grid resolution needed to faithfully sample a lattice.
 
     Uses the same 12% padding factor as _build_bounds() so the result is
     consistent with the actual padded bounding box.
 
     Args:
-        mesh_span: Largest dimension of the mesh bounding box in world units.
+        mesh_extents: Mesh bounding box extents for x/y/z in world units.
         lattice_pitch: Desired lattice cell size in world units.
         voxels_per_period: Number of voxels per lattice period (6 = safe default,
             4 = minimum, 8 = high quality).
 
     Returns:
-        Required voxel grid resolution (cubic).
+        Required voxel grid resolution for each axis.
     """
     if lattice_pitch <= 0:
         raise MeshUploadError("lattice_pitch must be > 0")
     if voxels_per_period < 2:
         raise MeshUploadError("voxels_per_period must be >= 2")
-    padded_span = mesh_span * 1.24  # matches _build_bounds() 12% padding each side
-    return max(24, int(math.ceil((padded_span / lattice_pitch) * voxels_per_period)))
+    spacing = float(lattice_pitch) / float(voxels_per_period)
+    pad_each_side = 2.0 * float(lattice_pitch)
+    padded = [float(extent) + (2.0 * pad_each_side) for extent in mesh_extents]
+    return (
+        max(24, int(math.ceil(padded[0] / spacing)) + 1),
+        max(24, int(math.ceil(padded[1] / spacing)) + 1),
+        max(24, int(math.ceil(padded[2] / spacing)) + 1),
+    )
 
 
 def build_host_field(
     mesh: ParsedMesh,
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
     *,
+    bounds: list[list[float]] | None = None,
     compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
     field_storage_mode: Literal["auto", "dense", "octree_sparse"] = "auto",
 ) -> HostFieldData:
-    if resolution < 24:
+    nx, ny, nz = normalize_resolution_xyz(resolution_xyz)
+    if min(nx, ny, nz) < 24:
         raise MeshUploadError("resolution is too low for mesh workflow")
 
-    bounds = _build_bounds(mesh)
-    occupancy, fallback_reason = _voxelize_and_fill(mesh, bounds, resolution)
+    resolved_bounds = bounds if bounds is not None else _build_bounds(mesh)
+    occupancy, fallback_reason = _voxelize_and_fill(mesh, resolved_bounds, (nx, ny, nz))
 
     if field_storage_mode == "dense":
         host_sdf, host_backend = _build_host_sdf_dense_with_backend(
             occupancy,
-            bounds,
-            resolution,
+            resolved_bounds,
+            (nx, ny, nz),
             compute_backend=compute_backend,
         )
         _log_host_field_backend(host_backend)
         return HostFieldData(
             mesh=mesh,
-            bounds=bounds,
+            bounds=resolved_bounds,
             host_sdf=host_sdf,
             host_compute_backend=host_backend,
             fallback_reason=fallback_reason,
@@ -301,14 +319,15 @@ def build_host_field(
             active_blocks=None,
             host_build_strategy="dense",
             host_decision_reason="dense_requested",
+            resolution_xyz=(nx, ny, nz),
         )
 
     allow_dense_fallback = field_storage_mode == "auto"
     host_sdf, block_size, active_blocks, sparse_background_value, decision_reason, host_backend = _build_host_sdf_octree_sparse(
         mesh,
         occupancy,
-        bounds,
-        resolution,
+        resolved_bounds,
+        (nx, ny, nz),
         allow_dense_fallback=allow_dense_fallback,
         compute_backend=compute_backend,
     )
@@ -328,7 +347,7 @@ def build_host_field(
         octree = OctreeField.from_sparse_bricks(sparse)
         return HostFieldData(
             mesh=mesh,
-            bounds=bounds,
+            bounds=resolved_bounds,
             host_sdf=host_sdf,
             host_compute_backend=host_backend,
             fallback_reason=fallback_reason,
@@ -345,11 +364,12 @@ def build_host_field(
             octree_node_kind=np.array(octree.node_kind, copy=True),
             host_build_strategy="octree_sparse",
             host_decision_reason=decision_reason,
+            resolution_xyz=(nx, ny, nz),
         )
 
     return HostFieldData(
         mesh=mesh,
-        bounds=bounds,
+        bounds=resolved_bounds,
         host_sdf=host_sdf,
         host_compute_backend=host_backend,
         fallback_reason=fallback_reason,
@@ -359,15 +379,16 @@ def build_host_field(
         sparse_background_value=sparse_background_value,
         host_build_strategy="dense",
         host_decision_reason=decision_reason,
+        resolution_xyz=(nx, ny, nz),
     )
 
 
 def _build_host_sdf_dense_cpu(
     occupancy: np.ndarray,
     bounds: list[list[float]],
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
 ) -> np.ndarray:
-    spacing = _bounds_spacing(bounds, resolution)
+    spacing = _bounds_spacing(bounds, resolution_xyz)
     outside = np.logical_not(occupancy)
     dist_out = ndimage.distance_transform_edt(outside, sampling=spacing)
     dist_in = ndimage.distance_transform_edt(occupancy, sampling=spacing)
@@ -377,20 +398,20 @@ def _build_host_sdf_dense_cpu(
 def _build_host_sdf_dense(
     occupancy: np.ndarray,
     bounds: list[list[float]],
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
 ) -> np.ndarray:
-    return _build_host_sdf_dense_cpu(occupancy, bounds, resolution)
+    return _build_host_sdf_dense_cpu(occupancy, bounds, resolution_xyz)
 
 
 def _build_host_sdf_dense_cuda(
     occupancy: np.ndarray,
     bounds: list[list[float]],
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
 ) -> np.ndarray:
     if not CUPY_AVAILABLE or cp is None or not CUPYX_AVAILABLE or cndimage is None or not _cuda_device_available():
         raise MeshUploadError("CUDA dense EDT requires CuPy and cupyx.scipy.ndimage")
 
-    spacing = _bounds_spacing(bounds, resolution)
+    spacing = _bounds_spacing(bounds, resolution_xyz)
     occupancy_gpu = cp.asarray(occupancy, dtype=cp.bool_)
     outside_gpu = cp.logical_not(occupancy_gpu)
     dist_out = cndimage.distance_transform_edt(outside_gpu, sampling=spacing)
@@ -401,25 +422,40 @@ def _build_host_sdf_dense_cuda(
 def _build_host_sdf_dense_with_backend(
     occupancy: np.ndarray,
     bounds: list[list[float]],
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
     *,
     compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
 ) -> tuple[np.ndarray, Literal["cpu", "cuda"]]:
+    start = time.perf_counter()
+    backend_name: Literal["cpu", "cuda"] = "cpu"
     resolved_backend = _resolve_compute_backend(compute_backend)
-    if resolved_backend == "cuda":
-        try:
-            return _build_host_sdf_dense_cuda(occupancy, bounds, resolution), "cuda"
-        except Exception:
-            logger.info("Dense host field CUDA path failed; falling back to CPU EDT", exc_info=True)
-    return _build_host_sdf_dense_cpu(occupancy, bounds, resolution), "cpu"
+    try:
+        if resolved_backend == "cuda":
+            try:
+                backend_name = "cuda"
+                return _build_host_sdf_dense_cuda(occupancy, bounds, resolution_xyz), backend_name
+            except Exception:
+                backend_name = "cpu"
+                logger.info("Dense host field CUDA path failed; falling back to CPU EDT", exc_info=True)
+        return _build_host_sdf_dense_cpu(occupancy, bounds, resolution_xyz), backend_name
+    finally:
+        nx, ny, nz = normalize_resolution_xyz(resolution_xyz)
+        logger.debug(
+            "host_sdf_dense_ms=%.2f backend=%s resolution=%dx%dx%d",
+            (time.perf_counter() - start) * 1000.0,
+            backend_name,
+            nx,
+            ny,
+            nz,
+        )
 
 
 def _octree_collect_surface_blocks(
     surface_mask: np.ndarray,
     block_size: int,
 ) -> set[tuple[int, int, int]]:
-    resolution = int(surface_mask.shape[0])
-    if resolution <= 0:
+    nx, ny, nz = (int(surface_mask.shape[0]), int(surface_mask.shape[1]), int(surface_mask.shape[2]))
+    if nx <= 0 or ny <= 0 or nz <= 0:
         return set()
 
     leaves: set[tuple[int, int, int]] = set()
@@ -446,7 +482,7 @@ def _octree_collect_surface_blocks(
                 for ka, kb in k_ranges:
                     recurse(ia, ib, ja, jb, ka, kb)
 
-    recurse(0, resolution, 0, resolution, 0, resolution)
+    recurse(0, nx, 0, ny, 0, nz)
     return leaves
 
 
@@ -525,36 +561,39 @@ def _point_triangle_distance_sq_batch(points: np.ndarray, triangle: np.ndarray) 
 def _triangle_scan_convert_candidates(
     mesh: ParsedMesh,
     bounds: list[list[float]],
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
     block_size: int,
     band_distance: float,
 ) -> tuple[np.ndarray, dict[tuple[int, int, int], list[int]], list[tuple[int, int, int]], float]:
-    spacing = _bounds_spacing(bounds, resolution)
+    nx, ny, nz = resolution_xyz
+    spacing = _bounds_spacing(bounds, resolution_xyz)
     origin = np.asarray([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
     spacing_vec = np.asarray(spacing, dtype=np.float64)
     triangles = np.ascontiguousarray(mesh.vertices[mesh.faces], dtype=np.float64)
 
     block_candidates: dict[tuple[int, int, int], list[int]] = defaultdict(list)
     active_blocks: set[tuple[int, int, int]] = set()
-    blocks_per_axis = int(math.ceil(resolution / float(block_size)))
+    blocks_x = int(math.ceil(nx / float(block_size)))
+    blocks_y = int(math.ceil(ny / float(block_size)))
+    blocks_z = int(math.ceil(nz / float(block_size)))
 
     for tri_idx, triangle in enumerate(triangles):
         tri_min = np.min(triangle, axis=0) - band_distance
         tri_max = np.max(triangle, axis=0) + band_distance
 
-        i0 = _grid_index_floor(float(tri_min[0]), float(origin[0]), float(spacing_vec[0]), resolution)
-        j0 = _grid_index_floor(float(tri_min[1]), float(origin[1]), float(spacing_vec[1]), resolution)
-        k0 = _grid_index_floor(float(tri_min[2]), float(origin[2]), float(spacing_vec[2]), resolution)
-        i1 = _grid_index_ceil(float(tri_max[0]), float(origin[0]), float(spacing_vec[0]), resolution)
-        j1 = _grid_index_ceil(float(tri_max[1]), float(origin[1]), float(spacing_vec[1]), resolution)
-        k1 = _grid_index_ceil(float(tri_max[2]), float(origin[2]), float(spacing_vec[2]), resolution)
+        i0 = _grid_index_floor(float(tri_min[0]), float(origin[0]), float(spacing_vec[0]), nx)
+        j0 = _grid_index_floor(float(tri_min[1]), float(origin[1]), float(spacing_vec[1]), ny)
+        k0 = _grid_index_floor(float(tri_min[2]), float(origin[2]), float(spacing_vec[2]), nz)
+        i1 = _grid_index_ceil(float(tri_max[0]), float(origin[0]), float(spacing_vec[0]), nx)
+        j1 = _grid_index_ceil(float(tri_max[1]), float(origin[1]), float(spacing_vec[1]), ny)
+        k1 = _grid_index_ceil(float(tri_max[2]), float(origin[2]), float(spacing_vec[2]), nz)
 
         bx0 = i0 // block_size
         by0 = j0 // block_size
         bz0 = k0 // block_size
-        bx1 = min(blocks_per_axis - 1, i1 // block_size)
-        by1 = min(blocks_per_axis - 1, j1 // block_size)
-        bz1 = min(blocks_per_axis - 1, k1 // block_size)
+        bx1 = min(blocks_x - 1, i1 // block_size)
+        by1 = min(blocks_y - 1, j1 // block_size)
+        bz1 = min(blocks_z - 1, k1 // block_size)
 
         for bx in range(bx0, bx1 + 1):
             for by in range(by0, by1 + 1):
@@ -569,12 +608,12 @@ def _triangle_scan_convert_candidates(
         i0 = bx * block_size
         j0 = by * block_size
         k0 = bz * block_size
-        i1 = min(resolution, i0 + block_size)
-        j1 = min(resolution, j0 + block_size)
-        k1 = min(resolution, k0 + block_size)
+        i1 = min(nx, i0 + block_size)
+        j1 = min(ny, j0 + block_size)
+        k1 = min(nz, k0 + block_size)
         active_voxels += float((i1 - i0) * (j1 - j0) * (k1 - k0))
 
-    near_ratio = active_voxels / float(resolution**3)
+    near_ratio = active_voxels / float(voxel_count((nx, ny, nz)))
     return triangles, block_candidates, active_blocks_sorted, near_ratio
 
 
@@ -582,7 +621,7 @@ def _scan_convert_block_distances(
     triangles: np.ndarray,
     triangle_indices: list[int],
     bounds: list[list[float]],
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
     i0: int,
     i1: int,
     j0: int,
@@ -590,7 +629,7 @@ def _scan_convert_block_distances(
     k0: int,
     k1: int,
 ) -> np.ndarray:
-    spacing = _bounds_spacing(bounds, resolution)
+    spacing = _bounds_spacing(bounds, resolution_xyz)
     x_axis = bounds[0][0] + np.arange(i0, i1, dtype=np.float64) * spacing[0]
     y_axis = bounds[1][0] + np.arange(j0, j1, dtype=np.float64) * spacing[1]
     z_axis = bounds[2][0] + np.arange(k0, k1, dtype=np.float64) * spacing[2]
@@ -609,12 +648,13 @@ def _refine_octree_sparse_block(
     triangles: np.ndarray,
     block_candidates: dict[tuple[int, int, int], list[int]],
     bounds: list[list[float]],
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
     block_size: int,
     bx: int,
     by: int,
     bz: int,
 ) -> tuple[tuple[int, int, int], np.ndarray] | None:
+    nx, ny, nz = resolution_xyz
     triangle_indices = block_candidates.get((bx, by, bz))
     if not triangle_indices:
         return None
@@ -622,15 +662,15 @@ def _refine_octree_sparse_block(
     i0 = bx * block_size
     j0 = by * block_size
     k0 = bz * block_size
-    i1 = min(resolution, i0 + block_size)
-    j1 = min(resolution, j0 + block_size)
-    k1 = min(resolution, k0 + block_size)
+    i1 = min(nx, i0 + block_size)
+    j1 = min(ny, j0 + block_size)
+    k1 = min(nz, k0 + block_size)
 
     min_dist_sq = _scan_convert_block_distances(
         triangles,
         triangle_indices,
         bounds,
-        resolution,
+        resolution_xyz,
         i0,
         i1,
         j0,
@@ -644,26 +684,29 @@ def _refine_octree_sparse_block(
 def _estimate_sparse_profitability(
     mesh: ParsedMesh,
     bounds: list[list[float]],
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
     block_size: int,
     band_distance: float,
 ) -> tuple[bool, str, float, int, float]:
-    spacing = _bounds_spacing(bounds, resolution)
+    nx, ny, nz = resolution_xyz
+    spacing = _bounds_spacing(bounds, resolution_xyz)
     origin = np.asarray([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
     spacing_vec = np.asarray(spacing, dtype=np.float64)
-    blocks_per_axis = int(math.ceil(resolution / float(block_size)))
+    blocks_x = int(math.ceil(nx / float(block_size)))
+    blocks_y = int(math.ceil(ny / float(block_size)))
+    blocks_z = int(math.ceil(nz / float(block_size)))
 
     mesh_min = np.min(mesh.vertices, axis=0) - band_distance
     mesh_max = np.max(mesh.vertices, axis=0) + band_distance
-    i0 = _grid_index_floor(float(mesh_min[0]), float(origin[0]), float(spacing_vec[0]), resolution)
-    j0 = _grid_index_floor(float(mesh_min[1]), float(origin[1]), float(spacing_vec[1]), resolution)
-    k0 = _grid_index_floor(float(mesh_min[2]), float(origin[2]), float(spacing_vec[2]), resolution)
-    i1 = _grid_index_ceil(float(mesh_max[0]), float(origin[0]), float(spacing_vec[0]), resolution)
-    j1 = _grid_index_ceil(float(mesh_max[1]), float(origin[1]), float(spacing_vec[1]), resolution)
-    k1 = _grid_index_ceil(float(mesh_max[2]), float(origin[2]), float(spacing_vec[2]), resolution)
+    i0 = _grid_index_floor(float(mesh_min[0]), float(origin[0]), float(spacing_vec[0]), nx)
+    j0 = _grid_index_floor(float(mesh_min[1]), float(origin[1]), float(spacing_vec[1]), ny)
+    k0 = _grid_index_floor(float(mesh_min[2]), float(origin[2]), float(spacing_vec[2]), nz)
+    i1 = _grid_index_ceil(float(mesh_max[0]), float(origin[0]), float(spacing_vec[0]), nx)
+    j1 = _grid_index_ceil(float(mesh_max[1]), float(origin[1]), float(spacing_vec[1]), ny)
+    k1 = _grid_index_ceil(float(mesh_max[2]), float(origin[2]), float(spacing_vec[2]), nz)
 
     near_voxels = max(1, (i1 - i0 + 1) * (j1 - j0 + 1) * (k1 - k0 + 1))
-    near_ratio_est = float(near_voxels) / float(max(1, resolution**3))
+    near_ratio_est = float(near_voxels) / float(max(1, voxel_count((nx, ny, nz))))
     if near_ratio_est >= _AUTO_SPARSE_MAX_EST_NEAR_RATIO:
         return False, "dense_auto_gate_near_ratio", near_ratio_est, 0, 0.0
 
@@ -673,20 +716,20 @@ def _estimate_sparse_profitability(
 
     tri_block_min = np.floor((tri_min - origin[None, :]) / spacing_vec[None, :]).astype(np.int64)
     tri_block_max = np.ceil((tri_max - origin[None, :]) / spacing_vec[None, :]).astype(np.int64)
-    np.clip(tri_block_min, 0, resolution - 1, out=tri_block_min)
-    np.clip(tri_block_max, 0, resolution - 1, out=tri_block_max)
+    np.clip(tri_block_min, 0, np.array([nx - 1, ny - 1, nz - 1], dtype=np.int64), out=tri_block_min)
+    np.clip(tri_block_max, 0, np.array([nx - 1, ny - 1, nz - 1], dtype=np.int64), out=tri_block_max)
 
     tri_block_min //= block_size
     tri_block_max //= block_size
-    np.minimum(tri_block_min, blocks_per_axis - 1, out=tri_block_min)
-    np.minimum(tri_block_max, blocks_per_axis - 1, out=tri_block_max)
+    np.minimum(tri_block_min, np.array([blocks_x - 1, blocks_y - 1, blocks_z - 1], dtype=np.int64), out=tri_block_min)
+    np.minimum(tri_block_max, np.array([blocks_x - 1, blocks_y - 1, blocks_z - 1], dtype=np.int64), out=tri_block_max)
 
     bx0 = i0 // block_size
     by0 = j0 // block_size
     bz0 = k0 // block_size
-    bx1 = min(blocks_per_axis - 1, i1 // block_size)
-    by1 = min(blocks_per_axis - 1, j1 // block_size)
-    bz1 = min(blocks_per_axis - 1, k1 // block_size)
+    bx1 = min(blocks_x - 1, i1 // block_size)
+    by1 = min(blocks_y - 1, j1 // block_size)
+    bz1 = min(blocks_z - 1, k1 // block_size)
     estimated_active_blocks = max(1, (bx1 - bx0 + 1) * (by1 - by0 + 1) * (bz1 - bz0 + 1))
 
     tri_block_spans = (tri_block_max - tri_block_min + 1).astype(np.int64)
@@ -721,11 +764,12 @@ def _estimate_sparse_profitability(
 def _build_host_sdf_from_surface_samples(
     occupancy: np.ndarray,
     bounds: list[list[float]],
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
     *,
     compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
 ) -> tuple[np.ndarray, int | None, list[tuple[int, int, int]] | None, float | None, str, Literal["cpu", "cuda"]]:
-    spacing = _bounds_spacing(bounds, resolution)
+    nx, ny, nz = resolution_xyz
+    spacing = _bounds_spacing(bounds, resolution_xyz)
     max_spacing = float(max(spacing))
     eroded = ndimage.binary_erosion(occupancy, iterations=1)
     surface = np.logical_xor(occupancy, eroded)
@@ -733,13 +777,14 @@ def _build_host_sdf_from_surface_samples(
         host_sdf, host_backend = _build_host_sdf_dense_with_backend(
             occupancy,
             bounds,
-            resolution,
+            resolution_xyz,
             compute_backend=compute_backend,
         )
         return host_sdf, None, None, None, "dense_sparse_no_surface", host_backend
 
-    block_size = max(8, min(32, resolution // 6))
-    band_voxels = max(12, resolution // 6)
+    min_dim = min(nx, ny, nz)
+    block_size = max(8, min(32, max(2, min_dim // 6)))
+    band_voxels = max(12, max(2, min_dim // 6))
     band_distance = float(band_voxels) * max_spacing
 
     surface_blocks = _octree_collect_surface_blocks(surface, block_size=block_size)
@@ -747,12 +792,14 @@ def _build_host_sdf_from_surface_samples(
         host_sdf, host_backend = _build_host_sdf_dense_with_backend(
             occupancy,
             bounds,
-            resolution,
+            resolution_xyz,
             compute_backend=compute_backend,
         )
         return host_sdf, None, None, None, "dense_sparse_no_surface_blocks", host_backend
 
-    blocks_per_axis = int(math.ceil(resolution / float(block_size)))
+    blocks_x = int(math.ceil(nx / float(block_size)))
+    blocks_y = int(math.ceil(ny / float(block_size)))
+    blocks_z = int(math.ceil(nz / float(block_size)))
     halo_blocks = max(1, int(math.ceil(float(band_voxels) / float(block_size))))
     active_blocks: set[tuple[int, int, int]] = set()
     for bx, by, bz in surface_blocks:
@@ -762,7 +809,7 @@ def _build_host_sdf_from_surface_samples(
                     nbx = bx + dx
                     nby = by + dy
                     nbz = bz + dz
-                    if 0 <= nbx < blocks_per_axis and 0 <= nby < blocks_per_axis and 0 <= nbz < blocks_per_axis:
+                    if 0 <= nbx < blocks_x and 0 <= nby < blocks_y and 0 <= nbz < blocks_z:
                         active_blocks.add((nbx, nby, nbz))
 
     near_mask = np.zeros_like(occupancy, dtype=bool)
@@ -770,9 +817,9 @@ def _build_host_sdf_from_surface_samples(
         i0 = bx * block_size
         j0 = by * block_size
         k0 = bz * block_size
-        i1 = min(resolution, i0 + block_size)
-        j1 = min(resolution, j0 + block_size)
-        k1 = min(resolution, k0 + block_size)
+        i1 = min(nx, i0 + block_size)
+        j1 = min(ny, j0 + block_size)
+        k1 = min(nz, k0 + block_size)
         near_mask[i0:i1, j0:j1, k0:k1] = True
 
     near_ratio = float(np.count_nonzero(near_mask)) / float(near_mask.size)
@@ -780,7 +827,7 @@ def _build_host_sdf_from_surface_samples(
         host_sdf, host_backend = _build_host_sdf_dense_with_backend(
             occupancy,
             bounds,
-            resolution,
+            resolution_xyz,
             compute_backend=compute_backend,
         )
         return host_sdf, None, None, None, "dense_sparse_post_near_ratio", host_backend
@@ -791,7 +838,7 @@ def _build_host_sdf_from_surface_samples(
         host_sdf, host_backend = _build_host_sdf_dense_with_backend(
             occupancy,
             bounds,
-            resolution,
+            resolution_xyz,
             compute_backend=compute_backend,
         )
         return host_sdf, None, None, None, "dense_sparse_no_query_points", host_backend
@@ -808,7 +855,7 @@ def _build_host_sdf_from_surface_samples(
         host_sdf, host_backend = _build_host_sdf_dense_with_backend(
             occupancy,
             bounds,
-            resolution,
+            resolution_xyz,
             compute_backend=compute_backend,
         )
         return host_sdf, None, None, None, "dense_sparse_kdtree_failure", host_backend
@@ -827,7 +874,7 @@ def _build_host_sdf_octree_sparse(
     mesh: ParsedMesh | None,
     occupancy: np.ndarray,
     bounds: list[list[float]],
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
     *,
     allow_dense_fallback: bool = True,
     compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
@@ -839,160 +886,182 @@ def _build_host_sdf_octree_sparse(
     str,
     Literal["cpu", "cuda"],
 ]:
+    start = time.perf_counter()
+    decision_reason = "sparse_selected_explicit" if not allow_dense_fallback else "sparse_selected_auto"
     # For smaller grids, full EDT is typically faster and simpler.
-    if resolution <= 96:
-        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
-            occupancy,
-            bounds,
-            resolution,
-            compute_backend=compute_backend,
-        )
-        return host_sdf, None, None, None, "dense_resolution_cutoff", host_backend
-
-    spacing = _bounds_spacing(bounds, resolution)
-    max_spacing = float(max(spacing))
-
-    block_size = max(8, min(32, resolution // 6))
-    band_voxels = max(12, resolution // 6)
-    band_distance = float(band_voxels) * max_spacing
-    far_value = np.float32(max(band_distance + 2.0 * max_spacing, max_spacing))
-
-    if mesh is None:
-        return _build_host_sdf_from_surface_samples(
-            occupancy,
-            bounds,
-            resolution,
-            compute_backend=compute_backend,
-        )
-
-    if allow_dense_fallback:
-        profitable, reason, _near_ratio, _tri_hits, _tri_per_block = _estimate_sparse_profitability(
-            mesh,
-            bounds,
-            resolution,
-            block_size=block_size,
-            band_distance=band_distance,
-        )
-        if not profitable:
+    nx, ny, nz = resolution_xyz
+    min_dim = min(nx, ny, nz)
+    try:
+        if max(nx, ny, nz) <= 96:
             host_sdf, host_backend = _build_host_sdf_dense_with_backend(
                 occupancy,
                 bounds,
-                resolution,
+                resolution_xyz,
                 compute_backend=compute_backend,
             )
-            return host_sdf, None, None, None, reason, host_backend
+            decision_reason = "dense_resolution_cutoff"
+            return host_sdf, None, None, None, decision_reason, host_backend
 
-    triangles, block_candidates, active_blocks, near_ratio = _triangle_scan_convert_candidates(
-        mesh,
-        bounds,
-        resolution,
-        block_size=block_size,
-        band_distance=band_distance,
-    )
-    if not active_blocks:
-        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
-            occupancy,
-            bounds,
-            resolution,
-            compute_backend=compute_backend,
-        )
-        return host_sdf, None, None, None, "dense_sparse_no_active_blocks", host_backend
+        spacing = _bounds_spacing(bounds, resolution_xyz)
+        max_spacing = float(max(spacing))
 
-    if allow_dense_fallback and near_ratio >= 0.65:
-        # Sparse path helps only when most of the domain is pruned.
-        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
-            occupancy,
-            bounds,
-            resolution,
-            compute_backend=compute_backend,
-        )
-        return host_sdf, None, None, None, "dense_sparse_post_near_ratio", host_backend
+        block_size = max(8, min(32, max(2, min_dim // 6)))
+        band_voxels = max(12, max(2, min_dim // 6))
+        band_distance = float(band_voxels) * max_spacing
+        far_value = np.float32(max(band_distance + 2.0 * max_spacing, max_spacing))
 
-    sign = np.where(occupancy, -1.0, 1.0).astype(np.float32, copy=False)
-    host_sdf = sign * far_value
-    band_distance_sq = band_distance * band_distance
-    refined_blocks: list[tuple[int, int, int]] = []
-    block_tasks = [block for block in active_blocks if block_candidates.get(block)]
-
-    if not block_tasks:
-        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
-            occupancy,
-            bounds,
-            resolution,
-            compute_backend=compute_backend,
-        )
-        return host_sdf, None, None, None, "dense_sparse_no_refined_blocks", host_backend
-
-    max_workers = min(len(block_tasks), os.cpu_count() or 1)
-
-    def apply_block_result(block_key: tuple[int, int, int], min_dist_sq: np.ndarray) -> None:
-        bx, by, bz = block_key
-        i0 = bx * block_size
-        j0 = by * block_size
-        k0 = bz * block_size
-        i1 = min(resolution, i0 + block_size)
-        j1 = min(resolution, j0 + block_size)
-        k1 = min(resolution, k0 + block_size)
-
-        within_band = np.isfinite(min_dist_sq) & (min_dist_sq <= band_distance_sq)
-        if not np.any(within_band):
-            return
-
-        dist_block = np.full_like(min_dist_sq, far_value, dtype=np.float64)
-        np.sqrt(min_dist_sq, out=dist_block, where=within_band)
-        signed_block = dist_block.astype(np.float32, copy=False) * sign[i0:i1, j0:j1, k0:k1]
-        current = host_sdf[i0:i1, j0:j1, k0:k1]
-        current[within_band] = signed_block[within_band]
-        host_sdf[i0:i1, j0:j1, k0:k1] = current
-        refined_blocks.append((bx, by, bz))
-
-    if max_workers <= 1:
-        for bx, by, bz in block_tasks:
-            result = _refine_octree_sparse_block(
-                triangles,
-                block_candidates,
+        if mesh is None:
+            host_sdf, block_size, active_blocks, sparse_background_value, reason, host_backend = _build_host_sdf_from_surface_samples(
+                occupancy,
                 bounds,
-                resolution,
-                block_size,
-                bx,
-                by,
-                bz,
+                resolution_xyz,
+                compute_backend=compute_backend,
             )
-            if result is not None:
-                apply_block_result(*result)
-    else:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(
-                    _refine_octree_sparse_block,
+            decision_reason = reason
+            return host_sdf, block_size, active_blocks, sparse_background_value, decision_reason, host_backend
+
+        if allow_dense_fallback:
+            profitable, reason, _near_ratio, _tri_hits, _tri_per_block = _estimate_sparse_profitability(
+                mesh,
+                bounds,
+                resolution_xyz,
+                block_size=block_size,
+                band_distance=band_distance,
+            )
+            if not profitable:
+                host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+                    occupancy,
+                    bounds,
+                    resolution_xyz,
+                    compute_backend=compute_backend,
+                )
+                decision_reason = reason
+                return host_sdf, None, None, None, decision_reason, host_backend
+
+        triangles, block_candidates, active_blocks, near_ratio = _triangle_scan_convert_candidates(
+            mesh,
+            bounds,
+            resolution_xyz,
+            block_size=block_size,
+            band_distance=band_distance,
+        )
+        if not active_blocks:
+            host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+                occupancy,
+                bounds,
+                resolution_xyz,
+                compute_backend=compute_backend,
+            )
+            decision_reason = "dense_sparse_no_active_blocks"
+            return host_sdf, None, None, None, decision_reason, host_backend
+
+        if allow_dense_fallback and near_ratio >= 0.65:
+            # Sparse path helps only when most of the domain is pruned.
+            host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+                occupancy,
+                bounds,
+                resolution_xyz,
+                compute_backend=compute_backend,
+            )
+            decision_reason = "dense_sparse_post_near_ratio"
+            return host_sdf, None, None, None, decision_reason, host_backend
+
+        sign = np.where(occupancy, -1.0, 1.0).astype(np.float32, copy=False)
+        host_sdf = sign * far_value
+        band_distance_sq = band_distance * band_distance
+        refined_blocks: list[tuple[int, int, int]] = []
+        block_tasks = [block for block in active_blocks if block_candidates.get(block)]
+
+        if not block_tasks:
+            host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+                occupancy,
+                bounds,
+                resolution_xyz,
+                compute_backend=compute_backend,
+            )
+            decision_reason = "dense_sparse_no_refined_blocks"
+            return host_sdf, None, None, None, decision_reason, host_backend
+
+        max_workers = min(len(block_tasks), os.cpu_count() or 1)
+
+        def apply_block_result(block_key: tuple[int, int, int], min_dist_sq: np.ndarray) -> None:
+            bx, by, bz = block_key
+            i0 = bx * block_size
+            j0 = by * block_size
+            k0 = bz * block_size
+            i1 = min(nx, i0 + block_size)
+            j1 = min(ny, j0 + block_size)
+            k1 = min(nz, k0 + block_size)
+
+            within_band = np.isfinite(min_dist_sq) & (min_dist_sq <= band_distance_sq)
+            if not np.any(within_band):
+                return
+
+            dist_block = np.full_like(min_dist_sq, far_value, dtype=np.float64)
+            np.sqrt(min_dist_sq, out=dist_block, where=within_band)
+            signed_block = dist_block.astype(np.float32, copy=False) * sign[i0:i1, j0:j1, k0:k1]
+            current = host_sdf[i0:i1, j0:j1, k0:k1]
+            current[within_band] = signed_block[within_band]
+            host_sdf[i0:i1, j0:j1, k0:k1] = current
+            refined_blocks.append((bx, by, bz))
+
+        if max_workers <= 1:
+            for bx, by, bz in block_tasks:
+                result = _refine_octree_sparse_block(
                     triangles,
                     block_candidates,
                     bounds,
-                    resolution,
+                    resolution_xyz,
                     block_size,
                     bx,
                     by,
                     bz,
                 )
-                for bx, by, bz in block_tasks
-            ]
-            for future in as_completed(futures):
-                result = future.result()
                 if result is not None:
                     apply_block_result(*result)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _refine_octree_sparse_block,
+                        triangles,
+                        block_candidates,
+                        bounds,
+                        resolution_xyz,
+                        block_size,
+                        bx,
+                        by,
+                        bz,
+                    )
+                    for bx, by, bz in block_tasks
+                ]
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        apply_block_result(*result)
 
-    if not refined_blocks:
-        host_sdf, host_backend = _build_host_sdf_dense_with_backend(
-            occupancy,
-            bounds,
-            resolution,
-            compute_backend=compute_backend,
+        if not refined_blocks:
+            host_sdf, host_backend = _build_host_sdf_dense_with_backend(
+                occupancy,
+                bounds,
+                resolution_xyz,
+                compute_backend=compute_backend,
+            )
+            decision_reason = "dense_sparse_no_refined_blocks"
+            return host_sdf, None, None, None, decision_reason, host_backend
+
+        refined_blocks.sort()
+        decision_reason = "sparse_selected_auto" if allow_dense_fallback else "sparse_selected_explicit"
+        return host_sdf, block_size, refined_blocks, float(far_value), decision_reason, "cpu"
+    finally:
+        logger.debug(
+            "host_sdf_sparse_ms=%.2f decision=%s resolution=%dx%dx%d",
+            (time.perf_counter() - start) * 1000.0,
+            decision_reason,
+            nx,
+            ny,
+            nz,
         )
-        return host_sdf, None, None, None, "dense_sparse_no_refined_blocks", host_backend
-
-    refined_blocks.sort()
-    strategy_reason = "sparse_selected_auto" if allow_dense_fallback else "sparse_selected_explicit"
-    return host_sdf, block_size, refined_blocks, float(far_value), strategy_reason, "cpu"
 
 
 def compose_hollow_lattice_field_sparse_with_backend(
@@ -1067,35 +1136,48 @@ def compose_hollow_lattice_field_with_backend(
     lattice_phase: float,
     compute_backend: Literal["auto", "cpu", "cuda"] = "auto",
 ) -> tuple[np.ndarray, Literal["cpu", "cuda"]]:
+    start = time.perf_counter()
+    backend_name: Literal["cpu", "cuda"] = "cpu"
     resolved_backend = _resolve_compute_backend(compute_backend)
-    if resolved_backend == "cuda":
-        try:
-            return (
-                _compose_hollow_lattice_field_cuda(
-                    host_sdf,
-                    bounds,
-                    shell_thickness=shell_thickness,
-                    lattice_type=lattice_type,
-                    lattice_pitch=lattice_pitch,
-                    lattice_thickness=lattice_thickness,
-                    lattice_phase=lattice_phase,
-                ),
-                "cuda",
-            )
-        except Exception:
-            pass
-    return (
-        _compose_hollow_lattice_field_cpu(
-            host_sdf,
-            bounds,
-            shell_thickness=shell_thickness,
-            lattice_type=lattice_type,
-            lattice_pitch=lattice_pitch,
-            lattice_thickness=lattice_thickness,
-            lattice_phase=lattice_phase,
-        ),
-        "cpu",
-    )
+    try:
+        if resolved_backend == "cuda":
+            try:
+                backend_name = "cuda"
+                return (
+                    _compose_hollow_lattice_field_cuda(
+                        host_sdf,
+                        bounds,
+                        shell_thickness=shell_thickness,
+                        lattice_type=lattice_type,
+                        lattice_pitch=lattice_pitch,
+                        lattice_thickness=lattice_thickness,
+                        lattice_phase=lattice_phase,
+                    ),
+                    backend_name,
+                )
+            except Exception:
+                backend_name = "cpu"
+        return (
+            _compose_hollow_lattice_field_cpu(
+                host_sdf,
+                bounds,
+                shell_thickness=shell_thickness,
+                lattice_type=lattice_type,
+                lattice_pitch=lattice_pitch,
+                lattice_thickness=lattice_thickness,
+                lattice_phase=lattice_phase,
+            ),
+            backend_name,
+        )
+    finally:
+        logger.debug(
+            "tpms_compose_ms=%.2f backend=%s resolution=%dx%dx%d",
+            (time.perf_counter() - start) * 1000.0,
+            backend_name,
+            int(host_sdf.shape[0]),
+            int(host_sdf.shape[1]),
+            int(host_sdf.shape[2]),
+        )
 
 
 def _compose_hollow_lattice_field_cpu(
@@ -1128,10 +1210,10 @@ def _compose_hollow_lattice_field_cpu(
     # Expensive TPMS trig is needed only inside cavity voxels.
     mask = out < 0.0
     if np.any(mask):
-        resolution = host_sdf.shape[0]
-        x_axis = np.linspace(bounds[0][0], bounds[0][1], resolution, dtype=host_sdf.dtype)
-        y_axis = np.linspace(bounds[1][0], bounds[1][1], resolution, dtype=host_sdf.dtype)
-        z_axis = np.linspace(bounds[2][0], bounds[2][1], resolution, dtype=host_sdf.dtype)
+        nx, ny, nz = (int(host_sdf.shape[0]), int(host_sdf.shape[1]), int(host_sdf.shape[2]))
+        x_axis = np.linspace(bounds[0][0], bounds[0][1], nx, dtype=host_sdf.dtype)
+        y_axis = np.linspace(bounds[1][0], bounds[1][1], ny, dtype=host_sdf.dtype)
+        z_axis = np.linspace(bounds[2][0], bounds[2][1], nz, dtype=host_sdf.dtype)
         ix, iy, iz = np.nonzero(mask)
 
         qx = x_axis[ix]
@@ -1187,10 +1269,10 @@ def _compose_hollow_lattice_field_cuda(
 
     mask = out < 0.0
     if bool(cp.any(mask).item()):
-        resolution = host.shape[0]
-        x_axis = cp.linspace(bounds[0][0], bounds[0][1], resolution, dtype=cp.float32)
-        y_axis = cp.linspace(bounds[1][0], bounds[1][1], resolution, dtype=cp.float32)
-        z_axis = cp.linspace(bounds[2][0], bounds[2][1], resolution, dtype=cp.float32)
+        nx, ny, nz = (int(host.shape[0]), int(host.shape[1]), int(host.shape[2]))
+        x_axis = cp.linspace(bounds[0][0], bounds[0][1], nx, dtype=cp.float32)
+        y_axis = cp.linspace(bounds[1][0], bounds[1][1], ny, dtype=cp.float32)
+        z_axis = cp.linspace(bounds[2][0], bounds[2][1], nz, dtype=cp.float32)
         ix, iy, iz = cp.nonzero(mask)
         qx = x_axis[ix]
         qy = y_axis[iy]
@@ -1218,9 +1300,9 @@ def build_hollow_lattice_field(
     lattice_pitch: float,
     lattice_thickness: float,
     lattice_phase: float,
-    resolution: int,
+    resolution_xyz: ResolutionXYZ,
 ) -> tuple[np.ndarray, list[list[float]], np.ndarray]:
-    host = build_host_field(mesh, resolution=resolution)
+    host = build_host_field(mesh, resolution_xyz=resolution_xyz)
     field = compose_hollow_lattice_field(
         host.host_sdf,
         host.bounds,
@@ -1408,12 +1490,8 @@ def _build_bounds(mesh: ParsedMesh) -> list[list[float]]:
     ]
 
 
-def _bounds_spacing(bounds: list[list[float]], resolution: int) -> tuple[float, float, float]:
-    return (
-        (bounds[0][1] - bounds[0][0]) / float(resolution - 1),
-        (bounds[1][1] - bounds[1][0]) / float(resolution - 1),
-        (bounds[2][1] - bounds[2][0]) / float(resolution - 1),
-    )
+def _bounds_spacing(bounds: list[list[float]], resolution_xyz: ResolutionXYZ) -> tuple[float, float, float]:
+    return spacing_from_bounds(bounds, resolution_xyz)
 
 
 def _clip_round_index(value: float, resolution: int) -> int:
@@ -1473,7 +1551,10 @@ def _dilate_close_and_fill(surface: np.ndarray, *, closing_iterations: int = 1) 
                 iterations=closing_iterations,
             )
             if _is_cupy_out_of_memory_error(exc):
-                return _fill_holes_cpu(surface_cpu), _gpu_fill_fallback_reason(surface.shape[0], exc)
+                return _fill_holes_cpu(surface_cpu), _gpu_fill_fallback_reason(
+                    (int(surface.shape[0]), int(surface.shape[1]), int(surface.shape[2])),
+                    exc,
+                )
             logger.warning("GPU voxel fill failed; falling back to CPU.", exc_info=True)
             return _fill_holes_cpu(surface_cpu), _gpu_runtime_fallback_reason(exc)
 
@@ -1482,8 +1563,9 @@ def _dilate_close_and_fill(surface: np.ndarray, *, closing_iterations: int = 1) 
     return _fill_holes_cpu(surface), None
 
 
-def _rasterize_surface_python(verts_grid: np.ndarray, faces: np.ndarray, resolution: int) -> np.ndarray:
-    surface = np.zeros((resolution, resolution, resolution), dtype=np.uint8)
+def _rasterize_surface_python(verts_grid: np.ndarray, faces: np.ndarray, resolution_xyz: ResolutionXYZ) -> np.ndarray:
+    nx, ny, nz = resolution_xyz
+    surface = np.zeros((nx, ny, nz), dtype=np.uint8)
     for f0, f1, f2 in faces:
         p0 = verts_grid[int(f0)]
         p1 = verts_grid[int(f1)]
@@ -1501,9 +1583,9 @@ def _rasterize_surface_python(verts_grid: np.ndarray, faces: np.ndarray, resolut
             for j in range(max_j + 1):
                 v = float(j) / float(steps)
                 sample = p0 + u * (p1 - p0) + v * (p2 - p0)
-                ix = _clip_round_index(float(sample[0]), resolution)
-                iy = _clip_round_index(float(sample[1]), resolution)
-                iz = _clip_round_index(float(sample[2]), resolution)
+                ix = _clip_round_index(float(sample[0]), nx)
+                iy = _clip_round_index(float(sample[1]), ny)
+                iz = _clip_round_index(float(sample[2]), nz)
                 surface[ix, iy, iz] = 1
     return surface
 
@@ -1521,8 +1603,15 @@ if NUMBA_AVAILABLE:
 
 
     @njit(parallel=True, cache=True)
-    def _rasterize_surface_numba(verts_grid: np.ndarray, faces: np.ndarray, resolution: int) -> np.ndarray:
-        surface = np.zeros((resolution, resolution, resolution), dtype=np.uint8)
+    def _rasterize_surface_numba(
+        verts_grid: np.ndarray,
+        faces: np.ndarray,
+        resolution_xyz: tuple[int, int, int],
+    ) -> np.ndarray:
+        nx = int(resolution_xyz[0])
+        ny = int(resolution_xyz[1])
+        nz = int(resolution_xyz[2])
+        surface = np.zeros((nx, ny, nz), dtype=np.uint8)
         for face_idx in prange(faces.shape[0]):
             f0 = int(faces[face_idx, 0])
             f1 = int(faces[face_idx, 1])
@@ -1575,25 +1664,34 @@ if NUMBA_AVAILABLE:
                     sy = p0y + u * d10y + v * d20y
                     sz = p0z + u * d10z + v * d20z
 
-                    ix = _clip_round_index_numba(sx, resolution)
-                    iy = _clip_round_index_numba(sy, resolution)
-                    iz = _clip_round_index_numba(sz, resolution)
+                    ix = _clip_round_index_numba(sx, nx)
+                    iy = _clip_round_index_numba(sy, ny)
+                    iz = _clip_round_index_numba(sz, nz)
                     surface[ix, iy, iz] = 1
         return surface
 
 else:
 
-    def _rasterize_surface_numba(verts_grid: np.ndarray, faces: np.ndarray, resolution: int) -> np.ndarray:
+    def _rasterize_surface_numba(
+        verts_grid: np.ndarray,
+        faces: np.ndarray,
+        resolution_xyz: tuple[int, int, int],
+    ) -> np.ndarray:
         raise RuntimeError("Numba is unavailable")
 
 
-def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: int) -> tuple[np.ndarray, str | None]:
+def _voxelize_and_fill(
+    mesh: ParsedMesh,
+    bounds: list[list[float]],
+    resolution_xyz: ResolutionXYZ,
+) -> tuple[np.ndarray, str | None]:
+    nx, ny, nz = normalize_resolution_xyz(resolution_xyz)
     mins = np.asarray([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
     scales = np.asarray(
         [
-            (resolution - 1) / (bounds[0][1] - bounds[0][0]),
-            (resolution - 1) / (bounds[1][1] - bounds[1][0]),
-            (resolution - 1) / (bounds[2][1] - bounds[2][0]),
+            (nx - 1) / (bounds[0][1] - bounds[0][0]),
+            (ny - 1) / (bounds[1][1] - bounds[1][0]),
+            (nz - 1) / (bounds[2][1] - bounds[2][0]),
         ],
         dtype=np.float64,
     )
@@ -1602,17 +1700,29 @@ def _voxelize_and_fill(mesh: ParsedMesh, bounds: list[list[float]], resolution: 
     faces = np.ascontiguousarray(mesh.faces, dtype=np.int32)
 
     surface_u8: np.ndarray
+    rasterize_start = time.perf_counter()
     try:
         if NUMBA_AVAILABLE:
-            surface_u8 = _rasterize_surface_numba(verts_grid, faces, resolution)
+            surface_u8 = _rasterize_surface_numba(verts_grid, faces, (nx, ny, nz))
         else:
-            surface_u8 = _rasterize_surface_python(verts_grid, faces, resolution)
+            surface_u8 = _rasterize_surface_python(verts_grid, faces, (nx, ny, nz))
     except Exception:
-        surface_u8 = _rasterize_surface_python(verts_grid, faces, resolution)
+        surface_u8 = _rasterize_surface_python(verts_grid, faces, (nx, ny, nz))
+    rasterize_ms = (time.perf_counter() - rasterize_start) * 1000.0
     surface = surface_u8.astype(bool, copy=False)
     del surface_u8
 
+    fill_start = time.perf_counter()
     filled, fallback_reason = _dilate_close_and_fill(surface, closing_iterations=1)
+    fill_ms = (time.perf_counter() - fill_start) * 1000.0
+    logger.debug(
+        "uploaded_mesh_voxelization_ms=%.2f uploaded_mesh_fill_ms=%.2f resolution=%dx%dx%d",
+        rasterize_ms,
+        fill_ms,
+        nx,
+        ny,
+        nz,
+    )
 
     if not np.any(filled):
         raise MeshUploadError("Voxelization failed: no solid volume detected")

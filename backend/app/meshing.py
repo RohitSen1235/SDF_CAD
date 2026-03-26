@@ -390,10 +390,10 @@ def _resolve_mesh_backend(requested: Literal["auto", "cpu", "cuda"]) -> Literal[
 
 
 def _mesh_single_cpu(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
-    resolution = field.shape[0]
-    dx = (bounds[0][1] - bounds[0][0]) / float(resolution - 1)
-    dy = (bounds[1][1] - bounds[1][0]) / float(resolution - 1)
-    dz = (bounds[2][1] - bounds[2][0]) / float(resolution - 1)
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
+    dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
+    dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
 
     vertices, faces, normals, _ = marching_cubes(
         field, level=0.0, spacing=(dx, dy, dz), allow_degenerate=False
@@ -409,10 +409,10 @@ def _mesh_single_cuda(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
     if not _cuda_meshing_available() or cp is None:
         raise MeshingError("CUDA meshing requested but CUDA runtime is unavailable")
 
-    resolution = field.shape[0]
-    dx = (bounds[0][1] - bounds[0][0]) / float(resolution - 1)
-    dy = (bounds[1][1] - bounds[1][0]) / float(resolution - 1)
-    dz = (bounds[2][1] - bounds[2][0]) / float(resolution - 1)
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
+    dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
+    dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
     origin = np.array([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float32)
 
     volume = cp.asarray(np.ascontiguousarray(field), dtype=cp.float32)
@@ -490,13 +490,13 @@ def _mesh_single_cuda(field: np.ndarray, bounds: list[list[float]]) -> MeshData:
 
 
 def _mesh_chunked(field: np.ndarray, bounds: list[list[float]], chunk_size: int = 80) -> MeshData:
-    resolution = field.shape[0]
-    dx = (bounds[0][1] - bounds[0][0]) / float(resolution - 1)
-    dy = (bounds[1][1] - bounds[1][0]) / float(resolution - 1)
-    dz = (bounds[2][1] - bounds[2][0]) / float(resolution - 1)
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
+    dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
+    dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
 
     origin = np.array([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
-    slab_step = max(12, min(chunk_size, resolution - 1))
+    slab_step = max(12, min(chunk_size, nx - 1))
 
     vertex_map: dict[tuple[int, int, int], int] = {}
     vertices: list[list[float]] = []
@@ -504,8 +504,8 @@ def _mesh_chunked(field: np.ndarray, bounds: list[list[float]], chunk_size: int 
     faces: list[list[int]] = []
     quant = 1e-6
 
-    for start in range(0, resolution - 1, slab_step):
-        stop = min(resolution - 1, start + slab_step)
+    for start in range(0, nx - 1, slab_step):
+        stop = min(nx - 1, start + slab_step)
         slab = field[start : stop + 1, :, :]
         if slab.size == 0:
             continue
@@ -568,13 +568,13 @@ def _mesh_chunked(field: np.ndarray, bounds: list[list[float]], chunk_size: int 
     )
  
 def _mesh_adaptive_cpu(field: np.ndarray, bounds: list[list[float]], block_size: int = 28) -> MeshData:
-    resolution = field.shape[0]
-    dx = (bounds[0][1] - bounds[0][0]) / float(resolution - 1)
-    dy = (bounds[1][1] - bounds[1][0]) / float(resolution - 1)
-    dz = (bounds[2][1] - bounds[2][0]) / float(resolution - 1)
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
+    dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
+    dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
 
     origin = np.array([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
-    step = max(8, min(block_size, resolution - 1))
+    step = max(8, min(block_size, min(nx, ny, nz) - 1))
 
     vertex_map: dict[tuple[int, int, int], int] = {}
     vertices: list[list[float]] = []
@@ -582,12 +582,12 @@ def _mesh_adaptive_cpu(field: np.ndarray, bounds: list[list[float]], block_size:
     faces: list[list[int]] = []
     quant = 1e-6
 
-    for i0 in range(0, resolution - 1, step):
-        i1 = min(resolution - 1, i0 + step)
-        for j0 in range(0, resolution - 1, step):
-            j1 = min(resolution - 1, j0 + step)
-            for k0 in range(0, resolution - 1, step):
-                k1 = min(resolution - 1, k0 + step)
+    for i0 in range(0, nx - 1, step):
+        i1 = min(nx - 1, i0 + step)
+        for j0 in range(0, ny - 1, step):
+            j1 = min(ny - 1, j0 + step)
+            for k0 in range(0, nz - 1, step):
+                k1 = min(nz - 1, k0 + step)
                 block = field[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1]
                 if block.size == 0:
                     continue
@@ -656,13 +656,13 @@ def _mesh_active_blocks_cpu(
     active_blocks: list[tuple[int, int, int]],
     block_size: int,
 ) -> MeshData:
-    resolution = field.shape[0]
-    dx = (bounds[0][1] - bounds[0][0]) / float(resolution - 1)
-    dy = (bounds[1][1] - bounds[1][0]) / float(resolution - 1)
-    dz = (bounds[2][1] - bounds[2][0]) / float(resolution - 1)
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
+    dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
+    dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
 
     origin = np.array([bounds[0][0], bounds[1][0], bounds[2][0]], dtype=np.float64)
-    step = max(8, min(int(block_size), resolution - 1))
+    step = max(8, min(int(block_size), min(nx, ny, nz) - 1))
 
     vertex_map: dict[tuple[int, int, int], int] = {}
     vertices: list[list[float]] = []
@@ -671,12 +671,12 @@ def _mesh_active_blocks_cpu(
     quant = 1e-6
 
     for bx, by, bz in active_blocks:
-        i0 = max(0, min((int(bx) * step), resolution - 1))
-        j0 = max(0, min((int(by) * step), resolution - 1))
-        k0 = max(0, min((int(bz) * step), resolution - 1))
-        i1 = min(resolution - 1, i0 + step)
-        j1 = min(resolution - 1, j0 + step)
-        k1 = min(resolution - 1, k0 + step)
+        i0 = max(0, min((int(bx) * step), nx - 1))
+        j0 = max(0, min((int(by) * step), ny - 1))
+        k0 = max(0, min((int(bz) * step), nz - 1))
+        i1 = min(nx - 1, i0 + step)
+        j1 = min(ny - 1, j0 + step)
+        k1 = min(nz - 1, k0 + step)
         block = field[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1]
         if block.size == 0:
             continue

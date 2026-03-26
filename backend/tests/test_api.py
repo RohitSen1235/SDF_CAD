@@ -131,7 +131,7 @@ def test_preview_field_endpoint_returns_volume_payload() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["field"]["encoding"] == "f32-base64"
-    assert payload["field"]["resolution"] == 64
+    assert payload["field"]["resolution_xyz"] == [64, 64, 64]
     assert payload["field"]["data"]
     assert payload["stats"]["preview_mode"] == "field"
     assert payload["stats"]["mesh_ms"] is None
@@ -151,7 +151,7 @@ def test_preview_field_binary_endpoint_returns_octet_stream() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/octet-stream")
     assert response.headers.get("x-sdf-stats")
-    assert response.headers.get("x-sdf-resolution") == "64"
+    assert response.headers.get("x-sdf-resolution-xyz") == "64,64,64"
     assert response.headers.get("x-sdf-bounds")
     # 64^3 float32 samples
     assert len(response.content) == 64 * 64 * 64 * 4
@@ -291,7 +291,7 @@ def test_mesh_preview_endpoint_obj_upload() -> None:
     assert payload["stats"]["tri_count"] > 0
     assert payload["mesh"]["encoding"] == "mesh-f32-u32-base64-v1"
     assert payload["field"]["encoding"] == "f32-base64"
-    assert payload["field"]["resolution"] == 24
+    assert payload["field"]["resolution_xyz"] == [24, 24, 24]
     assert payload["field"]["data"]
 
 
@@ -316,10 +316,10 @@ def test_mesh_field_endpoint_obj_upload() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["field"]["encoding"] == "f32-base64"
-    assert payload["field"]["resolution"] == 24
+    assert payload["field"]["resolution_xyz"] == [24, 24, 24]
     assert payload["field"]["data"]
     assert payload["host_field"]["encoding"] == "f32-base64"
-    assert payload["host_field"]["resolution"] == 24
+    assert payload["host_field"]["resolution_xyz"] == [24, 24, 24]
     assert payload["host_field"]["data"]
     assert payload["stats"]["preview_mode"] == "field"
     assert payload["stats"]["mesh_ms"] is None
@@ -336,7 +336,7 @@ def test_mesh_field_binary_endpoint_obj_upload() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/octet-stream")
     assert response.headers.get("x-sdf-stats")
-    assert response.headers.get("x-sdf-resolution") == "24"
+    assert response.headers.get("x-sdf-resolution-xyz") == "24,24,24"
     assert response.headers.get("x-sdf-trace-id")
     assert len(response.content) == 24 * 24 * 24 * 4 * 2
 
@@ -369,7 +369,7 @@ def test_mesh_field_binary_endpoint_reports_gpu_fill_fallback(monkeypatch: pytes
             metadata_cache_hit=False,
             host_cache_hit=False,
             field_cache_hit=False,
-            resolution=2,
+            resolution_xyz=(2, 2, 2),
             voxel_count=int(field.size),
             payload_bytes=int(field.size * np.dtype(np.float32).itemsize),
             compute_backend="cpu",
@@ -692,7 +692,7 @@ def test_uploaded_queueing_uses_computed_resolution_in_auto_mode(monkeypatch: py
     monkeypatch.setattr(
         main_module,
         "_compute_mesh_upload_resolution",
-        lambda *args, **kwargs: main_module.AUTO_QUEUE_RESOLUTION_THRESHOLD,
+        lambda *args, **kwargs: (128, 128, 128),
     )
     should_queue = main_module._should_queue_uploaded_request(
         file_bytes=MESH_OBJ,
@@ -707,7 +707,7 @@ def test_uploaded_queueing_uses_computed_resolution_in_auto_mode(monkeypatch: py
     monkeypatch.setattr(
         main_module,
         "_compute_mesh_upload_resolution",
-        lambda *args, **kwargs: main_module.AUTO_QUEUE_RESOLUTION_THRESHOLD - 1,
+        lambda *args, **kwargs: (127, 127, 127),
     )
     should_queue = main_module._should_queue_uploaded_request(
         file_bytes=MESH_OBJ,
@@ -723,7 +723,7 @@ def test_uploaded_queueing_uses_computed_resolution_in_auto_mode(monkeypatch: py
 def test_uploaded_queueing_uses_file_size_threshold_in_auto_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main_module, "REDIS_CLIENT_AVAILABLE", True)
     monkeypatch.setattr(main_module, "AUTO_QUEUE_UPLOAD_BYTES_THRESHOLD", 1)
-    monkeypatch.setattr(main_module, "_compute_mesh_upload_resolution", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(main_module, "_compute_mesh_upload_resolution", lambda *args, **kwargs: (2, 2, 2))
     should_queue = main_module._should_queue_uploaded_request(
         file_bytes=MESH_OBJ,
         file_hash=MESH_OBJ_HASH,
@@ -813,6 +813,7 @@ def test_preprocess_endpoint_returns_memory_context_headers(monkeypatch: pytest.
         metadata = kwargs["metadata"]
         context = main_module.UploadedMeshMemoryContext(
             mesh_span=1.5,
+            mesh_extents=(1.5, 1.5, 1.5),
             available_cpu_bytes=1024,
             available_gpu_free_bytes=2048,
             available_gpu_total_bytes=4096,
@@ -822,7 +823,7 @@ def test_preprocess_endpoint_returns_memory_context_headers(monkeypatch: pytest.
         )
         estimate = main_module.UploadedMeshMemoryEstimate(
             context=context,
-            resolution=24,
+            resolution_xyz=(24, 24, 24),
             required_cpu_bytes=512,
             required_gpu_bytes=1024,
             cpu_fatal=False,
@@ -840,6 +841,7 @@ def test_preprocess_endpoint_returns_memory_context_headers(monkeypatch: pytest.
     )
     assert response.status_code == 200
     assert response.headers["x-sdf-mesh-span"] == "1.5"
+    assert response.headers["x-sdf-resolution-xyz"] == "24,24,24"
     assert response.headers["x-sdf-available-cpu-bytes"] == "1024"
     assert response.headers["x-sdf-available-gpu-free-bytes"] == "2048"
     assert response.headers["x-sdf-available-gpu-total-bytes"] == "4096"
@@ -891,11 +893,12 @@ def test_preprocess_endpoint_warms_metadata_cache(monkeypatch: pytest.MonkeyPatc
 
     cache_module.clear_all_preview_caches()
 
-    def fake_build_host_field(mesh, resolution, **kwargs):
+    def fake_build_host_field(mesh, resolution_xyz, **kwargs):
+        nx, ny, nz = resolution_xyz
         return SimpleNamespace(
             mesh=mesh,
             bounds=[[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]],
-            host_sdf=np.zeros((2, 2, 2), dtype=np.float32),
+            host_sdf=np.zeros((nx, ny, nz), dtype=np.float32),
             host_compute_backend="cpu",
             field_storage_mode="dense",
             block_size=None,
@@ -956,7 +959,7 @@ def test_uploaded_field_preview_trace_includes_preprocessing_time(
             metadata_cache_hit=False,
             host_cache_hit=False,
             field_cache_hit=False,
-            resolution=2,
+            resolution_xyz=(2, 2, 2),
             voxel_count=int(field.size),
             payload_bytes=int(field.size * np.dtype(np.float32).itemsize),
             compute_backend="cpu",

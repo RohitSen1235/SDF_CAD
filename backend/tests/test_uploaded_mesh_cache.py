@@ -278,7 +278,12 @@ def test_uploaded_metadata_cache_avoids_reparsing_for_resolution(monkeypatch: py
     first = main_module._compute_mesh_upload_resolution(MESH_OBJ, MESH_OBJ_HASH, ".obj", 0.45, 6)
     second = main_module._compute_mesh_upload_resolution(MESH_OBJ, MESH_OBJ_HASH, ".obj", 0.45, 6)
 
-    expected, _ = main_module._resolve_mesh_resolution(0.45, 1.0, 6)
+    metadata = main_module._resolve_uploaded_mesh_metadata(
+        file_bytes=MESH_OBJ,
+        file_hash=MESH_OBJ_HASH,
+        extension=".obj",
+    )
+    expected, _ = main_module._resolve_mesh_resolution_xyz(0.45, metadata.mesh_extents, 6)
     assert first == expected
     assert first == second
     assert calls["parse"] == 1
@@ -294,14 +299,16 @@ def test_uploaded_host_cache_returns_shared_immutable_arrays() -> None:
         file_bytes=MESH_OBJ,
         file_hash=MESH_OBJ_HASH,
         extension=".obj",
-        resolution=24,
+        resolution_xyz=(24, 24, 24),
+        lattice_pitch=0.45,
         parsed=metadata.parsed,
     )
     second = main_module._resolve_uploaded_host_field(
         file_bytes=MESH_OBJ,
         file_hash=MESH_OBJ_HASH,
         extension=".obj",
-        resolution=24,
+        resolution_xyz=(24, 24, 24),
+        lattice_pitch=0.45,
         parsed=metadata.parsed,
     )
 

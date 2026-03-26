@@ -38,8 +38,8 @@ def test_clear_all_caches_empties_process_lru_caches() -> None:
 
 def test_clear_evaluator_caches_clears_lru_entries() -> None:
     key = (-1.0, 1.0, -1.0, 1.0, -1.0, 1.0)
-    evaluator._cached_grid(key, 8, "float32")
-    evaluator._cached_axes(key, 8, "float32")
+    evaluator._cached_grid(key, (8, 8, 8), "float32")
+    evaluator._cached_axes(key, (8, 8, 8), "float32")
     assert evaluator._cached_grid.cache_info().currsize > 0
     assert evaluator._cached_axes.cache_info().currsize > 0
 
@@ -130,10 +130,12 @@ def test_uploaded_mesh_memory_guard_accepts_resolution_360_with_realistic_availa
             normals=np.zeros((1, 3), dtype=np.float64),
         ),
         mesh_span=1.0,
+        mesh_extents=(1.0, 1.0, 1.0),
         cache_hit=False,
     )
     context = main.UploadedMeshMemoryContext(
         mesh_span=1.0,
+        mesh_extents=(1.0, 1.0, 1.0),
         available_cpu_bytes=int(6.9 * 1024**3),
         available_gpu_free_bytes=int(8.0 * 1024**3),
         available_gpu_total_bytes=int(8.0 * 1024**3),
@@ -143,8 +145,8 @@ def test_uploaded_mesh_memory_guard_accepts_resolution_360_with_realistic_availa
     )
 
     monkeypatch.setattr(main, "_resolve_uploaded_mesh_metadata", lambda **_kwargs: metadata)
-    monkeypatch.setattr(main, "_resolve_mesh_resolution", lambda *_args, **_kwargs: (360, None))
-    monkeypatch.setattr(main, "_snapshot_uploaded_mesh_memory_context", lambda _mesh_span: context)
+    monkeypatch.setattr(main, "_resolve_mesh_resolution_xyz", lambda *_args, **_kwargs: ((360, 360, 360), None))
+    monkeypatch.setattr(main, "_snapshot_uploaded_mesh_memory_context", lambda _mesh_span, _mesh_extents: context)
 
     estimate, resolved_metadata = main._resolve_uploaded_mesh_memory_estimate(
         file_bytes=b"dummy",
@@ -156,7 +158,7 @@ def test_uploaded_mesh_memory_guard_accepts_resolution_360_with_realistic_availa
     )
 
     assert resolved_metadata is metadata
-    assert estimate.resolution == 360
+    assert estimate.resolution_xyz == (360, 360, 360)
     assert estimate.cpu_fatal is False
     assert estimate.gpu_fatal is False
     assert estimate.fatal is False

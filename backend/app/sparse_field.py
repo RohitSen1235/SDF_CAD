@@ -20,24 +20,24 @@ def sample_dense_trilinear(
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("points must be Nx3")
 
-    resolution = int(field.shape[0])
-    if resolution < 2:
-        raise ValueError("field resolution must be >= 2")
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    if nx < 2 or ny < 2 or nz < 2:
+        raise ValueError("field resolution must be >= 2 on all axes")
 
-    dx = (bounds[0][1] - bounds[0][0]) / float(resolution - 1)
-    dy = (bounds[1][1] - bounds[1][0]) / float(resolution - 1)
-    dz = (bounds[2][1] - bounds[2][0]) / float(resolution - 1)
+    dx = (bounds[0][1] - bounds[0][0]) / float(nx - 1)
+    dy = (bounds[1][1] - bounds[1][0]) / float(ny - 1)
+    dz = (bounds[2][1] - bounds[2][0]) / float(nz - 1)
 
-    tx = np.clip((points[:, 0] - bounds[0][0]) / dx, 0.0, resolution - 1.000001)
-    ty = np.clip((points[:, 1] - bounds[1][0]) / dy, 0.0, resolution - 1.000001)
-    tz = np.clip((points[:, 2] - bounds[2][0]) / dz, 0.0, resolution - 1.000001)
+    tx = np.clip((points[:, 0] - bounds[0][0]) / dx, 0.0, nx - 1.000001)
+    ty = np.clip((points[:, 1] - bounds[1][0]) / dy, 0.0, ny - 1.000001)
+    tz = np.clip((points[:, 2] - bounds[2][0]) / dz, 0.0, nz - 1.000001)
 
     x0 = np.floor(tx).astype(np.int32)
     y0 = np.floor(ty).astype(np.int32)
     z0 = np.floor(tz).astype(np.int32)
-    x1 = np.minimum(x0 + 1, resolution - 1)
-    y1 = np.minimum(y0 + 1, resolution - 1)
-    z1 = np.minimum(z0 + 1, resolution - 1)
+    x1 = np.minimum(x0 + 1, nx - 1)
+    y1 = np.minimum(y0 + 1, ny - 1)
+    z1 = np.minimum(z0 + 1, nz - 1)
 
     fx = tx - x0
     fy = ty - y0
@@ -68,8 +68,8 @@ def detect_zero_crossing_blocks(
 ) -> list[tuple[int, int, int]]:
     if field.ndim != 3:
         raise ValueError("field must be a 3D array")
-    resolution = int(field.shape[0])
-    step = max(2, min(int(block_size), resolution - 1))
+    nx, ny, nz = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    step = max(2, min(int(block_size), max(2, min(nx, ny, nz) - 1)))
     if step <= 0:
         return []
 
@@ -77,21 +77,23 @@ def detect_zero_crossing_blocks(
     if candidate_blocks is not None:
         candidate_iter = candidate_blocks
     else:
-        blocks_per_axis = int(math.ceil(resolution / float(step)))
+        blocks_x = int(math.ceil(nx / float(step)))
+        blocks_y = int(math.ceil(ny / float(step)))
+        blocks_z = int(math.ceil(nz / float(step)))
         candidate_iter = [
             (bx, by, bz)
-            for bx in range(blocks_per_axis)
-            for by in range(blocks_per_axis)
-            for bz in range(blocks_per_axis)
+            for bx in range(blocks_x)
+            for by in range(blocks_y)
+            for bz in range(blocks_z)
         ]
 
     for bx, by, bz in candidate_iter:
-        i0 = max(0, min(int(bx) * step, resolution - 1))
-        j0 = max(0, min(int(by) * step, resolution - 1))
-        k0 = max(0, min(int(bz) * step, resolution - 1))
-        i1 = min(resolution, i0 + step + 1)
-        j1 = min(resolution, j0 + step + 1)
-        k1 = min(resolution, k0 + step + 1)
+        i0 = max(0, min(int(bx) * step, nx - 1))
+        j0 = max(0, min(int(by) * step, ny - 1))
+        k0 = max(0, min(int(bz) * step, nz - 1))
+        i1 = min(nx, i0 + step + 1)
+        j1 = min(ny, j0 + step + 1)
+        k1 = min(nz, k0 + step + 1)
         block = field[i0:i1, j0:j1, k0:k1]
         if block.size == 0:
             continue
@@ -105,7 +107,7 @@ def detect_zero_crossing_blocks(
 @dataclass
 class SparseBrickField:
     bounds: list[list[float]]
-    resolution: int
+    resolution_xyz: tuple[int, int, int]
     block_size: int
     background_value: float
     bricks: dict[tuple[int, int, int], np.ndarray]
@@ -122,8 +124,8 @@ class SparseBrickField:
     ) -> "SparseBrickField":
         if dense_field.ndim != 3:
             raise ValueError("dense_field must be a 3D array")
-        resolution = int(dense_field.shape[0])
-        step = max(2, min(int(block_size), resolution))
+        nx, ny, nz = (int(dense_field.shape[0]), int(dense_field.shape[1]), int(dense_field.shape[2]))
+        step = max(2, min(int(block_size), min(nx, ny, nz)))
 
         if background_value is None:
             max_abs = float(np.max(np.abs(dense_field))) if dense_field.size > 0 else 1.0
@@ -137,9 +139,9 @@ class SparseBrickField:
             i0 = int(bx) * step
             j0 = int(by) * step
             k0 = int(bz) * step
-            i1 = min(resolution, i0 + step)
-            j1 = min(resolution, j0 + step)
-            k1 = min(resolution, k0 + step)
+            i1 = min(nx, i0 + step)
+            j1 = min(ny, j0 + step)
+            k1 = min(nz, k0 + step)
             if i0 >= i1 or j0 >= j1 or k0 >= k1:
                 continue
             bricks[(int(bx), int(by), int(bz))] = np.array(
@@ -149,7 +151,7 @@ class SparseBrickField:
 
         return cls(
             bounds=[[float(axis[0]), float(axis[1])] for axis in bounds],
-            resolution=resolution,
+            resolution_xyz=(nx, ny, nz),
             block_size=step,
             background_value=float(background_value),
             bricks=bricks,
@@ -162,8 +164,9 @@ class SparseBrickField:
         if self._dense_cache is not None:
             return np.array(self._dense_cache, copy=True)
 
+        nx, ny, nz = self.resolution_xyz
         dense = np.full(
-            (self.resolution, self.resolution, self.resolution),
+            (nx, ny, nz),
             np.float32(self.background_value),
             dtype=np.float32,
         )
@@ -172,9 +175,9 @@ class SparseBrickField:
             i0 = int(bx) * step
             j0 = int(by) * step
             k0 = int(bz) * step
-            i1 = min(self.resolution, i0 + brick.shape[0])
-            j1 = min(self.resolution, j0 + brick.shape[1])
-            k1 = min(self.resolution, k0 + brick.shape[2])
+            i1 = min(nx, i0 + brick.shape[0])
+            j1 = min(ny, j0 + brick.shape[1])
+            k1 = min(nz, k0 + brick.shape[2])
             dense[i0:i1, j0:j1, k0:k1] = brick[: i1 - i0, : j1 - j0, : k1 - k0]
 
         self._dense_cache = dense
@@ -188,7 +191,7 @@ class SparseBrickField:
 @dataclass
 class OctreeField:
     bounds: list[list[float]]
-    resolution: int
+    resolution_xyz: tuple[int, int, int]
     block_size: int
     node_min: np.ndarray
     node_max: np.ndarray
@@ -199,9 +202,10 @@ class OctreeField:
     @classmethod
     def from_sparse_bricks(cls, sparse_bricks: SparseBrickField) -> "OctreeField":
         step = int(sparse_bricks.block_size)
-        dx = (sparse_bricks.bounds[0][1] - sparse_bricks.bounds[0][0]) / float(sparse_bricks.resolution - 1)
-        dy = (sparse_bricks.bounds[1][1] - sparse_bricks.bounds[1][0]) / float(sparse_bricks.resolution - 1)
-        dz = (sparse_bricks.bounds[2][1] - sparse_bricks.bounds[2][0]) / float(sparse_bricks.resolution - 1)
+        nx, ny, nz = sparse_bricks.resolution_xyz
+        dx = (sparse_bricks.bounds[0][1] - sparse_bricks.bounds[0][0]) / float(nx - 1)
+        dy = (sparse_bricks.bounds[1][1] - sparse_bricks.bounds[1][0]) / float(ny - 1)
+        dz = (sparse_bricks.bounds[2][1] - sparse_bricks.bounds[2][0]) / float(nz - 1)
 
         mins: list[list[float]] = []
         maxs: list[list[float]] = []
@@ -211,9 +215,9 @@ class OctreeField:
             i0 = int(bx) * step
             j0 = int(by) * step
             k0 = int(bz) * step
-            i1 = min(sparse_bricks.resolution - 1, i0 + step)
-            j1 = min(sparse_bricks.resolution - 1, j0 + step)
-            k1 = min(sparse_bricks.resolution - 1, k0 + step)
+            i1 = min(nx - 1, i0 + step)
+            j1 = min(ny - 1, j0 + step)
+            k1 = min(nz - 1, k0 + step)
             mins.append(
                 [
                     sparse_bricks.bounds[0][0] + i0 * dx,
@@ -239,7 +243,7 @@ class OctreeField:
 
         return cls(
             bounds=[[float(axis[0]), float(axis[1])] for axis in sparse_bricks.bounds],
-            resolution=int(sparse_bricks.resolution),
+            resolution_xyz=(int(nx), int(ny), int(nz)),
             block_size=int(sparse_bricks.block_size),
             node_min=np.asarray(mins, dtype=np.float32),
             node_max=np.asarray(maxs, dtype=np.float32),

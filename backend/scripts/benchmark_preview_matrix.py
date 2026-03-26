@@ -119,7 +119,11 @@ def run_acceptance_benchmark(
 
     mesh = parse_mesh_bytes(MESH_OBJ, ".obj")
     resolution = max(48, second_stats.voxel_count and round(second_stats.voxel_count ** (1.0 / 3.0)) or 48)
-    host = build_host_field(mesh, resolution=int(resolution), field_storage_mode="dense")
+    host = build_host_field(
+        mesh,
+        resolution_xyz=(int(resolution), int(resolution), int(resolution)),
+        field_storage_mode="dense",
+    )
 
     legacy_peak_bytes = _estimate_legacy_compose_peak_bytes(host.host_sdf)
     optimized_peak_bytes = _estimate_optimized_compose_peak_bytes(host.host_sdf)
