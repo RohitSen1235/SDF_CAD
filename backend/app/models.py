@@ -212,6 +212,10 @@ class JobAcceptedResponse(BaseModel):
     result_url: str
 
 
+class StructuralOptimizationJobAcceptedResponse(JobAcceptedResponse):
+    progress_url: str
+
+
 class JobStatusResponse(BaseModel):
     job_id: str
     status: Literal["queued", "running", "succeeded", "failed"]
@@ -293,3 +297,156 @@ class PreviewProgramResponse(BaseModel):
     program: SceneProgramPayload | None = None
     capabilities: ProgramCapabilities
     stats: PreviewStats
+
+
+class SelectionPoint(BaseModel):
+    point_xyz: list[float] = Field(min_length=3, max_length=3)
+
+    @field_validator("point_xyz")
+    @classmethod
+    def validate_point_xyz(cls, value: list[float]) -> list[float]:
+        if len(value) != 3 or not all(isinstance(v, (int, float)) and abs(float(v)) < 1e6 for v in value):
+            raise ValueError("point_xyz must contain 3 finite coordinates")
+        return [float(v) for v in value]
+
+
+class ConstraintRegion(BaseModel):
+    kind: Literal["fixed"] = "fixed"
+    points: list[SelectionPoint] = Field(default_factory=list)
+    radius: float = Field(default=0.0, ge=0.0)
+
+
+class LoadRegion(BaseModel):
+    kind: Literal["point", "surface"] = "point"
+    points: list[SelectionPoint] = Field(default_factory=list)
+    direction_xyz: list[float] = Field(default_factory=lambda: [0.0, -1.0, 0.0], min_length=3, max_length=3)
+    magnitude: float = Field(default=1.0)
+    radius: float = Field(default=0.0, ge=0.0)
+
+    @field_validator("direction_xyz")
+    @classmethod
+    def validate_direction_xyz(cls, value: list[float]) -> list[float]:
+        if len(value) != 3:
+            raise ValueError("direction_xyz must contain 3 values")
+        parsed = [float(v) for v in value]
+        if not any(abs(v) > 0.0 for v in parsed):
+            raise ValueError("direction_xyz must not be the zero vector")
+        return parsed
+
+
+class StructuralMaterial(BaseModel):
+    youngs_modulus: float = Field(default=1.0, gt=0.0)
+    poissons_ratio: float = Field(default=0.30, ge=0.0, lt=0.5)
+    density_floor: float = Field(default=1e-3, gt=0.0, le=1.0)
+    stiffness_floor_ratio: float = Field(default=1e-3, gt=0.0, le=1.0)
+    simp_penalty: float = Field(default=3.0, ge=1.0, le=6.0)
+
+
+class StructuralOptimizationConfig(BaseModel):
+    resolution: int = Field(default=96, ge=32, le=192)
+    target_volume_fraction: float = Field(default=0.35, gt=0.01, lt=1.0)
+    max_iterations: int = Field(default=40, ge=1, le=64)
+    cg_max_iterations: int = Field(default=200, ge=8, le=2000)
+    cg_tolerance: float = Field(default=1e-6, gt=0.0, le=1e-2)
+    optimization_tolerance: float = Field(default=1e-3, gt=0.0, le=1e-1)
+    filter_radius_voxels: float = Field(default=1.5, ge=0.0, le=8.0)
+    min_density: float = Field(default=1e-3, gt=0.0, le=1.0)
+    oc_move_limit: float = Field(default=0.2, gt=0.0, le=1.0)
+    density_iso_threshold: float = Field(default=0.30, gt=0.0, lt=1.0)
+
+
+class StructuralOptimizationRequest(BaseModel):
+    design_space_file_name: str
+    design_space_file_data_base64: str
+    non_design_space_file_name: str
+    non_design_space_file_data_base64: str
+    compute_backend: ComputeBackend = "auto"
+    mesh_backend: MeshBackend = "auto"
+    execution_mode: ExecutionMode = "auto"
+    constraints: list[ConstraintRegion] = Field(default_factory=list)
+    loads: list[LoadRegion] = Field(default_factory=list)
+    material: StructuralMaterial = Field(default_factory=StructuralMaterial)
+    config: StructuralOptimizationConfig = Field(default_factory=StructuralOptimizationConfig)
+
+
+class StructuralOptimizationPreprocessResponse(BaseModel):
+    design_mesh: MeshPayload
+    non_design_mesh: MeshPayload
+    combined_mesh: MeshPayload
+    bounds: list[list[float]]
+    resolution_xyz: list[int]
+    diagnostics: list[str] = Field(default_factory=list)
+
+
+class OptimizationHistoryEntry(BaseModel):
+    iteration: int
+    objective_value: float
+    active_volume_fraction: float
+    removed_voxels: int
+    max_displacement: float
+
+
+class StructuralOptimizationIterationResult(BaseModel):
+    iteration: int
+    objective_value: float
+    active_volume_fraction: float
+    removed_voxels: int
+    mesh: MeshPayload | None = None
+    density_field: FieldPayload | None = None
+    displacement_field: FieldPayload | None = None
+    stress_field: FieldPayload | None = None
+    strain_field: FieldPayload | None = None
+
+
+StructuralOptimizationStopReason = Literal[
+    "target_volume_reached",
+    "objective_converged",
+    "density_converged",
+    "max_iterations",
+]
+
+
+class StructuralOptimizationResultResponse(BaseModel):
+    history: list[OptimizationHistoryEntry] = Field(default_factory=list)
+    final_iteration: StructuralOptimizationIterationResult
+    bounds: list[list[float]]
+    resolution_xyz: list[int]
+    compute_backend_used: Literal["cpu", "cuda"] = "cpu"
+    mesh_backend_used: Literal["cpu", "cuda"] = "cpu"
+    stop_reason: StructuralOptimizationStopReason
+
+
+class StructuralOptimizationIterationWebhookRequest(BaseModel):
+    iteration_result: StructuralOptimizationIterationResult | None = None
+    history_entry: OptimizationHistoryEntry | None = None
+    bounds: list[list[float]] | None = None
+    resolution_xyz: list[int] | None = None
+    compute_backend_used: Literal["cpu", "cuda"] | None = None
+    mesh_backend_used: Literal["cpu", "cuda"] | None = None
+    is_final: bool = False
+    stop_reason: StructuralOptimizationStopReason | None = None
+    failure_detail: str | None = None
+
+    @model_validator(mode="after")
+    def validate_payload(self) -> "StructuralOptimizationIterationWebhookRequest":
+        if self.failure_detail:
+            return self
+        if self.iteration_result is None or self.history_entry is None:
+            raise ValueError("iteration_result and history_entry are required unless failure_detail is provided")
+        if self.bounds is None or self.resolution_xyz is None:
+            raise ValueError("bounds and resolution_xyz are required for iteration callbacks")
+        if self.compute_backend_used is None or self.mesh_backend_used is None:
+            raise ValueError("compute_backend_used and mesh_backend_used are required for iteration callbacks")
+        return self
+
+
+class StructuralOptimizationProgressResponse(BaseModel):
+    job_id: str
+    status: Literal["queued", "running", "succeeded", "failed"]
+    current_iteration: int = 0
+    max_iterations: int
+    iterations: list[StructuralOptimizationIterationResult] = Field(default_factory=list)
+    history: list[OptimizationHistoryEntry] = Field(default_factory=list)
+    stop_reason: StructuralOptimizationStopReason | None = None
+    detail: str | None = None
+    final_result: StructuralOptimizationResultResponse | None = None

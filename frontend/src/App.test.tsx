@@ -22,6 +22,9 @@ const commitUploadedMesh = vi.fn();
 const previewUploadedMeshField = vi.fn();
 const exportUploadedMesh = vi.fn();
 const submitUploadedFieldPreviewTelemetry = vi.fn();
+const preprocessStructuralOptimization = vi.fn();
+const buildStructuralOptimizationRequest = vi.fn();
+const runStructuralOptimizationPhased = vi.fn();
 
 vi.mock("./lib/api", () => ({
   compileScene: (...args: unknown[]) => compileScene(...args),
@@ -32,7 +35,10 @@ vi.mock("./lib/api", () => ({
   commitUploadedMesh: (...args: unknown[]) => commitUploadedMesh(...args),
   previewUploadedMeshField: (...args: unknown[]) => previewUploadedMeshField(...args),
   exportUploadedMesh: (...args: unknown[]) => exportUploadedMesh(...args),
-  submitUploadedFieldPreviewTelemetry: (...args: unknown[]) => submitUploadedFieldPreviewTelemetry(...args)
+  submitUploadedFieldPreviewTelemetry: (...args: unknown[]) => submitUploadedFieldPreviewTelemetry(...args),
+  preprocessStructuralOptimization: (...args: unknown[]) => preprocessStructuralOptimization(...args),
+  buildStructuralOptimizationRequest: (...args: unknown[]) => buildStructuralOptimizationRequest(...args),
+  runStructuralOptimizationPhased: (...args: unknown[]) => runStructuralOptimizationPhased(...args)
 }));
 
 const compiledScene = {
@@ -139,6 +145,29 @@ describe("App", () => {
     previewUploadedMeshField.mockResolvedValue(fieldPreviewPayload);
     exportUploadedMesh.mockResolvedValue(new Blob(["ok"]));
     submitUploadedFieldPreviewTelemetry.mockResolvedValue(undefined);
+    preprocessStructuralOptimization.mockResolvedValue({
+      design_mesh: outerMeshPayload,
+      non_design_mesh: outerMeshPayload,
+      combined_mesh: outerMeshPayload,
+      bounds: [[0, 1], [0, 1], [0, 1]],
+      resolution_xyz: [64, 64, 64],
+      diagnostics: []
+    });
+    buildStructuralOptimizationRequest.mockResolvedValue({});
+    runStructuralOptimizationPhased.mockResolvedValue({
+      history: [],
+      final_iteration: {
+        iteration: 1,
+        objective_value: 1,
+        active_volume_fraction: 1,
+        removed_voxels: 0
+      },
+      bounds: [[0, 1], [0, 1], [0, 1]],
+      resolution_xyz: [64, 64, 64],
+      compute_backend_used: "cpu",
+      mesh_backend_used: "cpu",
+      stop_reason: "max_iterations"
+    });
   });
 
   afterEach(() => {

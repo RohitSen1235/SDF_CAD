@@ -17,7 +17,13 @@ import {
   QualityProfile,
   SceneIR,
   UploadedFieldPreviewClientTelemetry,
-  UploadedPreviewFieldResponse
+  UploadedPreviewFieldResponse,
+  StructuralOptimizationIterationResult,
+  StructuralOptimizationJobAcceptedResponse,
+  StructuralOptimizationPreprocessResponse as StructuralOptimizationPreprocessResponseJson,
+  StructuralOptimizationProgressResponse,
+  StructuralOptimizationRequest,
+  StructuralOptimizationResultResponse
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
@@ -64,14 +70,20 @@ function asNetworkError(error: unknown): Error {
   );
 }
 
-function toWebSocketBase(httpBase: string): string {
-  if (httpBase.startsWith("https://")) {
-    return `wss://${httpBase.slice("https://".length)}`;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+function toWebSocketBase(base: string): string {
+  if (base.startsWith("https://")) {
+    return `wss://${base.slice("https://".length)}`;
   }
-  if (httpBase.startsWith("http://")) {
-    return `ws://${httpBase.slice("http://".length)}`;
+  if (base.startsWith("http://")) {
+    return `ws://${base.slice("http://".length)}`;
   }
-  return httpBase;
+  return base;
 }
 
 function fileToBase64(file: File): Promise<string> {
@@ -773,6 +785,115 @@ export async function preprocessUploadedMesh(
     }
     throw error;
   }
+}
+
+export async function preprocessStructuralOptimization(
+  designFile: File,
+  nonDesignFile: File,
+  resolution: number,
+  computeBackend: ComputeBackend = "auto",
+  meshBackend: MeshBackend = "auto",
+  signal?: AbortSignal
+): Promise<StructuralOptimizationPreprocessResponseJson> {
+  const body = new FormData();
+  body.append("design_space_file", designFile, designFile.name);
+  body.append("non_design_space_file", nonDesignFile, nonDesignFile.name);
+  body.append("resolution", String(resolution));
+  body.append("compute_backend", computeBackend);
+  body.append("mesh_backend", meshBackend);
+  try {
+    const response = await fetch(`${API_BASE}/api/v1/optimization/structural/preprocess`, {
+      method: "POST",
+      body,
+      signal
+    });
+    if (!response.ok) {
+      await parseErrorResponse(response, "Structural optimization preprocess failed");
+    }
+    return (await response.json()) as StructuralOptimizationPreprocessResponseJson;
+  } catch (error) {
+    if ((error as Error)?.name === "AbortError") {
+      throw error;
+    }
+    if (error instanceof TypeError) {
+      throw asNetworkError(error);
+    }
+    throw error;
+  }
+}
+
+export async function runStructuralOptimizationPhased(
+  request: StructuralOptimizationRequest,
+  onIteration?: (iteration: StructuralOptimizationIterationResult) => void
+): Promise<StructuralOptimizationResultResponse> {
+  const submitResponse = await fetch(`${API_BASE}/api/v1/optimization/structural/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request)
+  }).catch((error: unknown) => {
+    throw asNetworkError(error);
+  });
+
+  if (!submitResponse.ok) {
+    await parseErrorResponse(submitResponse, "Structural optimization job submission failed");
+  }
+
+  const accepted = (await submitResponse.json()) as StructuralOptimizationJobAcceptedResponse;
+  let afterIteration = 0;
+
+  while (true) {
+    let progressResponse: Response;
+    try {
+      const progressUrl = new URL(accepted.progress_url, API_BASE);
+      progressUrl.searchParams.set("after_iteration", String(afterIteration));
+      progressResponse = await fetch(progressUrl.toString());
+    } catch (error) {
+      throw asNetworkError(error);
+    }
+
+    if (!progressResponse.ok) {
+      await parseErrorResponse(progressResponse, "Structural optimization progress polling failed");
+    }
+
+    const progress = (await progressResponse.json()) as StructuralOptimizationProgressResponse;
+    for (const iteration of progress.iterations) {
+      afterIteration = Math.max(afterIteration, iteration.iteration);
+      onIteration?.(iteration);
+    }
+
+    if (progress.status === "failed") {
+      throw new Error(progress.detail ?? "Structural optimization failed");
+    }
+    if (progress.status === "succeeded") {
+      if (progress.final_result) {
+        return progress.final_result;
+      }
+      const resultResponse = await fetch(new URL(accepted.result_url, API_BASE).toString()).catch((error: unknown) => {
+        throw asNetworkError(error);
+      });
+      if (!resultResponse.ok) {
+        await parseErrorResponse(resultResponse, "Structural optimization result retrieval failed");
+      }
+      return (await resultResponse.json()) as StructuralOptimizationResultResponse;
+    }
+
+    await sleep(1000);
+  }
+}
+
+export async function buildStructuralOptimizationRequest(
+  baseRequest: Omit<StructuralOptimizationRequest, "design_space_file_name" | "design_space_file_data_base64" | "non_design_space_file_name" | "non_design_space_file_data_base64">,
+  designFile: File,
+  nonDesignFile: File
+): Promise<StructuralOptimizationRequest> {
+  const [designB64, nonDesignB64] = await Promise.all([fileToBase64(designFile), fileToBase64(nonDesignFile)]);
+  return {
+    ...baseRequest,
+    design_space_file_name: designFile.name,
+    design_space_file_data_base64: designB64,
+    non_design_space_file_name: nonDesignFile.name,
+    non_design_space_file_data_base64: nonDesignB64
+  };
 }
 
 export async function submitUploadedFieldPreviewTelemetry(

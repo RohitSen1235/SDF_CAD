@@ -9,6 +9,9 @@ import { FieldPayload, MeshPayload, UploadedFieldPreviewTrace } from "../types";
 export interface ViewerProps {
   mesh: MeshPayload | null;
   field: FieldPayload | null;
+  pickMarkers?: Array<{ position: [number, number, number]; color: string; size?: number }>;
+  onMeshPick?: ((point: [number, number, number]) => void) | null;
+  pickModeActive?: boolean;
   uploadedMeshPreviewActive?: boolean;
   uploadedFieldPreviewTrace?: UploadedFieldPreviewTrace | null;
   onUploadedFieldPreviewVisible?: ((timing: {
@@ -401,6 +404,9 @@ function FitCamera({
 export function Viewer({
   mesh,
   field,
+  pickMarkers = [],
+  onMeshPick = null,
+  pickModeActive = false,
   uploadedMeshPreviewActive = false,
   uploadedFieldPreviewTrace = null,
   onUploadedFieldPreviewVisible = null,
@@ -562,6 +568,7 @@ export function Viewer({
       {geometry ? (
         <TransformControls
           mode={transformMode}
+          enabled={!pickModeActive}
           onMouseDown={() => setOrbitEnabled(false)}
           onMouseUp={() => setOrbitEnabled(true)}
           size={0.75}
@@ -605,6 +612,14 @@ export function Viewer({
               castShadow
               receiveShadow
               renderOrder={layeredUploadedMeshPreview ? 1 : 3}
+              onPointerDown={(event) => {
+                if (!onMeshPick) {
+                  return;
+                }
+                event.stopPropagation();
+                const point = event.point;
+                onMeshPick([point.x, point.y, point.z]);
+              }}
             >
               <meshStandardMaterial
                 color="#8be9fd"
@@ -657,6 +672,13 @@ export function Viewer({
         </TransformControls>
       ) : null}
 
+      {pickMarkers.map((marker, index) => (
+        <mesh key={`${marker.color}-${index}`} position={marker.position} renderOrder={30}>
+          <sphereGeometry args={[marker.size ?? 0.05, 20, 20]} />
+          <meshBasicMaterial color={marker.color} depthTest={false} depthWrite={false} toneMapped={false} />
+        </mesh>
+      ))}
+
       {geometry && sectionEnabled && sectionPlane ? (
         <mesh
           position={[0, sectionLevel, 0]}
@@ -704,7 +726,7 @@ export function Viewer({
         </mesh>
       ) : null}
 
-      <OrbitControls ref={orbitRef} makeDefault enabled={orbitEnabled} />
+      <OrbitControls ref={orbitRef} makeDefault enabled={pickModeActive ? true : orbitEnabled} />
       <FitCamera orbitRef={orbitRef} fitSignal={fitSignal} targetBox={targetBox} />
     </Canvas>
   );

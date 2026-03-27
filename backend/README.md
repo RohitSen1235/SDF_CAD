@@ -27,6 +27,8 @@ uvicorn app.main:app --reload
 celery -A app.worker:celery_app worker --loglevel=info --concurrency=2
 ```
 
+For structural optimization, the worker must also be able to call back into the API. When running outside Docker, the default `SDF_CAD_INTERNAL_API_BASE_URL=http://127.0.0.1:8000` is already correct. In Docker Compose, it is set automatically to `http://backend:8000`.
+
 ### Deployment profile
 
 - API workers: start with `2-4` uvicorn workers for mixed traffic.

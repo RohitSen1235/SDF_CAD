@@ -15,6 +15,8 @@ export type ComputeBackend = "auto" | "cpu" | "cuda";
 export type MeshBackend = "auto" | "cpu" | "cuda";
 export type MeshingMode = "uniform" | "adaptive";
 export type MeshLatticeType = "gyroid" | "schwarz_p" | "diamond";
+export type SelectionKind = "fixed";
+export type LoadKind = "point" | "surface";
 
 export interface ParameterSpec {
   name: string;
@@ -184,4 +186,116 @@ export interface UploadedMeshMemoryContext {
 export interface UploadedMeshPreprocessResponse {
   mesh: MeshPayloadBinary;
   memoryContext: UploadedMeshMemoryContext | null;
+}
+
+export interface SelectionPoint {
+  point_xyz: [number, number, number];
+}
+
+export interface ConstraintRegion {
+  kind: SelectionKind;
+  points: SelectionPoint[];
+  radius: number;
+}
+
+export interface LoadRegion {
+  kind: LoadKind;
+  points: SelectionPoint[];
+  direction_xyz: [number, number, number];
+  magnitude: number;
+  radius: number;
+}
+
+export interface StructuralMaterial {
+  youngs_modulus: number;
+  poissons_ratio: number;
+  density_floor: number;
+  stiffness_floor_ratio: number;
+  simp_penalty: number;
+}
+
+export interface StructuralOptimizationConfig {
+  resolution: number;
+  target_volume_fraction: number;
+  max_iterations: number;
+  cg_max_iterations: number;
+  cg_tolerance: number;
+  optimization_tolerance: number;
+  filter_radius_voxels: number;
+  min_density: number;
+  oc_move_limit: number;
+  density_iso_threshold: number;
+}
+
+export interface StructuralOptimizationRequest {
+  design_space_file_name: string;
+  design_space_file_data_base64: string;
+  non_design_space_file_name: string;
+  non_design_space_file_data_base64: string;
+  compute_backend: ComputeBackend;
+  mesh_backend: MeshBackend;
+  execution_mode: "auto" | "inline" | "queued";
+  constraints: ConstraintRegion[];
+  loads: LoadRegion[];
+  material: StructuralMaterial;
+  config: StructuralOptimizationConfig;
+}
+
+export interface StructuralOptimizationPreprocessResponse {
+  design_mesh: MeshPayload;
+  non_design_mesh: MeshPayload;
+  combined_mesh: MeshPayload;
+  bounds: [[number, number], [number, number], [number, number]];
+  resolution_xyz: [number, number, number];
+  diagnostics: string[];
+}
+
+export interface OptimizationHistoryEntry {
+  iteration: number;
+  objective_value: number;
+  active_volume_fraction: number;
+  removed_voxels: number;
+  max_displacement: number;
+}
+
+export interface StructuralOptimizationIterationResult {
+  iteration: number;
+  objective_value: number;
+  active_volume_fraction: number;
+  removed_voxels: number;
+  mesh?: MeshPayload | null;
+  density_field?: FieldPayload | null;
+  displacement_field?: FieldPayload | null;
+  stress_field?: FieldPayload | null;
+  strain_field?: FieldPayload | null;
+}
+
+export interface StructuralOptimizationResultResponse {
+  history: OptimizationHistoryEntry[];
+  final_iteration: StructuralOptimizationIterationResult;
+  bounds: [[number, number], [number, number], [number, number]];
+  resolution_xyz: [number, number, number];
+  compute_backend_used: "cpu" | "cuda";
+  mesh_backend_used: "cpu" | "cuda";
+  stop_reason: "target_volume_reached" | "objective_converged" | "density_converged" | "max_iterations";
+}
+
+export interface StructuralOptimizationJobAcceptedResponse {
+  job_id: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  status_url: string;
+  result_url: string;
+  progress_url: string;
+}
+
+export interface StructuralOptimizationProgressResponse {
+  job_id: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  current_iteration: number;
+  max_iterations: number;
+  iterations: StructuralOptimizationIterationResult[];
+  history: OptimizationHistoryEntry[];
+  stop_reason?: StructuralOptimizationResultResponse["stop_reason"] | null;
+  detail?: string | null;
+  final_result?: StructuralOptimizationResultResponse | null;
 }

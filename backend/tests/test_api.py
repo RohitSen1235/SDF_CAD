@@ -1,3 +1,4 @@
+import asyncio
 import json
 import base64
 import io
@@ -6,10 +7,20 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from app import main as main_module
 from app.main import app
+from app.models import (
+    OptimizationHistoryEntry,
+    StructuralOptimizationRequest,
+    StructuralOptimizationIterationResult,
+    StructuralOptimizationIterationWebhookRequest,
+    StructuralOptimizationProgressResponse,
+    StructuralOptimizationResultResponse,
+)
 from app.worker import celery_app
 
 client = TestClient(app)
@@ -53,6 +64,119 @@ def _mesh_form(lattice_type: str = "gyroid") -> dict[str, str]:
     }
 
 
+def _structural_request_json() -> dict[str, object]:
+    return {
+        "design_space_file_name": "design.stl",
+        "design_space_file_data_base64": "AA==",
+        "non_design_space_file_name": "keep.stl",
+        "non_design_space_file_data_base64": "AA==",
+        "compute_backend": "cpu",
+        "mesh_backend": "cpu",
+        "execution_mode": "queued",
+        "constraints": [{"kind": "fixed", "points": [{"point_xyz": [0.0, 0.0, 0.0]}], "radius": 0.0}],
+        "loads": [
+            {
+                "kind": "point",
+                "points": [{"point_xyz": [1.0, 0.0, 0.0]}],
+                "direction_xyz": [1.0, 0.0, 0.0],
+                "magnitude": 1.0,
+                "radius": 0.0,
+            }
+        ],
+        "material": {
+            "youngs_modulus": 1.0,
+            "poissons_ratio": 0.3,
+            "density_floor": 1e-3,
+            "stiffness_floor_ratio": 1e-3,
+            "simp_penalty": 3.0,
+        },
+        "config": {
+            "resolution": 64,
+            "target_volume_fraction": 0.35,
+            "max_iterations": 8,
+            "cg_max_iterations": 200,
+            "cg_tolerance": 1e-6,
+            "optimization_tolerance": 1e-3,
+            "filter_radius_voxels": 1.5,
+            "min_density": 1e-3,
+            "oc_move_limit": 0.2,
+            "density_iso_threshold": 0.3,
+        },
+    }
+
+
+class FakeStructuralProgressStore:
+    def __init__(self) -> None:
+        self.jobs: dict[str, dict[str, object]] = {}
+
+    def initialize_job(self, *, job_id: str, max_iterations: int, callback_token: str) -> None:
+        self.jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "current_iteration": 0,
+            "max_iterations": max_iterations,
+            "callback_token": callback_token,
+            "iterations": [],
+            "history": [],
+            "stop_reason": None,
+            "detail": None,
+            "final_result": None,
+        }
+
+    def clear_job(self, job_id: str) -> None:
+        self.jobs.pop(job_id, None)
+
+    def mark_running(self, job_id: str) -> None:
+        self.jobs[job_id]["status"] = "running"
+
+    def mark_failed(self, job_id: str, detail: str) -> None:
+        self.jobs[job_id]["status"] = "failed"
+        self.jobs[job_id]["detail"] = detail
+
+    def validate_callback_token(self, job_id: str, token: str) -> bool:
+        return self.jobs[job_id]["callback_token"] == token
+
+    def persist_callback(self, job_id: str, payload: StructuralOptimizationIterationWebhookRequest) -> StructuralOptimizationProgressResponse:
+        job = self.jobs[job_id]
+        if payload.iteration_result is not None:
+            job["iterations"].append(payload.iteration_result)
+            job["current_iteration"] = payload.iteration_result.iteration
+            job["status"] = "running"
+        if payload.history_entry is not None:
+            job["history"].append(payload.history_entry)
+        if payload.failure_detail:
+            job["status"] = "failed"
+            job["detail"] = payload.failure_detail
+        elif payload.is_final and payload.iteration_result is not None:
+            job["status"] = "succeeded"
+            job["stop_reason"] = payload.stop_reason
+            job["final_result"] = StructuralOptimizationResultResponse(
+                history=list(job["history"]),
+                final_iteration=payload.iteration_result,
+                bounds=payload.bounds or [],
+                resolution_xyz=payload.resolution_xyz or [],
+                compute_backend_used=payload.compute_backend_used or "cpu",
+                mesh_backend_used=payload.mesh_backend_used or "cpu",
+                stop_reason=payload.stop_reason or "max_iterations",
+            )
+        return self.get_progress(job_id=job_id, after_iteration=max(0, (payload.iteration_result.iteration - 1) if payload.iteration_result else 0))
+
+    def get_progress(self, *, job_id: str, after_iteration: int = 0) -> StructuralOptimizationProgressResponse:
+        job = self.jobs[job_id]
+        iterations = list(job["iterations"])[int(after_iteration) :]
+        return StructuralOptimizationProgressResponse(
+            job_id=job_id,
+            status=job["status"],
+            current_iteration=int(job["current_iteration"]),
+            max_iterations=int(job["max_iterations"]),
+            iterations=list(iterations),
+            history=list(job["history"]),
+            stop_reason=job["stop_reason"],
+            detail=job["detail"],
+            final_result=job["final_result"],
+        )
+
+
 @pytest.fixture(autouse=True)
 def eager_celery() -> None:
     prev_eager = celery_app.conf.task_always_eager
@@ -64,6 +188,113 @@ def eager_celery() -> None:
     finally:
         celery_app.conf.task_always_eager = prev_eager
         celery_app.conf.task_store_eager_result = prev_store
+
+
+def test_structural_job_submission_returns_progress_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import worker_tasks
+
+    store = FakeStructuralProgressStore()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(main_module, "get_structural_progress_store", lambda: store)
+
+    def fake_apply_async(*, args: list[dict[str, object]], task_id: str):
+        captured["payload"] = args[0]
+        captured["task_id"] = task_id
+        return SimpleNamespace(id=task_id)
+
+    monkeypatch.setattr(worker_tasks, "structural_optimization_job", SimpleNamespace(apply_async=fake_apply_async))
+
+    response = main_module._enqueue_structural_optimization_job(StructuralOptimizationRequest.model_validate(_structural_request_json()))
+
+    assert response.job_id
+    assert response.progress_url == f"/api/v1/optimization/structural/jobs/{response.job_id}/progress"
+    assert response.job_id == captured["task_id"]
+    assert isinstance(captured["payload"], dict)
+    assert "_callback_token" in captured["payload"]
+    assert store.jobs[response.job_id]["callback_token"] == captured["payload"]["_callback_token"]
+
+
+def test_structural_iteration_callback_rejects_invalid_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = FakeStructuralProgressStore()
+    store.initialize_job(job_id="job-invalid", max_iterations=8, callback_token="token-good")
+    monkeypatch.setattr(main_module, "get_structural_progress_store", lambda: store)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            main_module.structural_optimization_iteration_callback(
+                "job-invalid",
+                StructuralOptimizationIterationWebhookRequest(failure_detail="boom", is_final=True),
+                Request({"type": "http", "headers": [(b"authorization", b"Bearer token-bad")]}),
+            )
+        )
+
+    assert exc_info.value.status_code == 403
+
+
+def test_structural_progress_endpoint_returns_only_unseen_iterations(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = FakeStructuralProgressStore()
+    store.initialize_job(job_id="job-progress", max_iterations=8, callback_token="token-progress")
+    monkeypatch.setattr(main_module, "get_structural_progress_store", lambda: store)
+
+    callback_request = Request({"type": "http", "headers": [(b"authorization", b"Bearer token-progress")]})
+    iteration_one = StructuralOptimizationIterationWebhookRequest(
+        iteration_result=StructuralOptimizationIterationResult(
+            iteration=1,
+            objective_value=4.0,
+            active_volume_fraction=0.95,
+            removed_voxels=2,
+        ),
+        history_entry=OptimizationHistoryEntry(
+            iteration=1,
+            objective_value=4.0,
+            active_volume_fraction=0.95,
+            removed_voxels=2,
+            max_displacement=0.1,
+        ),
+        bounds=[[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]],
+        resolution_xyz=[64, 64, 64],
+        compute_backend_used="cpu",
+        mesh_backend_used="cpu",
+        is_final=False,
+    )
+    iteration_two = StructuralOptimizationIterationWebhookRequest(
+        iteration_result=StructuralOptimizationIterationResult(
+            iteration=2,
+            objective_value=3.1,
+            active_volume_fraction=0.82,
+            removed_voxels=3,
+        ),
+        history_entry=OptimizationHistoryEntry(
+            iteration=2,
+            objective_value=3.1,
+            active_volume_fraction=0.82,
+            removed_voxels=3,
+            max_displacement=0.09,
+        ),
+        bounds=[[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]],
+        resolution_xyz=[64, 64, 64],
+        compute_backend_used="cpu",
+        mesh_backend_used="cpu",
+        is_final=True,
+        stop_reason="objective_converged",
+    )
+    callback_result_one = asyncio.run(
+        main_module.structural_optimization_iteration_callback("job-progress", iteration_one, callback_request)
+    )
+    callback_result_two = asyncio.run(
+        main_module.structural_optimization_iteration_callback("job-progress", iteration_two, callback_request)
+    )
+    assert callback_result_one["acknowledged"] is True
+    assert callback_result_two["acknowledged"] is True
+
+    first = asyncio.run(main_module.structural_optimization_progress("job-progress", after_iteration=0))
+    second = asyncio.run(main_module.structural_optimization_progress("job-progress", after_iteration=1))
+
+    assert [entry.iteration for entry in first.iterations] == [1, 2]
+    assert [entry.iteration for entry in second.iterations] == [2]
+    assert first.final_result is not None
+    assert first.final_result.stop_reason == "objective_converged"
 
 
 def test_compile_endpoint_returns_diagnostics() -> None:

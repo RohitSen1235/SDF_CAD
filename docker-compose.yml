@@ -1,7 +1,11 @@
 services:
   redis:
     image: redis:7-alpine
-    profiles: ["queue"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     ports:
       - "6379:6379"
 
@@ -9,21 +13,33 @@ services:
     build:
       context: ./backend
     gpus: all
+    depends_on:
+      redis:
+        condition: service_healthy
     environment:
+      REDIS_URL: redis://redis:6379/0
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   worker:
     build:
       context: ./backend
     gpus: all
-    profiles: ["queue"]
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
     environment:
       REDIS_URL: redis://redis:6379/0
+      SDF_CAD_INTERNAL_API_BASE_URL: http://backend:8000
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     command: ["celery", "-A", "app.worker:celery_app", "worker", "--loglevel=info", "--concurrency=1", "--pool=solo"]

@@ -2,26 +2,36 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Viewer } from "./components/Viewer";
 import {
+  buildStructuralOptimizationRequest,
   compileScene,
   commitUploadedMesh,
   exportMesh,
   exportUploadedMesh,
   previewField,
   previewMesh,
+  preprocessStructuralOptimization,
   preprocessUploadedMesh,
+  runStructuralOptimizationPhased,
   previewUploadedMeshField,
   submitUploadedFieldPreviewTelemetry
 } from "./lib/api";
 import {
   CompileDiagnostics,
+  ConstraintRegion,
   ComputeBackend,
   ComputePrecision,
   FieldPayload,
+  LoadRegion,
   MeshBackend,
   MeshLatticeType,
   MeshingMode,
   MeshPayload,
   MeshWorkflowParams,
+  StructuralMaterial,
+  StructuralOptimizationConfig,
+  StructuralOptimizationIterationResult,
+  StructuralOptimizationPreprocessResponse,
+  StructuralOptimizationResultResponse,
   PreviewStats,
   QualityProfile,
   SceneIR,
@@ -35,8 +45,15 @@ interface SavedFieldExpression {
   updatedAt: number;
 }
 
-type WorkflowMode = "dsl" | "mesh";
+type WorkflowMode = "dsl" | "mesh" | "generative";
 type TransformMode = "translate" | "rotate" | "scale";
+type GenerativePickMode = "fixed" | "load" | null;
+
+interface ViewerMarker {
+  position: [number, number, number];
+  color: string;
+  size?: number;
+}
 
 interface WorkspaceDraft {
   version: 1;
@@ -107,7 +124,8 @@ const FUNCTION_SIGNATURES = [
 const QUALITY_ORDER: QualityProfile[] = ["interactive", "medium", "high", "ultra"];
 const MODULE_TABS: Array<{ mode: WorkflowMode; label: string }> = [
   { mode: "dsl", label: "DSL" },
-  { mode: "mesh", label: "Lattice Infill" }
+  { mode: "mesh", label: "Lattice Infill" },
+  { mode: "generative", label: "Topology Opt" }
 ];
 const SAVED_EXPRESSIONS_KEY = "sdfcad.savedFieldExpressions.v1";
 const WORKSPACE_DRAFT_KEY = "sdfcad.workspaceDraft.v1";
@@ -186,7 +204,7 @@ function loadWorkspaceDraft(): Partial<WorkspaceDraft> {
 
     const draft: Partial<WorkspaceDraft> = {};
 
-    if (parsed.workflow === "dsl" || parsed.workflow === "mesh") {
+    if (parsed.workflow === "dsl" || parsed.workflow === "mesh" || parsed.workflow === "generative") {
       draft.workflow = parsed.workflow;
     }
     if (typeof parsed.source === "string") {
@@ -367,6 +385,22 @@ function bytesToMiB(value: number): string {
   return `${Math.round(value / (1024 * 1024))} MiB`;
 }
 
+function describeOptimizationStopReason(reason: StructuralOptimizationResultResponse["stop_reason"] | null): string | null {
+  if (reason === "target_volume_reached") {
+    return "Stopped: target volume fraction reached.";
+  }
+  if (reason === "objective_converged") {
+    return "Stopped: objective converged.";
+  }
+  if (reason === "density_converged") {
+    return "Stopped: density update converged.";
+  }
+  if (reason === "max_iterations") {
+    return "Stopped: maximum iteration count reached.";
+  }
+  return null;
+}
+
 export default function App() {
   const [workspaceDraft] = useState<Partial<WorkspaceDraft>>(() => loadWorkspaceDraft());
   const [workflow, setWorkflow] = useState<WorkflowMode>(workspaceDraft.workflow ?? "dsl");
@@ -378,6 +412,8 @@ export default function App() {
   const [params, setParams] = useState<Record<string, number>>({});
 
   const [meshFile, setMeshFile] = useState<File | null>(null);
+  const [generativeDesignFile, setGenerativeDesignFile] = useState<File | null>(null);
+  const [generativeNonDesignFile, setGenerativeNonDesignFile] = useState<File | null>(null);
   const [meshShellThickness, setMeshShellThickness] = useState(workspaceDraft.meshShellThickness ?? 2.0);
   const [meshLatticeType, setMeshLatticeType] = useState<MeshLatticeType>(workspaceDraft.meshLatticeType ?? "gyroid");
   const [meshLatticePitch, setMeshLatticePitch] = useState(workspaceDraft.meshLatticePitch ?? 5.0);
@@ -391,6 +427,33 @@ export default function App() {
   const [mesh, setMesh] = useState<MeshPayload | null>(null);
   const [stats, setStats] = useState<PreviewStats | null>(null);
   const [uploadedFieldPreviewTrace, setUploadedFieldPreviewTrace] = useState<UploadedFieldPreviewTrace | null>(null);
+  const [generativePreprocess, setGenerativePreprocess] = useState<StructuralOptimizationPreprocessResponse | null>(null);
+  const [generativeHistory, setGenerativeHistory] = useState<StructuralOptimizationResultResponse["history"]>([]);
+  const [generativeStopReason, setGenerativeStopReason] = useState<StructuralOptimizationResultResponse["stop_reason"] | null>(null);
+  const [generativePickMode, setGenerativePickMode] = useState<GenerativePickMode>(null);
+  const [generativeConstraints, setGenerativeConstraints] = useState<ConstraintRegion[]>([]);
+  const [generativeLoads, setGenerativeLoads] = useState<LoadRegion[]>([]);
+  const [generativeLoadDirection, setGenerativeLoadDirection] = useState<[number, number, number]>([0, -1, 0]);
+  const [generativeLoadMagnitude, setGenerativeLoadMagnitude] = useState(1.0);
+  const [generativeMaterial, setGenerativeMaterial] = useState<StructuralMaterial>({
+    youngs_modulus: 1.0,
+    poissons_ratio: 0.30,
+    density_floor: 1e-3,
+    stiffness_floor_ratio: 1e-3,
+    simp_penalty: 3.0
+  });
+  const [generativeConfig, setGenerativeConfig] = useState<StructuralOptimizationConfig>({
+    resolution: 96,
+    target_volume_fraction: 0.35,
+    max_iterations: 40,
+    cg_max_iterations: 200,
+    cg_tolerance: 1e-6,
+    optimization_tolerance: 1e-3,
+    filter_radius_voxels: 1.5,
+    min_density: 1e-3,
+    oc_move_limit: 0.2,
+    density_iso_threshold: 0.3
+  });
   const [error, setError] = useState<string | null>(null);
   const [isCompiling, setIsCompiling] = useState(false);
   const [isPreviewing, setIsPreviewing] = useState(false);
@@ -421,6 +484,7 @@ export default function App() {
   const meshFieldPreviewRunIdRef = useRef(0);
   const meshFieldPreviewControllerRef = useRef<AbortController | null>(null);
   const preprocessControllerRef = useRef<AbortController | null>(null);
+  const generativePreprocessControllerRef = useRef<AbortController | null>(null);
   const uploadedFieldTelemetrySentRef = useRef<Set<string>>(new Set());
 
   const meshWorkflowParams = useMemo<MeshWorkflowParams>(
@@ -590,6 +654,8 @@ export default function App() {
     workflow,
     stats?.fallback_reason
   ]);
+
+  const generativeStopReasonMessage = describeOptimizationStopReason(generativeStopReason);
 
   const abortActivePreview = useCallback(() => {
     previewControllersRef.current.field?.abort();
@@ -1049,6 +1115,156 @@ export default function App() {
     }
   };
 
+  const generativeMarkers = useMemo<ViewerMarker[]>(() => {
+    const markers: ViewerMarker[] = [];
+    for (const constraint of generativeConstraints) {
+      for (const point of constraint.points) {
+        markers.push({ position: point.point_xyz, color: "#5eead4", size: 0.05 });
+      }
+    }
+    for (const load of generativeLoads) {
+      for (const point of load.points) {
+        markers.push({ position: point.point_xyz, color: "#fb7185", size: 0.05 });
+      }
+    }
+    return markers;
+  }, [generativeConstraints, generativeLoads]);
+
+  const onPreprocessGenerative = useCallback(async () => {
+    if (!generativeDesignFile || !generativeNonDesignFile) {
+      setError("Upload both design-space and non-design-space meshes first.");
+      return;
+    }
+    generativePreprocessControllerRef.current?.abort();
+    const controller = new AbortController();
+    generativePreprocessControllerRef.current = controller;
+    setIsPreviewing(true);
+    setError(null);
+    try {
+      const response = await preprocessStructuralOptimization(
+        generativeDesignFile,
+        generativeNonDesignFile,
+        generativeConfig.resolution,
+        computeBackend,
+        meshBackend,
+        controller.signal
+      );
+      if (generativePreprocessControllerRef.current !== controller) {
+        return;
+      }
+      setGenerativePreprocess(response);
+      setGenerativeStopReason(null);
+      setMesh(response.combined_mesh);
+      setField(null);
+      setStats({
+        eval_ms: 0,
+        mesh_ms: null,
+        tri_count: response.combined_mesh.face_count,
+        voxel_count: response.resolution_xyz[0] * response.resolution_xyz[1] * response.resolution_xyz[2],
+        compute_backend: "cpu",
+        mesh_backend: "cpu",
+        preview_mode: "mesh"
+      });
+    } catch (preprocessError) {
+      if ((preprocessError as Error).name !== "AbortError") {
+        setError((preprocessError as Error).message);
+      }
+    } finally {
+      if (generativePreprocessControllerRef.current === controller) {
+        generativePreprocessControllerRef.current = null;
+      }
+      setIsPreviewing(false);
+    }
+  }, [computeBackend, generativeConfig.resolution, generativeDesignFile, generativeNonDesignFile, meshBackend]);
+
+  const onGenerativeMeshPick = useCallback(
+    (point: [number, number, number]) => {
+      if (generativePickMode === "fixed") {
+        setGenerativeConstraints((previous) => {
+          const next = [...previous];
+          if (!next.length) {
+            next.push({ kind: "fixed", points: [], radius: 0 });
+          }
+          next[0] = {
+            ...next[0],
+            points: [...next[0].points, { point_xyz: point }]
+          };
+          return next;
+        });
+      } else if (generativePickMode === "load") {
+        setGenerativeLoads((previous) => [
+          ...previous,
+          {
+            kind: "point",
+            points: [{ point_xyz: point }],
+            direction_xyz: generativeLoadDirection,
+            magnitude: generativeLoadMagnitude,
+            radius: 0
+          }
+        ]);
+      }
+    },
+    [generativeLoadDirection, generativeLoadMagnitude, generativePickMode]
+  );
+
+  const onRunGenerative = useCallback(async () => {
+    if (!generativeDesignFile || !generativeNonDesignFile) {
+      setError("Upload both design-space and non-design-space meshes first.");
+      return;
+    }
+    setIsPreviewing(true);
+    setError(null);
+    setGenerativeHistory([]);
+    setGenerativeStopReason(null);
+    setField(null);
+    try {
+      const request = await buildStructuralOptimizationRequest(
+        {
+          compute_backend: computeBackend,
+          mesh_backend: meshBackend,
+          execution_mode: "queued",
+          constraints: generativeConstraints,
+          loads: generativeLoads,
+          material: generativeMaterial,
+          config: generativeConfig
+        },
+        generativeDesignFile,
+        generativeNonDesignFile
+      );
+      const result = await runStructuralOptimizationPhased(request, (iteration: StructuralOptimizationIterationResult) => {
+        setMesh(iteration.mesh ?? null);
+        setField(iteration.stress_field ?? null);
+        setGenerativeHistory((previous) => [
+          ...previous,
+          {
+            iteration: iteration.iteration,
+            objective_value: iteration.objective_value,
+            active_volume_fraction: iteration.active_volume_fraction,
+            removed_voxels: iteration.removed_voxels,
+            max_displacement: 0
+          }
+        ]);
+      });
+      setMesh(result.final_iteration.mesh ?? null);
+      setField(result.final_iteration.stress_field ?? null);
+      setGenerativeStopReason(result.stop_reason);
+    } catch (runError) {
+      setGenerativeStopReason(null);
+      setError((runError as Error).message);
+    } finally {
+      setIsPreviewing(false);
+    }
+  }, [
+    computeBackend,
+    generativeConfig,
+    generativeConstraints,
+    generativeDesignFile,
+    generativeLoads,
+    generativeMaterial,
+    generativeNonDesignFile,
+    meshBackend
+  ]);
+
   useEffect(() => {
     if (workflow !== "mesh") {
       return;
@@ -1120,6 +1336,8 @@ export default function App() {
     return () => {
       preprocessControllerRef.current?.abort();
       preprocessControllerRef.current = null;
+      generativePreprocessControllerRef.current?.abort();
+      generativePreprocessControllerRef.current = null;
     };
   }, []);
 
@@ -1320,7 +1538,7 @@ export default function App() {
                 )}
               </div>
             </>
-          ) : (
+          ) : workflow === "mesh" ? (
             <>
               <div className="mesh-workflow-grid">
                 <div className="mesh-control-stack">
@@ -1621,6 +1839,326 @@ export default function App() {
                 </aside>
               </div>
             </>
+          ) : (
+            <>
+              <div className="mesh-workflow-grid">
+                <div className="mesh-control-stack">
+                  <section className="mesh-card">
+                    <h3>Design Domains</h3>
+                    <div className="mesh-detail-grid">
+                      <label className="slider-row mesh-file-row">
+                        <span>Design space mesh</span>
+                        <input
+                          type="file"
+                          accept=".stl,.obj"
+                          onChange={(event) => {
+                            setGenerativeDesignFile(event.target.files?.[0] ?? null);
+                            setGenerativePreprocess(null);
+                          }}
+                        />
+                      </label>
+                      <label className="slider-row mesh-file-row">
+                        <span>Non-design mesh</span>
+                        <input
+                          type="file"
+                          accept=".stl,.obj"
+                          onChange={(event) => {
+                            setGenerativeNonDesignFile(event.target.files?.[0] ?? null);
+                            setGenerativePreprocess(null);
+                          }}
+                        />
+                      </label>
+                      <label className="slider-row">
+                        <span>Resolution</span>
+                        <select
+                          value={generativeConfig.resolution}
+                          onChange={(event) =>
+                            setGenerativeConfig((previous) => ({ ...previous, resolution: Number(event.target.value) }))
+                          }
+                        >
+                          <option value={64}>64</option>
+                          <option value={96}>96</option>
+                          <option value={128}>128</option>
+                          <option value={160}>160</option>
+                        </select>
+                      </label>
+                    </div>
+                    <div className="mesh-actions">
+                      <button type="button" onClick={() => void onPreprocessGenerative()}>
+                        Preprocess Domain
+                      </button>
+                    </div>
+                    <p className="muted">{generativeDesignFile ? `Design: ${generativeDesignFile.name}` : "No design-space mesh selected."}</p>
+                    <p className="muted">
+                      {generativeNonDesignFile ? `Non-design: ${generativeNonDesignFile.name}` : "No non-design mesh selected."}
+                    </p>
+                    {generativePreprocess?.diagnostics.length ? (
+                      <div className="warning-stack">
+                        {generativePreprocess.diagnostics.map((warning) => (
+                          <p key={warning} className="warning">
+                            {warning}
+                          </p>
+                        ))}
+                      </div>
+                    ) : null}
+                  </section>
+
+                  <section className="mesh-card">
+                    <h3>Supports & Loads</h3>
+                    <div className="mesh-actions">
+                      <button type="button" onClick={() => setGenerativePickMode("fixed")}>
+                        Pick Fixed Support
+                      </button>
+                      <button type="button" onClick={() => setGenerativePickMode("load")}>
+                        Pick Load Point
+                      </button>
+                      <button type="button" onClick={() => setGenerativePickMode(null)}>
+                        Stop Picking
+                      </button>
+                      <button type="button" onClick={() => setGenerativeConstraints([])}>
+                        Clear Supports
+                      </button>
+                      <button type="button" onClick={() => setGenerativeLoads([])}>
+                        Clear Loads
+                      </button>
+                    </div>
+                    <div className="mesh-detail-grid">
+                      <label className="slider-row">
+                        <span>Load X</span>
+                        <input
+                          type="number"
+                          value={generativeLoadDirection[0]}
+                          onChange={(event) =>
+                            setGenerativeLoadDirection([
+                              Number(event.target.value),
+                              generativeLoadDirection[1],
+                              generativeLoadDirection[2]
+                            ])
+                          }
+                        />
+                      </label>
+                      <label className="slider-row">
+                        <span>Load Y</span>
+                        <input
+                          type="number"
+                          value={generativeLoadDirection[1]}
+                          onChange={(event) =>
+                            setGenerativeLoadDirection([
+                              generativeLoadDirection[0],
+                              Number(event.target.value),
+                              generativeLoadDirection[2]
+                            ])
+                          }
+                        />
+                      </label>
+                      <label className="slider-row">
+                        <span>Load Z</span>
+                        <input
+                          type="number"
+                          value={generativeLoadDirection[2]}
+                          onChange={(event) =>
+                            setGenerativeLoadDirection([
+                              generativeLoadDirection[0],
+                              generativeLoadDirection[1],
+                              Number(event.target.value)
+                            ])
+                          }
+                        />
+                      </label>
+                      <label className="slider-row">
+                        <span>Load magnitude</span>
+                        <input
+                          type="number"
+                          value={generativeLoadMagnitude}
+                          onChange={(event) => setGenerativeLoadMagnitude(Number(event.target.value))}
+                        />
+                      </label>
+                    </div>
+                    <p className="muted">Pick mode: {generativePickMode ?? "off"}</p>
+                    <p className="muted">
+                      In pick mode, click directly on the mesh surface in the viewer. Cyan dots mark supports and pink dots mark load points.
+                    </p>
+                    <p className="muted">Supports: {generativeConstraints.reduce((sum, item) => sum + item.points.length, 0)}</p>
+                    <p className="muted">Loads: {generativeLoads.length}</p>
+                    {generativeConstraints.length > 0 ? (
+                      <div className="warning-stack">
+                        {generativeConstraints.flatMap((constraint) =>
+                          constraint.points.map((point, index) => (
+                            <p key={`fixed-${index}`} className="muted">
+                              Support {index + 1}: {point.point_xyz.map((value) => value.toFixed(2)).join(", ")}
+                            </p>
+                          ))
+                        )}
+                        {generativeLoads.map((load, index) => (
+                          <p key={`load-${index}`} className="muted">
+                            Load {index + 1}: {load.points[0]?.point_xyz.map((value) => value.toFixed(2)).join(", ")} | dir{" "}
+                            {load.direction_xyz.map((value) => value.toFixed(2)).join(", ")} | mag {load.magnitude.toFixed(2)}
+                          </p>
+                        ))}
+                      </div>
+                    ) : null}
+                  </section>
+
+                  <section className="mesh-card">
+                    <h3>Optimization Setup</h3>
+                    <div className="mesh-detail-grid">
+                      <label className="slider-row">
+                        <span>Target volume fraction</span>
+                        <input
+                          type="number"
+                          step={0.05}
+                          min={0.05}
+                          max={0.95}
+                          value={generativeConfig.target_volume_fraction}
+                          onChange={(event) =>
+                            setGenerativeConfig((previous) => ({
+                              ...previous,
+                              target_volume_fraction: Number(event.target.value)
+                            }))
+                          }
+                        />
+                      </label>
+                      <label className="slider-row">
+                        <span>Max iterations</span>
+                        <input
+                          type="number"
+                          min={1}
+                          max={64}
+                          value={generativeConfig.max_iterations}
+                          onChange={(event) =>
+                            setGenerativeConfig((previous) => ({ ...previous, max_iterations: Number(event.target.value) }))
+                          }
+                        />
+                      </label>
+                      <label className="slider-row">
+                        <span>CG tolerance</span>
+                        <input
+                          type="number"
+                          step={1e-6}
+                          min={1e-8}
+                          max={1e-2}
+                          value={generativeConfig.cg_tolerance}
+                          onChange={(event) =>
+                            setGenerativeConfig((previous) => ({ ...previous, cg_tolerance: Number(event.target.value) }))
+                          }
+                        />
+                      </label>
+                      <label className="slider-row">
+                        <span>Optimization tolerance</span>
+                        <input
+                          type="number"
+                          step={1e-4}
+                          min={1e-5}
+                          max={0.1}
+                          value={generativeConfig.optimization_tolerance}
+                          onChange={(event) =>
+                            setGenerativeConfig((previous) => ({
+                              ...previous,
+                              optimization_tolerance: Number(event.target.value)
+                            }))
+                          }
+                        />
+                      </label>
+                      <label className="slider-row">
+                        <span>Min density</span>
+                        <input
+                          type="number"
+                          step={0.001}
+                          min={0.001}
+                          max={0.5}
+                          value={generativeConfig.min_density}
+                          onChange={(event) =>
+                            setGenerativeConfig((previous) => ({ ...previous, min_density: Number(event.target.value) }))
+                          }
+                        />
+                      </label>
+                      <label className="slider-row">
+                        <span>OC move limit</span>
+                        <input
+                          type="number"
+                          step={0.01}
+                          min={0.01}
+                          max={1}
+                          value={generativeConfig.oc_move_limit}
+                          onChange={(event) =>
+                            setGenerativeConfig((previous) => ({ ...previous, oc_move_limit: Number(event.target.value) }))
+                          }
+                        />
+                      </label>
+                      <label className="slider-row">
+                        <span>Density iso threshold</span>
+                        <input
+                          type="number"
+                          step={0.01}
+                          min={0.05}
+                          max={0.95}
+                          value={generativeConfig.density_iso_threshold}
+                          onChange={(event) =>
+                            setGenerativeConfig((previous) => ({
+                              ...previous,
+                              density_iso_threshold: Number(event.target.value)
+                            }))
+                          }
+                        />
+                      </label>
+                      <label className="slider-row">
+                        <span>Young's modulus</span>
+                        <input
+                          type="number"
+                          step={0.1}
+                          min={0.1}
+                          value={generativeMaterial.youngs_modulus}
+                          onChange={(event) =>
+                            setGenerativeMaterial((previous) => ({ ...previous, youngs_modulus: Number(event.target.value) }))
+                          }
+                        />
+                      </label>
+                      <label className="slider-row">
+                        <span>Poisson ratio</span>
+                        <input
+                          type="number"
+                          step={0.01}
+                          min={0}
+                          max={0.49}
+                          value={generativeMaterial.poissons_ratio}
+                          onChange={(event) =>
+                            setGenerativeMaterial((previous) => ({ ...previous, poissons_ratio: Number(event.target.value) }))
+                          }
+                        />
+                      </label>
+                    </div>
+                    <div className="mesh-actions">
+                      <button type="button" onClick={() => void onRunGenerative()}>
+                        Run Optimization
+                      </button>
+                    </div>
+                    <p className="muted">The first pass supports point-based supports and loads picked directly in the viewer.</p>
+                  </section>
+                </div>
+
+                <aside className="warning-panel">
+                  <div className="warning-panel-head">
+                    <h3>Optimization History</h3>
+                    <span className="pill">{generativeHistory.length} iters</span>
+                  </div>
+                  {generativeHistory.length ? (
+                    <div className="warning-stack">
+                      {generativeStopReasonMessage ? (
+                        <p className="muted">{generativeStopReasonMessage}</p>
+                      ) : null}
+                      {generativeHistory.map((entry) => (
+                        <p key={entry.iteration} className="muted">
+                          Iter {entry.iteration}: obj {entry.objective_value.toFixed(3)}, volume{" "}
+                          {(entry.active_volume_fraction * 100).toFixed(1)}%, removed {entry.removed_voxels}
+                        </p>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="muted">Run preprocessing and then start optimization to load queued iteration progress here.</p>
+                  )}
+                </aside>
+              </div>
+            </>
           )}
         </section>
 
@@ -1709,6 +2247,9 @@ export default function App() {
             <Viewer
               mesh={mesh}
               field={field}
+              pickMarkers={workflow === "generative" ? generativeMarkers : []}
+              onMeshPick={workflow === "generative" ? onGenerativeMeshPick : null}
+              pickModeActive={workflow === "generative" && generativePickMode !== null}
               uploadedMeshPreviewActive={workflow === "mesh" && !meshCommitted && field != null}
               uploadedFieldPreviewTrace={workflow === "mesh" ? uploadedFieldPreviewTrace : null}
               onUploadedFieldPreviewVisible={onUploadedFieldPreviewVisible}

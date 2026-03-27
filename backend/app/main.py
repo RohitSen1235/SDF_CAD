@@ -9,9 +9,11 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import struct
 import time
 from dataclasses import dataclass, replace
+from contextlib import suppress
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -109,12 +111,20 @@ from .models import (
     QualityProfile,
     MeshBackend,
     MeshPayload,
+    StructuralOptimizationIterationWebhookRequest,
+    StructuralOptimizationJobAcceptedResponse,
+    StructuralOptimizationPreprocessResponse,
+    StructuralOptimizationProgressResponse,
+    StructuralOptimizationRequest,
+    StructuralOptimizationResultResponse,
     UploadedPreviewFieldResponse,
     UploadedFieldStorageMode,
     UploadedFieldPreviewClientTelemetry,
     UploadedMeshPreviewWsRequest,
     UploadedMeshPreviewWsResponse,
 )
+from .optimization import preprocess_structural_optimization, run_structural_optimization
+from .structural_progress import get_structural_progress_store
 
 logger = logging.getLogger(__name__)
 _uvicorn_error_logger = logging.getLogger("uvicorn.error")
@@ -755,6 +765,16 @@ def _job_response(task_id: str) -> JobAcceptedResponse:
     )
 
 
+def _structural_job_response(task_id: str) -> StructuralOptimizationJobAcceptedResponse:
+    return StructuralOptimizationJobAcceptedResponse(
+        job_id=task_id,
+        status="queued",
+        status_url=f"/api/v1/jobs/{task_id}",
+        result_url=f"/api/v1/jobs/{task_id}/result",
+        progress_url=f"/api/v1/optimization/structural/jobs/{task_id}/progress",
+    )
+
+
 def _enqueue_preview_mesh_job(payload: PreviewMeshRequest) -> JobAcceptedResponse:
     from .worker_tasks import preview_mesh_job
 
@@ -855,6 +875,26 @@ def _enqueue_uploaded_export_job(
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}") from exc
     return _job_response(task.id)
+
+
+def _enqueue_structural_optimization_job(payload: StructuralOptimizationRequest) -> StructuralOptimizationJobAcceptedResponse:
+    from .worker_tasks import structural_optimization_job
+
+    store = get_structural_progress_store()
+    job_id = uuid4().hex
+    callback_token = secrets.token_urlsafe(32)
+    try:
+        store.initialize_job(job_id=job_id, max_iterations=int(payload.config.max_iterations), callback_token=callback_token)
+        task_payload = payload.model_dump(mode="json")
+        task_payload["_callback_token"] = callback_token
+        structural_optimization_job.apply_async(args=[task_payload], task_id=job_id)
+    except Exception as exc:
+        try:
+            store.clear_job(job_id)
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}") from exc
+    return _structural_job_response(job_id)
 
 
 def _run_preview(
@@ -2660,6 +2700,78 @@ async def export_mesh(payload: ExportMeshRequest) -> Response | JobAcceptedRespo
     return StreamingResponse(body, media_type=media_type, headers=headers)
 
 
+@app.post("/api/v1/optimization/structural/preprocess", response_model=StructuralOptimizationPreprocessResponse)
+async def preprocess_structural_optimization_route(
+    design_space_file: UploadFile = File(...),
+    non_design_space_file: UploadFile = File(...),
+    resolution: int = Form(96),
+    compute_backend: ComputeBackend = Form("auto"),
+    mesh_backend: MeshBackend = Form("auto"),
+) -> StructuralOptimizationPreprocessResponse:
+    design_bytes, _ = await _read_uploaded_mesh(design_space_file)
+    keep_bytes, _ = await _read_uploaded_mesh(non_design_space_file)
+    try:
+        return await asyncio.to_thread(
+            preprocess_structural_optimization,
+            design_space_file.filename or "design.stl",
+            base64.b64encode(design_bytes).decode("ascii"),
+            non_design_space_file.filename or "non_design.stl",
+            base64.b64encode(keep_bytes).decode("ascii"),
+            resolution=resolution,
+            compute_backend=compute_backend,
+            mesh_backend=mesh_backend,
+        )
+    except (MeshUploadError, MeshingError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        cleanup_gpu_memory(reason="preprocess_structural_optimization_inline")
+
+
+@app.post("/api/v1/optimization/structural/jobs", response_model=StructuralOptimizationJobAcceptedResponse)
+async def structural_optimization_jobs(payload: StructuralOptimizationRequest) -> StructuralOptimizationJobAcceptedResponse:
+    if not REDIS_CLIENT_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Structural optimization requires Redis-backed queued execution")
+    try:
+        return _enqueue_structural_optimization_job(payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}") from exc
+
+
+@app.get("/api/v1/optimization/structural/jobs/{job_id}/progress", response_model=StructuralOptimizationProgressResponse)
+async def structural_optimization_progress(job_id: str, after_iteration: int = 0) -> StructuralOptimizationProgressResponse:
+    try:
+        return get_structural_progress_store().get_progress(job_id=job_id, after_iteration=max(0, int(after_iteration)))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Structural optimization job progress not found") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Structural optimization progress unavailable: {exc}") from exc
+
+
+@app.post("/api/v1/internal/optimization/structural/jobs/{job_id}/iterations")
+async def structural_optimization_iteration_callback(job_id: str, payload: StructuralOptimizationIterationWebhookRequest, request: Request) -> dict[str, object]:
+    auth_header = str(request.headers.get("authorization") or "")
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="Missing structural optimization callback bearer token")
+    store = get_structural_progress_store()
+    if not store.validate_callback_token(job_id, token):
+        raise HTTPException(status_code=403, detail="Invalid structural optimization callback token")
+    try:
+        progress = store.persist_callback(job_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Structural optimization job progress not found") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to persist structural optimization iteration: {exc}") from exc
+    return {
+        "acknowledged": True,
+        "job_id": progress.job_id,
+        "status": progress.status,
+        "current_iteration": progress.current_iteration,
+    }
+
+
 @app.post("/api/v1/jobs/preview-mesh", response_model=JobAcceptedResponse)
 async def submit_preview_mesh_job(payload: PreviewMeshRequest) -> JobAcceptedResponse:
     return _enqueue_preview_mesh_job(payload)
@@ -2701,6 +2813,11 @@ async def get_job_result(job_id: str) -> Response:
     if kind in {"preview_mesh", "preview_uploaded_mesh"}:
         return Response(
             content=PreviewMeshResponse.model_validate(payload["payload"]).model_dump_json(),
+            media_type="application/json",
+        )
+    if kind == "structural_optimization":
+        return Response(
+            content=StructuralOptimizationResultResponse.model_validate(payload["payload"]).model_dump_json(),
             media_type="application/json",
         )
     if kind in {"export_mesh", "export_uploaded_mesh"}:
@@ -3594,6 +3711,23 @@ async def preview_uploaded_mesh_ws(websocket: WebSocket) -> None:
             return
     except WebSocketDisconnect:
         return
+
+
+@app.websocket("/api/v1/optimization/structural/ws")
+async def structural_optimization_ws(websocket: WebSocket) -> None:
+    await websocket.accept()
+    try:
+        await websocket.send_json(
+            {
+                "phase": "error",
+                "error": "Structural optimization websocket is disabled. Submit /api/v1/optimization/structural/jobs and poll the progress_url instead.",
+            }
+        )
+    except WebSocketDisconnect:
+        return
+    finally:
+        with suppress(Exception):
+            await websocket.close(code=1008, reason="Structural optimization now uses queued polling")
 
 
 @app.websocket("/api/v1/preview")
