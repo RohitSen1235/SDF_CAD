@@ -7,9 +7,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY pyproject.toml ./
-COPY app ./app
-
 RUN pip install --no-cache-dir ".[gpu]"
+
+COPY app ./app
 
 EXPOSE 8000
 
